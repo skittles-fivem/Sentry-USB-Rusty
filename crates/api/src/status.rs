@@ -279,18 +279,19 @@ async fn compute_network_info() -> CachedNetwork {
     let wifi_dev = find_net_device("wl*");
     if !wifi_dev.is_empty() && iface_is_up(&wifi_dev) {
         info.wifi_dev = wifi_dev.clone();
-        let ssid_args = ["-r", wifi_dev.as_str()];
         let ip_args = ["-4", "addr", "show", wifi_dev.as_str()];
-        // `iw` reports frequency in MHz.
+        // `iw` reports both SSID and frequency (MHz) from one query, and
+        // — unlike `iwgetid` — works with drivers that only implement
+        // nl80211 and never wired up the legacy Wireless Extensions ioctls
+        // `iwgetid` depends on. Out-of-tree drivers for newer chipsets
+        // routinely fall in that bucket (most Wi-Fi 6E/7 USB adapters, none
+        // of which have official in-kernel or vendor Linux support yet),
+        // so `iwgetid` silently returns nothing even while fully associated.
         let iw_args = ["dev", wifi_dev.as_str(), "link"];
-        let (ssid_r, ip_r, iw_r) = tokio::join!(
-            sentryusb_shell::run("iwgetid", &ssid_args),
+        let (ip_r, iw_r) = tokio::join!(
             sentryusb_shell::run("ip", &ip_args),
             sentryusb_shell::run("iw", &iw_args),
         );
-        if let Ok(out) = ssid_r {
-            info.wifi_ssid = out.trim().to_string();
-        }
         if let Ok(out) = ip_r {
             for line in out.lines() {
                 let trimmed = line.trim();
@@ -302,6 +303,9 @@ async fn compute_network_info() -> CachedNetwork {
             }
         }
         if let Ok(out) = iw_r {
+            if let Some(ssid) = parse_iw_link_ssid(&out) {
+                info.wifi_ssid = ssid;
+            }
             for line in out.lines() {
                 let trimmed = line.trim();
                 // Convert MHz to the API's Hz-string format.
@@ -350,6 +354,15 @@ async fn compute_network_info() -> CachedNetwork {
     }
 
     info
+}
+
+/// Extracts the SSID line from `iw dev <iface> link` output. `None` when
+/// not associated (`Not connected.`) or the output doesn't parse, so callers
+/// can `if let Some(ssid) = ...` without a separate connected-check.
+fn parse_iw_link_ssid(text: &str) -> Option<String> {
+    text.lines()
+        .find_map(|l| l.trim().strip_prefix("SSID: "))
+        .map(str::to_string)
 }
 
 
@@ -433,12 +446,18 @@ pub async fn get_wifi_config(
     let mut source = String::new();
 
     // Prefer the kernel association query; `nmcli` may trigger a scan.
-    if let Ok(out) = sentryusb_shell::run("iwgetid", &["-r"]).await {
-        let s = out.trim();
-        if !s.is_empty() {
-            ssid = s.to_string();
-            connected = true;
-            source = "iwgetid".into();
+    // `iw` (nl80211) rather than `iwgetid` (legacy WEXT ioctls): out-of-tree
+    // drivers for newer chipsets — most Wi-Fi 6E/7 USB adapters included,
+    // since none have official Linux support yet — routinely implement only
+    // nl80211, so `iwgetid` silently returns nothing while `iw` still works.
+    let wifi_dev = find_net_device("wl*");
+    if !wifi_dev.is_empty() {
+        if let Ok(out) = sentryusb_shell::run("iw", &["dev", wifi_dev.as_str(), "link"]).await {
+            if let Some(s) = parse_iw_link_ssid(&out) {
+                ssid = s;
+                connected = true;
+                source = "iw".into();
+            }
         }
     }
 
@@ -572,6 +591,28 @@ fn scan_snapshots(base: &std::path::Path) -> SnapshotScan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_iw_link_ssid_reads_connected_output() {
+        let sample = "Connected to aa:bb:cc:dd:ee:ff (on wlan0)\n\tSSID: HomeNet\n\tfreq: 5180\n\tsignal: -45 dBm\n";
+        assert_eq!(parse_iw_link_ssid(sample), Some("HomeNet".to_string()));
+    }
+
+    #[test]
+    fn parse_iw_link_ssid_none_when_not_connected() {
+        assert_eq!(parse_iw_link_ssid("Not connected.\n"), None);
+    }
+
+    #[test]
+    fn parse_iw_link_ssid_handles_ssid_containing_a_colon() {
+        // SSIDs can contain arbitrary characters, including ':' — match on
+        // the "SSID: " prefix only, not a naive split on the first ':'.
+        let sample = "Connected to aa:bb:cc:dd:ee:ff (on wlan0)\n\tSSID: Office: 2nd Floor\n";
+        assert_eq!(
+            parse_iw_link_ssid(sample),
+            Some("Office: 2nd Floor".to_string())
+        );
+    }
 
     #[test]
     fn scan_snapshots_range_is_mtime_min_max_not_name_order() {
