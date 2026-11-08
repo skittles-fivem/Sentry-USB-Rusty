@@ -9,6 +9,8 @@ import { Toggle } from "@/components/ui/Toggle"
 import { Modal } from "@/components/ui/Modal"
 import { InfoButton } from "@/components/ui/InfoButton"
 import { AutoUpdateToggle } from "./AutoUpdateToggle"
+import { UpdateSourceControl } from "./UpdateSourceControl"
+import { customRepo, isTestBuild, type UpdateSource } from "./updateSource"
 
 type UpdateStatus =
   | "idle"
@@ -43,6 +45,9 @@ export function UpdateSection({ onInstallStart }: Props) {
   const [stableUpdate, setStableUpdate] = useState<ReleaseInfo | null>(null)
   const [prereleaseUpdate, setPrereleaseUpdate] = useState<ReleaseInfo | null>(null)
   const [revertStable, setRevertStable] = useState<ReleaseInfo | null>(null)
+  // Repository the offered updates were listed from (null: older server).
+  const [offerRepo, setOfferRepo] = useState<string | null>(null)
+  const [source, setSource] = useState<UpdateSource | null>(null)
   const [autoUpdateEnabled, setAutoUpdateEnabled] = useState<boolean | null>(null)
   const [includePrerelease, setIncludePrerelease] = useState<boolean | null>(null)
   const [preferenceError, setPreferenceError] = useState<string | null>(null)
@@ -70,6 +75,7 @@ export function UpdateSection({ onInstallStart }: Props) {
       })
       .then((data) => {
         if (controller.signal.aborted) return
+        setOfferRepo(data.source_repo ?? null)
         if (data.stable?.available) {
           setStableUpdate({
             version: data.stable.version,
@@ -153,6 +159,7 @@ export function UpdateSection({ onInstallStart }: Props) {
         setUpdateError(data.error)
       } else {
         let foundAny = false
+        setOfferRepo(data.source_repo ?? null)
         if (data.stable?.available) {
           setStableUpdate({
             version: data.stable.version,
@@ -416,6 +423,11 @@ export function UpdateSection({ onInstallStart }: Props) {
         }
       >
         <p className="t-xs">
+          Installed: <span className="font-mono">{version ?? "…"}</span>
+          {" · "}{isTestBuild(version) ? <span className="text-amber-300">Test build</span> : "Official"}
+          {source && !source.official && <> · <span className="text-amber-300">Updates from {source.repo} (test builds)</span></>}
+        </p>
+        <p className="t-xs">
           {updateStatus === "idle" && !updateError && !stableUpdate && !prereleaseUpdate &&
             "Check for and install the latest version."}
           {updateStatus === "idle" && updateError && (
@@ -438,7 +450,7 @@ export function UpdateSection({ onInstallStart }: Props) {
                   Stable: {stableUpdate.version}
                 </p>
                 <p className="mt-0.5 text-[11px] text-slate-400">
-                  Updates server, scripts &amp; BLE daemon.{" "}
+                  {customRepo(offerRepo) && <>From {customRepo(offerRepo)}. </>}Updates server, scripts &amp; BLE daemon.{" "}
                   <a
                     href={stableUpdate.release_url}
                     target="_blank"
@@ -467,7 +479,7 @@ export function UpdateSection({ onInstallStart }: Props) {
                   Pre-release: {prereleaseUpdate.version}
                 </p>
                 <p className="mt-0.5 text-[11px] text-slate-400">
-                  Test build — may contain bugs.{" "}
+                  {customRepo(offerRepo) && <>From {customRepo(offerRepo)}. </>}Test build — may contain bugs.{" "}
                   <a
                     href={prereleaseUpdate.release_url}
                     target="_blank"
@@ -496,7 +508,7 @@ export function UpdateSection({ onInstallStart }: Props) {
                   Revert to Stable: {revertStable.version}
                 </p>
                 <p className="mt-0.5 text-[11px] text-slate-400">
-                  Downgrade from pre-release to latest stable.{" "}
+                  {customRepo(offerRepo) && <>From {customRepo(offerRepo)}. </>}Downgrade from pre-release to latest stable.{" "}
                   <a
                     href={revertStable.release_url}
                     target="_blank"
@@ -540,6 +552,16 @@ export function UpdateSection({ onInstallStart }: Props) {
         halo="slate"
         title="Update Preferences"
       >
+        <UpdateSourceControl onChange={next => {
+          // Offers listed from another repository no longer apply.
+          if (source && source.repo !== next.repo) {
+            setStableUpdate(null)
+            setPrereleaseUpdate(null)
+            setRevertStable(null)
+            setOfferRepo(null)
+          }
+          setSource(next)
+        }} />
         <AutoUpdateToggle />
         <Toggle
           checked={autoUpdateEnabled ?? false}
@@ -553,7 +575,7 @@ export function UpdateSection({ onInstallStart }: Props) {
           disabled={autoUpdateEnabled === null || includePrerelease === null || preferencePending}
           onChange={next => savePreference("update_channel", next ? "prerelease" : "stable", () => setIncludePrerelease(next))}
           label="Include pre-releases"
-          help={<InfoButton title="Pre-release updates"><p>Includes test builds when checking for updates. These builds may contain bugs. Automatic installation still uses stable releases only.</p></InfoButton>}
+          help={<InfoButton title="Pre-release updates"><p>Includes test builds when checking for updates. These builds may contain bugs. Automatic installation still uses stable releases only. A custom update source always includes them.</p></InfoButton>}
         />
         {(autoUpdateEnabled === null || includePrerelease === null) && !preferenceError && <p role="status" className="t-xs">Loading preferences…</p>}
         {preferencePending && <p role="status" className="t-xs">Saving…</p>}

@@ -197,19 +197,84 @@ async fn system_stopping() -> bool {
 }
 
 /// Default OTA source.
-const DEFAULT_UPDATE_OWNER: &str = "Sentry-Six";
 const DEFAULT_UPDATE_REPO_NAME: &str = "Sentry-USB-Rusty";
+pub const OFFICIAL_UPDATE_REPO: &str = "Sentry-Six/Sentry-USB-Rusty";
 
-/// Resolves the configured owner while keeping the release repository name fixed.
-pub(crate) fn update_repo() -> String {
+/// Resolves the OTA release repository from `REPO` in sentryusb.conf.
+/// `REPO=owner` keeps the original repository name (owner/Sentry-USB-Rusty);
+/// `REPO=owner/name` names a whole repository, such as a test fork with a
+/// different name. A missing, empty or malformed value means official.
+pub fn update_repo() -> String {
     let path = sentryusb_config::find_config_path();
     let (active, _commented) = sentryusb_config::parse_file(path).unwrap_or_default();
-    let owner = active
-        .get("REPO")
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .unwrap_or(DEFAULT_UPDATE_OWNER);
-    format!("{}/{}", owner, DEFAULT_UPDATE_REPO_NAME)
+    match active.get("REPO").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        None => OFFICIAL_UPDATE_REPO.to_string(),
+        Some(value) => normalize_repo(value).unwrap_or_else(|| {
+            tracing::warn!("REPO={value:?} is not a GitHub owner or owner/name; updating from {OFFICIAL_UPDATE_REPO}");
+            OFFICIAL_UPDATE_REPO.to_string()
+        }),
+    }
+}
+
+/// `owner` or `owner/name` as `owner/name`, or `None` unless both parts use
+/// only characters GitHub allows (owner: letters, digits and inner hyphens,
+/// at most 39; name: letters, digits, `-`, `_`, `.`, at most 100, not `.`/`..`).
+pub(crate) fn normalize_repo(value: &str) -> Option<String> {
+    let value = value.trim();
+    let (owner, name) = value.split_once('/').unwrap_or((value, DEFAULT_UPDATE_REPO_NAME));
+    let owner_ok = (1..=39).contains(&owner.len()) && !owner.starts_with('-') && !owner.ends_with('-')
+        && owner.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-');
+    let name_ok = (1..=100).contains(&name.len()) && name != "." && name != ".."
+        && name.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'));
+    (owner_ok && name_ok).then(|| format!("{owner}/{name}"))
+}
+
+/// GET /api/system/update-source
+pub async fn get_update_source() -> (StatusCode, Json<serde_json::Value>) {
+    let repo = update_repo();
+    (StatusCode::OK, Json(serde_json::json!({
+        "repo": repo,
+        "official": repo.eq_ignore_ascii_case(OFFICIAL_UPDATE_REPO),
+        "official_repo": OFFICIAL_UPDATE_REPO,
+    })))
+}
+
+/// PUT /api/system/update-source — `{"repo": "owner/name"}`; an empty repo
+/// (or the official one) removes `REPO` so updates come from official again.
+pub async fn set_update_source(body: String) -> (StatusCode, Json<serde_json::Value>) {
+    let requested = serde_json::from_str::<serde_json::Value>(&body).ok()
+        .and_then(|v| v.get("repo").and_then(|r| r.as_str()).map(|r| r.trim().to_string()));
+    let Some(requested) = requested else {
+        return crate::json_error(StatusCode::BAD_REQUEST, "invalid request body");
+    };
+    let repo = if requested.is_empty() { None } else {
+        match normalize_repo(&requested) {
+            Some(repo) if repo.eq_ignore_ascii_case(OFFICIAL_UPDATE_REPO) => None,
+            Some(repo) => Some(repo),
+            None => return crate::json_error(StatusCode::BAD_REQUEST,
+                "Enter a GitHub repository as owner/name, for example skittles-fivem/Sentry-USB-Rusty."),
+        }
+    };
+    let persist = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let config_path = sentryusb_config::find_config_path();
+        let (mut active, _) = sentryusb_config::parse_file(config_path)?;
+        match repo {
+            Some(repo) => { active.insert("REPO".to_string(), repo); }
+            // Omitting the key comments it out, restoring the official default.
+            None => { active.remove("REPO"); }
+        }
+        let _ = std::process::Command::new("bash").args(["-c", "/root/bin/remountfs_rw"]).status();
+        sentryusb_config::write_file(config_path, &active)
+    }).await;
+    match persist {
+        Ok(Ok(())) => {
+            // A cached check describes the previous source's releases.
+            let _ = std::fs::remove_file(UPDATE_CHECK_CACHE);
+            get_update_source().await
+        }
+        Ok(Err(e)) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("config write failed: {e}")),
+        Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("config task failed: {e}")),
+    }
 }
 
 /// Detects the release suffix selected by the boot picker or equivalent live
@@ -385,6 +450,13 @@ async fn self_update(
             None
         }
     };
+    // A non-semver tag (a fork's old `1.22`) can't be ordered against later
+    // releases, so it is never installed, even as "latest".
+    if let Some(tag) = release.as_ref().map(|r| r.tag.as_str()).or(target_version.as_deref())
+        && parse_semver(tag).is_none()
+    {
+        anyhow::bail!("Release {tag} isn't tagged vX.Y.Z, so it can't be installed. {UNCHANGED}");
+    }
     let file_tag = release.as_ref().map(|r| r.tag.clone()).or_else(|| target_version.clone());
     let source_for = |name: &str| match &release {
         Some(r) => r.source(&repo, name),
@@ -843,9 +915,11 @@ pub async fn get_version() -> (StatusCode, Json<serde_json::Value>) {
     })))
 }
 
-/// Parses a semver tag, handling prerelease and edge cases.
+/// Parses a semver tag, handling prerelease and edge cases. Build metadata
+/// (`+...`) is dropped: semver gives it no precedence.
 pub(crate) fn parse_semver(v: &str) -> Option<(u32, u32, u32, String)> {
     let v = v.trim().trim_start_matches('v');
+    let v = v.split_once('+').map_or(v, |(v, _)| v);
     let (base, pre) = match v.find('-') {
         Some(i) => (&v[..i], v[i + 1..].to_string()),
         None => (v, String::new()),
@@ -864,31 +938,59 @@ pub(crate) fn parse_semver(v: &str) -> Option<(u32, u32, u32, String)> {
     Some((nums[0], nums[1], nums[2], pre))
 }
 
-/// True if `candidate` is newer than `current`. Prerelease-aware:
-/// stable beats prerelease at the same base version.
+/// Semver 2.0 precedence (section 11), or `None` if either side isn't semver.
+/// A release outranks every prerelease of the same version, so `4.98.1` is
+/// newer than `4.98.1-test.N` for every N. Prerelease identifiers compare
+/// numerically when both are numbers (`test.10` > `test.9`), numbers rank
+/// below words, and a longer list wins when one is a prefix of the other.
+pub(crate) fn compare_versions(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    let (a, b) = (parse_semver(a)?, parse_semver(b)?);
+    let base = (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2));
+    if base != Ordering::Equal {
+        return Some(base);
+    }
+    Some(match (a.3.is_empty(), b.3.is_empty()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => {
+            let numeric = |s: &str| (!s.is_empty() && s.bytes().all(|c| c.is_ascii_digit())).then(|| s.parse::<u64>().ok()).flatten();
+            let (mut x, mut y) = (a.3.split('.'), b.3.split('.'));
+            loop {
+                let ord = match (x.next(), y.next()) {
+                    (None, None) => break Ordering::Equal,
+                    (Some(_), None) => Ordering::Greater,
+                    (None, Some(_)) => Ordering::Less,
+                    (Some(p), Some(q)) => match (numeric(p), numeric(q)) {
+                        (Some(p), Some(q)) => p.cmp(&q),
+                        (Some(_), None) => Ordering::Less,
+                        (None, Some(_)) => Ordering::Greater,
+                        (None, None) => p.cmp(q),
+                    },
+                };
+                if ord != Ordering::Equal {
+                    break ord;
+                }
+            }
+        }
+    })
+}
+
+/// True if `candidate` is newer than `current` by semver precedence: stable
+/// beats prerelease at the same base version. A candidate tag that isn't
+/// semver (`1.22`, `latest`) is never newer; a semver candidate is offered
+/// over an unreadable installed version so the device can recover.
 pub(crate) fn is_version_newer(candidate: &str, current: &str) -> bool {
-    let c = parse_semver(candidate);
-    let u = parse_semver(current);
-    let (c, u) = match (c, u) {
-        (Some(c), Some(u)) => (c, u),
-        _ => return candidate.trim() != current.trim(),
-    };
-    if c.0 != u.0 {
-        return c.0 > u.0;
+    if parse_semver(candidate).is_none() {
+        return false;
     }
-    if c.1 != u.1 {
-        return c.1 > u.1;
-    }
-    if c.2 != u.2 {
-        return c.2 > u.2;
-    }
-    match (u.3.is_empty(), c.3.is_empty()) {
-        (true, true) => false,
-        (false, true) => true,   // Stable supersedes prerelease at the same version.
-        (true, false) => false,
-        (false, false) => c.3 > u.3,
+    match compare_versions(candidate, current) {
+        Some(ord) => ord == std::cmp::Ordering::Greater,
+        None => true,
     }
 }
+
 
 /// Prereleases are tagged like stable releases (`v3.27.3`) and flagged only on
 /// GitHub, so the installed tag's own release record decides. A tag missing
@@ -917,8 +1019,10 @@ pub async fn check_for_update(
     let current = read_current_version();
     let can_update = !current.is_empty() && current != "dev";
 
-    // Either the request or saved channel can enable prerelease discovery.
-    let mut include_prerelease = params.get("include_prerelease").map(String::as_str) == Some("true");
+    // The request, the saved channel, or a custom source (whose releases are
+    // test builds, tagged as prereleases) enables prerelease discovery.
+    let mut include_prerelease = params.get("include_prerelease").map(String::as_str) == Some("true")
+        || !update_repo().eq_ignore_ascii_case(OFFICIAL_UPDATE_REPO);
     if !include_prerelease {
         let prefs = crate::preferences::load_prefs();
         if prefs.get("update_channel").and_then(|v| v.as_str()) == Some("prerelease") {
@@ -947,6 +1051,8 @@ pub async fn check_for_update(
 
     let mut result = serde_json::json!({
         "current_version": current,
+        // Offered releases all come from this repository.
+        "source_repo": update_repo(),
         "checked_at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
     });
 
@@ -1032,12 +1138,14 @@ async fn fetch_releases() -> Result<Vec<ReleaseInfo>, String> {
         .collect())
 }
 
-/// Selects the first non-draft stable and prerelease from GitHub's newest-first list.
+/// Selects the first non-draft stable and prerelease from GitHub's
+/// newest-first list. Releases whose tag isn't semver (a fork's old `1.22`)
+/// are skipped: they can't be ordered against installed versions.
 fn find_latest_releases(releases: &[ReleaseInfo]) -> (Option<&ReleaseInfo>, Option<&ReleaseInfo>) {
     let mut stable: Option<&ReleaseInfo> = None;
     let mut prerelease: Option<&ReleaseInfo> = None;
     for r in releases {
-        if r.draft {
+        if r.draft || parse_semver(&r.tag_name).is_none() {
             continue;
         }
         if r.prerelease {
@@ -1149,5 +1257,75 @@ mod prerelease_install_tests {
         let mut list = releases();
         list.push(ReleaseInfo { draft: true, ..release("v3.29.0", true) });
         assert!(!is_prerelease_install("v3.29.0", &list));
+    }
+
+    #[test]
+    fn non_semver_releases_are_never_offered() {
+        let list = vec![release("1.22", false), release("latest", true), release("", false), release("v3.28.9", false), release("v3.29.0-beta.1", true)];
+        let (stable, pre) = find_latest_releases(&list);
+        assert_eq!(stable.map(|r| r.tag_name.as_str()), Some("v3.28.9"));
+        assert_eq!(pre.map(|r| r.tag_name.as_str()), Some("v3.29.0-beta.1"));
+        assert_eq!(find_latest_releases(&[release("1.22", false)]).0.map(|r| r.tag_name.clone()), None);
+        for bad in ["1.22", "latest", "", "v1", "1.2.x", "main"] {
+            assert!(!is_version_newer(bad, "v3.28.9"), "{bad:?}");
+            assert!(!is_version_newer(bad, "dev"), "{bad:?}");
+        }
+        // A real release still repairs an unreadable installed version.
+        assert!(is_version_newer("v3.28.9", "unknown"));
+    }
+
+    #[test]
+    fn a_fork_test_build_counts_as_prerelease_so_official_stable_is_offered() {
+        assert!(is_prerelease_install("v4.98.1-test.2", &[]));
+    }
+}
+
+#[cfg(test)]
+mod version_order_tests {
+    use super::*;
+    use std::cmp::Ordering::*;
+
+    #[test]
+    fn official_release_outranks_every_test_build_of_it() {
+        for n in ["1", "2", "9", "10", "123"] {
+            let test = format!("v4.98.1-test.{n}");
+            assert!(is_version_newer("v4.98.1", &test), "{test}");
+            assert!(!is_version_newer(&test, "v4.98.1"), "{test}");
+            assert!(is_version_newer(&test, "v4.98.0"), "{test}");
+            assert!(!is_version_newer(&test, "v4.98.2"), "{test}");
+        }
+    }
+
+    #[test]
+    fn prerelease_identifiers_follow_semver_precedence() {
+        // Numeric identifiers compare as numbers, not strings.
+        assert_eq!(compare_versions("v4.98.1-test.10", "v4.98.1-test.9"), Some(Greater));
+        assert_eq!(compare_versions("1.0.0-alpha", "1.0.0-alpha.1"), Some(Less));
+        assert_eq!(compare_versions("1.0.0-alpha.1", "1.0.0-alpha.beta"), Some(Less));
+        assert_eq!(compare_versions("1.0.0-beta.2", "1.0.0-beta.11"), Some(Less));
+        assert_eq!(compare_versions("1.0.0-rc.1", "1.0.0"), Some(Less));
+        assert_eq!(compare_versions("v1.0.0", "1.0.0+build.7"), Some(Equal));
+        assert_eq!(compare_versions("v3.10.0", "v3.9.9"), Some(Greater));
+        assert_eq!(compare_versions("dev", "v1.0.0"), None);
+    }
+
+    #[test]
+    fn repo_setting_accepts_owner_or_owner_and_name() {
+        assert_eq!(normalize_repo("Sentry-Six").as_deref(), Some("Sentry-Six/Sentry-USB-Rusty"));
+        assert_eq!(normalize_repo(" skittles-fivem ").as_deref(), Some("skittles-fivem/Sentry-USB-Rusty"));
+        assert_eq!(normalize_repo("skittles-fivem/Sentry-USB-Rusty-testing").as_deref(),
+            Some("skittles-fivem/Sentry-USB-Rusty-testing"));
+        assert_eq!(normalize_repo("a/b_c.d").as_deref(), Some("a/b_c.d"));
+    }
+
+    #[test]
+    fn repo_setting_rejects_anything_github_would_not_name() {
+        let long_owner = "x".repeat(40);
+        let long_name = format!("owner/{}", "x".repeat(101));
+        for bad in ["", "/", "owner/", "/name", "a/b/c", "-owner", "owner-", "own_er", "own.er",
+            "owner/..", "owner/.", "owner/na me", "https://github.com/a/b", "owner/name?x=1",
+            "o\nwner", &long_owner, &long_name] {
+            assert_eq!(normalize_repo(bad), None, "{bad:?}");
+        }
     }
 }

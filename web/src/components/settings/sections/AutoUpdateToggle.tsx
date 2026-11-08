@@ -37,6 +37,7 @@ export function AutoUpdateToggle() {
       sub="After archiving. Restarts the Pi."
       help={<InfoButton title="Automatic updates">
         <p>Installs newer stable releases after archiving new footage and finishing all follow-up work. Pre-releases are never installed automatically.</p>
+        <p>That includes test builds (vX.Y.Z-test.N) from a custom update source: install those by hand. A device on a test build moves to the next official stable release automatically once the source is Official again.</p>
         <ul className="list-disc space-y-2 pl-5">
           <li>The archive must still be reachable after downloading.</li>
           <li>With Tesla BLE paired, the car must report Park and Sentry Mode off. The Sentry Mode check is skipped when SentryUSB uses it for keep-awake.</li>

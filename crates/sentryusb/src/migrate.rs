@@ -16,6 +16,7 @@ use tracing::{info, warn};
 
 const VERSION_FILE: &str = "/opt/sentryusb/version";
 const MIGRATE_DIR: &str = "/opt/sentryusb";
+#[cfg(test)]
 const MIGRATE_REPO: &str = "Sentry-Six/Sentry-USB-Rusty";
 const MIGRATE_BRANCH: &str = "main";
 const REPAIR_TOOL_SELECTOR: &str = include_str!("../../../run/xfs-repair-tool.py");
@@ -125,12 +126,15 @@ pub async fn run_startup_migration() -> bool {
     } else {
         current_version.clone()
     };
+    // The installed tag was published by the configured update source (a
+    // test fork's `-test.N` tags exist only there), so fetch scripts from it.
+    let repo = sentryusb_api::update::update_repo();
     let tarball_url = format!(
         "https://github.com/{}/archive/{}.tar.gz",
-        MIGRATE_REPO, script_ref
+        repo, script_ref
     );
 
-    let script = migration_script_for_mode(&tarball_url, &script_ref, automatic);
+    let script = migration_script_for_mode(&repo, &tarball_url, &script_ref, automatic);
 
     // Retry up to 3 times with exponential backoff. The script itself
     // fails fast on `curl: Could not resolve host: github.com` when DNS
@@ -236,8 +240,8 @@ pub async fn run_startup_migration() -> bool {
     false
 }
 
-fn migration_script_for_mode(tarball_url: &str, release_ref: &str, automatic: bool) -> String {
-    let mut script = build_migration_script(tarball_url, release_ref);
+fn migration_script_for_mode(repo: &str, tarball_url: &str, release_ref: &str, automatic: bool) -> String {
+    let mut script = build_migration_script(repo, tarball_url, release_ref);
     if automatic {
         // The payload was validated/staged with the target binary. Never fetch
         // main or resume a partial installation after an unexpected power cut.
@@ -250,11 +254,11 @@ fn migration_script_for_mode(tarball_url: &str, release_ref: &str, automatic: bo
     script
 }
 
-fn build_migration_script(tarball_url: &str, release_ref: &str) -> String {
+fn build_migration_script(repo: &str, tarball_url: &str, release_ref: &str) -> String {
     let helper_release_base = if release_ref == MIGRATE_BRANCH {
-        format!("https://github.com/{MIGRATE_REPO}/releases/latest/download")
+        format!("https://github.com/{repo}/releases/latest/download")
     } else {
-        format!("https://github.com/{MIGRATE_REPO}/releases/download/{release_ref}")
+        format!("https://github.com/{repo}/releases/download/{release_ref}")
     };
     format!(
         r#"set -e
@@ -667,7 +671,7 @@ rm -f /root/bin/tesla-control /root/bin/tesla-keygen \
       /usr/local/bin/tesla-control /usr/local/bin/tesla-keygen 2>/dev/null || true
 "#,
         tarball_url = tarball_url,
-        repo = MIGRATE_REPO,
+        repo = repo,
         helper_release_base = helper_release_base,
         branch = MIGRATE_BRANCH,
         ap_dnsmasq_conf = sentryusb_setup::network::ap_profile::AP_DNSMASQ_CONF,
@@ -762,7 +766,7 @@ mod tests {
 
     #[test]
     fn automatic_migration_uses_cached_payload_and_preserves_manual_fallback() {
-        let automatic = migration_script_for_mode("https://example.invalid/release.tar.gz", "v0.0.0", true);
+        let automatic = migration_script_for_mode(MIGRATE_REPO, "https://example.invalid/release.tar.gz", "v0.0.0", true);
         assert!(automatic.starts_with("SENTRYUSB_AUTOMATIC_UPDATE=1\n"));
         assert!(automatic.contains("tar xzf /opt/sentryusb/auto-update-source.tar.gz"));
         assert!(!automatic.contains("https://example.invalid/release.tar.gz"));
@@ -772,7 +776,7 @@ mod tests {
         use std::io::Write;
         child.stdin.take().unwrap().write_all(automatic.as_bytes()).unwrap();
         assert!(child.wait().unwrap().success());
-        let manual = migration_script_for_mode("https://example.invalid/release.tar.gz", "v0.0.0", false);
+        let manual = migration_script_for_mode(MIGRATE_REPO, "https://example.invalid/release.tar.gz", "v0.0.0", false);
         assert!(manual.contains("https://example.invalid/release.tar.gz"));
         assert!(manual.contains("FALLBACK="));
         assert!(!manual.starts_with("SENTRYUSB_AUTOMATIC_UPDATE=1"));
@@ -783,7 +787,7 @@ mod tests {
     /// at runtime on every user's Pi. Render it and let bash parse it.
     #[test]
     fn migration_script_parses() {
-        let script = build_migration_script(
+        let script = build_migration_script(MIGRATE_REPO,
             "https://github.com/Sentry-Six/Sentry-USB-Rusty/archive/v0.0.0.tar.gz",
             "v0.0.0",
         );
@@ -807,7 +811,7 @@ mod tests {
     #[test]
     fn migration_installs_the_hotspot_dnsmasq_conf_for_existing_nm_profiles() {
         use sentryusb_setup::network::ap_profile::{AP_DNSMASQ_CONF, AP_DNSMASQ_CONTENTS};
-        let script = build_migration_script("https://example.invalid/source.tar.gz", "v0.0.0");
+        let script = build_migration_script(MIGRATE_REPO, "https://example.invalid/source.tar.gz", "v0.0.0");
         let start = script.find("if nmcli -t con show SENTRYUSB_AP").unwrap();
         let end = start + script[start..].find("\nfi\n").unwrap() + "\nfi\n".len();
 
@@ -832,7 +836,7 @@ mod tests {
 
     #[test]
     fn migration_stops_the_hostapd_dnsmasq_handing_out_dns_once() {
-        let script = build_migration_script("https://example.invalid/source.tar.gz", "v0.0.0");
+        let script = build_migration_script(MIGRATE_REPO, "https://example.invalid/source.tar.gz", "v0.0.0");
         let start = script.find("if grep -qxF 'interface=lo,ap0' /etc/dnsmasq.conf").unwrap();
         let end = start + script[start..].find("\nfi\n").unwrap() + "\nfi\n".len();
 
@@ -870,7 +874,7 @@ mod tests {
 
     #[test]
     fn migration_script_repairs_dangling_aux_links() {
-        let script = build_migration_script(
+        let script = build_migration_script(MIGRATE_REPO,
             "https://github.com/Sentry-Six/Sentry-USB-Rusty/archive/v0.0.0.tar.gz",
             "v0.0.0",
         );
@@ -891,7 +895,7 @@ mod tests {
 
     #[test]
     fn migration_downloads_helpers_from_the_installed_release() {
-        let script = build_migration_script(
+        let script = build_migration_script(MIGRATE_REPO,
             "https://github.com/Sentry-Six/Sentry-USB-Rusty/archive/v0.0.0.tar.gz",
             "v0.0.0",
         );
@@ -908,11 +912,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn migration_uses_the_update_source_that_published_the_tag() {
+        let fork = "skittles-fivem/Sentry-USB-Rusty";
+        let script = build_migration_script(fork,
+            "https://github.com/skittles-fivem/Sentry-USB-Rusty/archive/v4.98.1-test.1.tar.gz",
+            "v4.98.1-test.1",
+        );
+        assert!(script.contains(
+            "https://github.com/skittles-fivem/Sentry-USB-Rusty/releases/download/v4.98.1-test.1/$_name-$_suffix"));
+        assert!(script.contains("https://github.com/skittles-fivem/Sentry-USB-Rusty/archive/main.tar.gz"));
+        assert!(!script.contains("Sentry-Six/Sentry-USB-Rusty/"), "a fork tag must not be fetched from official");
+    }
+
     #[cfg(unix)]
     #[test]
     fn helper_repair_keeps_automatic_updates_offline_and_manual_updates_versioned() {
         use std::os::unix::fs::{PermissionsExt, symlink};
-        let script = build_migration_script("https://example.invalid/source.tar.gz", "v1.2.3");
+        let script = build_migration_script(MIGRATE_REPO, "https://example.invalid/source.tar.gz", "v1.2.3");
         let start = script.find("    for _name in sentryusb-tesla-telemetry sentryusb-ble-action; do").unwrap();
         let end = start + script[start..].find("\n    done").unwrap() + "\n    done".len();
         let loop_body = &script[start..end];
