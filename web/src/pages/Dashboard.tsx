@@ -12,6 +12,7 @@ import {
   PhotoCameraIcon,
   ScheduleIcon,
   TimerIcon,
+  SpeedIcon,
   VitalSignsIcon,
   WarningIcon,
   WifiIcon,
@@ -578,6 +579,13 @@ export default function Dashboard() {
 
 // ─── Tiles ──────────────────────────────────────────────────────────────────
 
+/** Amber from 75% busy, red from 90%; plain below. */
+function getCpuUsageColor(percent: number): string | undefined {
+  if (percent >= 90) return "#f87171"
+  if (percent >= 75) return "#fbbf24"
+  return undefined
+}
+
 function SystemTile({
   status,
   uptime,
@@ -590,6 +598,7 @@ function SystemTile({
   keepAwakeIdle: boolean
 }) {
   const cpuTemp = parseInt(status.cpu_temp)
+  const cpuPercent = status.cpu_percent
   const supplyVoltage = status.supply_voltage
   return (
     <StatusTile
@@ -608,6 +617,14 @@ function SystemTile({
         value={cpuTemp > 0 ? formatTemp(cpuTemp, useFahrenheit) : "N/A"}
         valueColor={cpuTemp > 0 ? getTempColor(cpuTemp) : undefined}
       />
+      {typeof cpuPercent === "number" && Number.isFinite(cpuPercent) && (
+        <Row
+          icon={<SpeedIcon className="h-3.5 w-3.5" />}
+          label="CPU usage"
+          value={`${Math.round(cpuPercent)}%`}
+          valueColor={getCpuUsageColor(cpuPercent)}
+        />
+      )}
       {status.fan_speed && (
         <Row
           icon={<AirIcon className="h-3.5 w-3.5" />}

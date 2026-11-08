@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use crate::router::AppState;
 
 mod supply_voltage;
+mod cpu_usage;
 
 // Shared status snapshots keep UI polling independent of archive I/O.
 
@@ -300,6 +301,10 @@ pub type NetSampler = Arc<Mutex<HashMap<String, NetSample>>>;
 #[derive(Clone, Serialize)]
 struct PiStatus {
     cpu_temp: String,
+    /// CPU busy share across all cores since the previous status request,
+    /// in percent (I/O wait counts as idle). Omitted when unreadable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpu_percent: Option<f64>,
     num_snapshots: String,
     snapshot_oldest: String,
     snapshot_newest: String,
@@ -401,6 +406,8 @@ pub async fn get_status(
     // This cache is separate from filesystem status: a stalled archive must not
     // keep an old voltage reading alive, and status requests never wait for PMIC I/O.
     s.supply_voltage = supply_voltage::get();
+    // Measured per request, not cached with the filesystem snapshot above.
+    s.cpu_percent = cpu_usage::get().await;
 
     (StatusCode::OK, Json(serde_json::to_value(s).unwrap_or_default()))
 }
@@ -409,6 +416,7 @@ pub async fn get_status(
 fn status_fs_snapshot() -> PiStatus {
     let mut s = PiStatus {
         cpu_temp: String::new(),
+        cpu_percent: None,
         num_snapshots: "0".into(),
         snapshot_oldest: String::new(),
         snapshot_newest: String::new(),

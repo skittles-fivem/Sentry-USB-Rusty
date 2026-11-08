@@ -26,6 +26,8 @@ export interface ManagedStorageHealth {
 
 export interface PiStatus {
   cpu_temp: string
+  /** CPU busy share across all cores since the previous status poll, 0–100; absent when unreadable. */
+  cpu_percent?: number | null
   num_snapshots: string
   snapshot_oldest: string
   snapshot_newest: string
