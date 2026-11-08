@@ -135,13 +135,13 @@ removes `REPO` again. A custom source always lists its pre-releases, since
 that is what test builds are.
 
 **Tag format.** Fork releases must use `v<semver>` tags, and test builds take
-the *next* official patch version plus `-test.<n>`. With official at `v4.98.0`,
-tag `v4.98.1-test.1`, then `v4.98.1-test.2`, and so on. Semver ranks a release
-above its own pre-releases, so the official `v4.98.1` is newer than every
-`v4.98.1-test.N`: after switching the source back to Official, the Pi offers
-`v4.98.1` (or whatever official latest is by then) as one update. Before
-official `v4.98.1` exists, the Settings page offers "Revert to Stable" back to
-`v4.98.0`. Never tag a fork release with a plain `vX.Y.Z` version the official
+the *next* official patch version plus `-test.<n>`. With official at `v3.28.9`,
+tag `v3.28.10-test.1`, then `v3.28.10-test.2`, and so on. Semver ranks a release
+above its own pre-releases, so the official `v3.28.10` is newer than every
+`v3.28.10-test.N`: after switching the source back to Official, the Pi offers
+`v3.28.10` (or whatever official latest is by then) as one update. Before
+official `v3.28.10` exists, the Settings page offers "Revert to Stable" back to
+`v3.28.9`. Never tag a fork release with a plain `vX.Y.Z` version the official
 project hasn't shipped: it would outrank, or collide with, the real release.
 Tags that aren't semver at all (`1.22`, `latest`) are ignored: the Pi never
 offers or installs them.
@@ -152,7 +152,7 @@ offers or installs them.
    and allow `GITHUB_TOKEN` read and write access (Settings > Actions >
    General > Workflow permissions) so the workflow can create the release.
 2. Commit to the fork's `main`, then push the tag:
-   `git tag v4.98.1-test.1 && git push origin v4.98.1-test.1`.
+   `git tag v3.28.10-test.1 && git push origin v3.28.10-test.1`.
 3. `Build & Release` (`.github/workflows/build.yml`) runs on the `v*` tag,
    builds every variant and creates the GitHub Release with the assets listed
    above. A tag containing `-` is marked as a pre-release automatically, and

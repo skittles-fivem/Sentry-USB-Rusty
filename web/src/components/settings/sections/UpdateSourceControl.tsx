@@ -54,7 +54,7 @@ export function UpdateSourceControl({ onChange }: { onChange?: (source: UpdateSo
       <span className="t-md">Update source</span>
       <InfoButton title="Update source">
         <p>Where updates are downloaded from. Official releases come from {source?.official_repo ?? OFFICIAL_REPO}.</p>
-        <p>A custom repository is for testing a fork's builds. Tag them <code>v&lt;next patch&gt;-test.&lt;n&gt;</code> (for example v4.98.1-test.1 while official is v4.98.0), so the next official release always counts as newer. Switch back to Official to get that release in one update.</p>
+        <p>A custom repository is for testing a fork's builds. Tag them <code>v&lt;next patch&gt;-test.&lt;n&gt;</code> (for example v3.28.10-test.1 while official is v3.28.9), so the next official release always counts as newer. Switch back to Official to get that release in one update.</p>
         <p>Test builds are pre-releases, so they are never installed automatically. Install them with the button above.</p>
       </InfoButton>
     </div>
