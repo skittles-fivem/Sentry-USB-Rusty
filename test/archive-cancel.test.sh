@@ -52,6 +52,11 @@ archive_teslacam_clips() {
 archive_is_reachable() { return 0; }
 clear_archive_status() { echo clear >> "$work/calls"; }
 cloud_upload_step() { echo cloud >> "$work/calls"; }
+# Archive verification and the share status file have their own tests
+# (archiveloop-archive-verify.test.sh); here they only need to exist.
+verify_archived_clips() { :; }
+write_share_status() { :; }
+SHARE_STATUS_DIR=.sentryusb SHARE_STATUS_NAME=archive-status.json
 LOG_FILE="$work/log"
 CAM_CLEANUP_DEFERRED="$work/cleanup-deferred"
 archive_wait_for_processor() { :; }

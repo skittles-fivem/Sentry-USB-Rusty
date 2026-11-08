@@ -456,6 +456,11 @@ archive_is_reachable() { return 0; }
 travel_mode_active() { return 1; }
 cam_user_media_may_need_sync() { return 1; }
 cloud_upload_step() { :; }
+# Archive verification and the share status file have their own tests
+# (archiveloop-archive-verify.test.sh); here they only need to exist.
+verify_archived_clips() { :; }
+write_share_status() { :; }
+SHARE_STATUS_DIR=.sentryusb SHARE_STATUS_NAME=archive-status.json
 MUSIC_MOUNT="$workdir/unused-music"
 disable_calls=0
 enable_calls=0

@@ -2161,6 +2161,12 @@ function verify_archived_clips () {
   nosource=$(awk -F'\t' '$5 == "nosource"' "$ARCHIVE_VERIFY_WORK/results-all" | wc -l)
   [ ! -s "$ARCHIVE_VERIFY_QUEUE" ] || left=$(wc -l < "$ARCHIVE_VERIFY_QUEUE")
   log "Archive verification: $ok matched, $bad to re-send, $nosource with no Pi copy left to compare, $left still queued${stopped:+ ($stopped)}"
+  ARCHIVE_VERIFY_RAN=1
+  ARCHIVE_VERIFY_MATCHED=$ok
+  ARCHIVE_VERIFY_RESEND=$bad
+  ARCHIVE_VERIFY_NOSOURCE=$nosource
+  ARCHIVE_VERIFY_LEFT=$left
+  ARCHIVE_VERIFY_STOPPED=$stopped
 
   # Only release snapshots after a complete, clean pass.
   if [ -z "$stopped" ]
@@ -2168,6 +2174,199 @@ function verify_archived_clips () {
     auto_delete_verified_snapshots || log "WARNING: auto-delete of verified snapshots failed"
   fi
   [ -z "$stopped" ] || [ "$stopped" = "archive cancelled" ]
+}
+
+# ── Status file on the archive share ──────────────────────────────────────
+#
+# After each archive cycle, write .sentryusb/archive-status.json at the root
+# of the archive destination, so tools that read the share (Sentry Manager)
+# can show what the Pi last did. The folder is dot-prefixed and the file
+# isn't an .mp4, so footage scanners skip it. The file is replaced
+# atomically: a reader sees the old or the new version, never half of one.
+#
+# Format (schema 1; counts are integers, times are Unix seconds):
+# {
+#   "schema": 1,
+#   "device": "<hostname>",
+#   "written_unix": 1762646400,
+#   "archive": {
+#     "result": "in_progress" | "ok" | "failed" | "nothing_new",
+#                                 failed: some files didn't move; they are
+#                                 retried next cycle (files_not_archived)
+#     "started_unix": ..., "finished_unix": ...,
+#     "files_archived": N,        files moved to the share this cycle
+#     "files_not_archived": N,    files that should have moved but didn't
+#     "last_clip": "RecentClips/2026-11-08/2026-11-08_12-59-00-front.mp4" | null
+#   },
+#   "verification": {
+#     "enabled": true|false,      SHA-256 check of archived clips is on
+#     "ran": true|false,          a check ran this cycle
+#     "matched": N,               server copy matched the Pi's (this cycle)
+#     "resending": N,             mismatched or missing; sent again next cycle
+#     "no_pi_copy": N,            snapshot gone before it could be compared
+#     "still_queued": N,          left for the next cycle
+#     "stopped": "<reason>" | null
+#   },
+#   "auto_delete_enabled": true|false,
+#   "state": "transferring" | "idle",
+#   "transfer": null | {          the transfer this cycle started
+#     "started_unix": ...,
+#     "files": N, "bytes": N,     what is being sent
+#     "first_clip": "<relpath>",  oldest clip in the transfer, by clip name
+#     "last_clip": "<relpath>",   newest clip in the transfer, by clip name
+#     "expected_finish_unix": ...,
+#     "give_up_unix": ...
+#   }
+# }
+#
+# The file is written twice per cycle: with "state": "transferring" just
+# before the clips start moving, and with "state": "idle" (and the results
+# above) once the cycle's archive and checksum steps are done.
+#
+# How a reader should treat a transfer: clips between first_clip and
+# last_clip are on their way, so a missing minute in that range isn't a gap
+# yet. If the file still says "transferring" after give_up_unix, the car most
+# likely drove off or the Pi lost its connection mid-transfer: nothing is
+# lost (the clips stay on the Pi and the transfer resumes the next time it
+# reaches the archive), so keep waiting rather than reporting the range as
+# missing. expected_finish_unix is estimated from the throughput of the last
+# successful transfer (2 MB/s until one has been measured, doubled in Travel
+# Mode); give_up_unix adds half that time again, at least 15 minutes.
+SHARE_STATUS_DIR=.sentryusb
+SHARE_STATUS_NAME=archive-status.json
+
+function json_string () {
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\t'/\\t}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/\\r}
+  printf '"%s"' "$s"
+}
+
+function json_int () {
+  if [[ "${1:-}" =~ ^[0-9]+$ ]]; then printf '%s' "$1"; else printf 'null'; fi
+}
+
+function json_bool () {
+  if "$@" >/dev/null 2>&1; then printf 'true'; else printf 'false'; fi
+}
+
+function build_share_status_json () {
+  local clip=null stopped=null ran=false
+  [ -z "${ARCHIVE_LAST_CLIP:-}" ] || clip=$(json_string "$ARCHIVE_LAST_CLIP")
+  [ -z "${ARCHIVE_VERIFY_STOPPED:-}" ] || stopped=$(json_string "$ARCHIVE_VERIFY_STOPPED")
+  [ "${ARCHIVE_VERIFY_RAN:-0}" != 1 ] || ran=true
+  printf '{\n'
+  printf '  "schema": 1,\n'
+  printf '  "device": %s,\n' "$(json_string "$(hostname 2>/dev/null || echo sentryusb)")"
+  printf '  "written_unix": %s,\n' "$(date +%s)"
+  printf '  "archive": {\n'
+  printf '    "result": %s,\n' "$(json_string "${ARCHIVE_LAST_RESULT:-nothing_new}")"
+  printf '    "started_unix": %s,\n' "$(json_int "${ARCHIVE_LAST_START:-}")"
+  printf '    "finished_unix": %s,\n' "$(json_int "${ARCHIVE_LAST_END:-}")"
+  printf '    "files_archived": %s,\n' "$(json_int "${ARCHIVE_LAST_ARCHIVED:-0}")"
+  printf '    "files_not_archived": %s,\n' "$(json_int "${ARCHIVE_LAST_LEFT:-0}")"
+  printf '    "last_clip": %s\n' "$clip"
+  printf '  },\n'
+  printf '  "verification": {\n'
+  printf '    "enabled": %s,\n' "$(json_bool archive_verify_enabled)"
+  printf '    "ran": %s,\n' "$ran"
+  printf '    "matched": %s,\n' "$(json_int "${ARCHIVE_VERIFY_MATCHED:-0}")"
+  printf '    "resending": %s,\n' "$(json_int "${ARCHIVE_VERIFY_RESEND:-0}")"
+  printf '    "no_pi_copy": %s,\n' "$(json_int "${ARCHIVE_VERIFY_NOSOURCE:-0}")"
+  printf '    "still_queued": %s,\n' "$(json_int "${ARCHIVE_VERIFY_LEFT:-0}")"
+  printf '    "stopped": %s\n' "$stopped"
+  printf '  },\n'
+  printf '  "auto_delete_enabled": %s,\n' "$(json_bool archive_auto_delete_enabled)"
+  printf '  "state": %s,\n' "$(json_string "${ARCHIVE_SHARE_STATE:-idle}")"
+  if [ -n "${ARCHIVE_PLAN_START:-}" ]
+  then
+    printf '  "transfer": {\n'
+    printf '    "started_unix": %s,\n' "$(json_int "$ARCHIVE_PLAN_START")"
+    printf '    "files": %s,\n' "$(json_int "${ARCHIVE_PLAN_FILES:-0}")"
+    printf '    "bytes": %s,\n' "$(json_int "${ARCHIVE_PLAN_BYTES:-0}")"
+    printf '    "first_clip": %s,\n' "$(if [ -n "${ARCHIVE_PLAN_FIRST:-}" ]; then json_string "$ARCHIVE_PLAN_FIRST"; else printf null; fi)"
+    printf '    "last_clip": %s,\n' "$(if [ -n "${ARCHIVE_PLAN_LAST:-}" ]; then json_string "$ARCHIVE_PLAN_LAST"; else printf null; fi)"
+    printf '    "expected_finish_unix": %s,\n' "$(json_int "${ARCHIVE_PLAN_FINISH:-}")"
+    printf '    "give_up_unix": %s\n' "$(json_int "${ARCHIVE_PLAN_GIVE_UP:-}")"
+    printf '  }\n'
+  else
+    printf '  "transfer": null\n'
+  fi
+  printf '}\n'
+}
+
+# Bytes per second of the last successful transfer (see
+# record_archive_throughput); used to estimate when the next one finishes.
+ARCHIVE_THROUGHPUT_FILE=/mutable/archive_throughput
+
+# Plan the transfer about to start, for the "transferring" status file:
+# $1 is the archive list, $2 the directory its paths are relative to.
+function plan_share_transfer () {
+  local list=$1 root=$2 rate secs
+  ARCHIVE_PLAN_START=$(date +%s)
+  ARCHIVE_PLAN_FILES=$(wc -l < "$list")
+  # Sizes through the links; the earlier short-recording pass already
+  # mounted the same snapshots, so this is a cheap second stat.
+  ARCHIVE_PLAN_BYTES=$( (cd "$root" && xargs -a "$list" -d '\n' stat -L -c %s 2>/dev/null) |
+    awk '{ t += $1 } END { printf "%d", t }')
+  local range
+  range=$(awk -F/ '$NF ~ /\.mp4$/ { print $NF "\t" $0 }' "$list" | LC_ALL=C sort | cut -f2-)
+  ARCHIVE_PLAN_FIRST=$(head -1 <<< "$range")
+  ARCHIVE_PLAN_LAST=$(tail -1 <<< "$range")
+  rate=$(cat "$ARCHIVE_THROUGHPUT_FILE" 2>/dev/null || true)
+  [[ "$rate" =~ ^[0-9]+$ ]] && [ "$rate" -gt 0 ] || rate=2000000
+  secs=$(( ARCHIVE_PLAN_BYTES / rate + 60 ))
+  if travel_mode_active; then secs=$((secs * 2)); fi
+  ARCHIVE_PLAN_FINISH=$((ARCHIVE_PLAN_START + secs))
+  local grace=$((secs / 2))
+  [ "$grace" -ge 900 ] || grace=900
+  ARCHIVE_PLAN_GIVE_UP=$((ARCHIVE_PLAN_FINISH + grace))
+}
+
+# After a fully successful transfer of at least 30 s, remember its
+# throughput for the next estimate. Short or failed transfers say little.
+function record_archive_throughput () {
+  local secs=$(( ${ARCHIVE_LAST_END:-0} - ${ARCHIVE_PLAN_START:-0} ))
+  [ "${ARCHIVE_LAST_RESULT:-}" = ok ] || return 0
+  [ "$secs" -ge 30 ] && [ "${ARCHIVE_PLAN_BYTES:-0}" -gt 0 ] || return 0
+  echo $(( ARCHIVE_PLAN_BYTES / secs )) > "$ARCHIVE_THROUGHPUT_FILE.new" &&
+    mv "$ARCHIVE_THROUGHPUT_FILE.new" "$ARCHIVE_THROUGHPUT_FILE"
+}
+
+# Write the status file to the archive destination. Best effort: a failure
+# is logged and never fails the archive cycle.
+function write_share_status () {
+  [ "${ARCHIVE_SYSTEM:-none}" != "none" ] || return 0
+  local stage=/tmp/archive-share-status
+  rm -rf "$stage"
+  mkdir -p "$stage/$SHARE_STATUS_DIR" || return 1
+  build_share_status_json > "$stage/$SHARE_STATUS_DIR/$SHARE_STATUS_NAME" || return 1
+  case "$ARCHIVE_SYSTEM" in
+    cifs|nfs)
+      # Copy to a dot-named temp file beside it, then rename over the old one.
+      local dest="$ARCHIVE_MOUNT/$SHARE_STATUS_DIR"
+      timeout 30 mkdir -p "$dest" &&
+        timeout 30 cp "$stage/$SHARE_STATUS_DIR/$SHARE_STATUS_NAME" "$dest/.$SHARE_STATUS_NAME.tmp" &&
+        timeout 30 mv -f "$dest/.$SHARE_STATUS_NAME.tmp" "$dest/$SHARE_STATUS_NAME"
+      ;;
+    rsync)
+      # rsync writes a dot-named temp file and renames it into place.
+      local -a ssh_cmd
+      archive_ssh_command
+      timeout 60 rsync -r --no-perms --omit-dir-times -e "${ssh_cmd[*]}" \
+        "$stage/$SHARE_STATUS_DIR" "$RSYNC_USER@$RSYNC_SERVER:$RSYNC_PATH/"
+      ;;
+    rclone)
+      timeout 120 rclone --config /root/.config/rclone/rclone.conf copyto \
+        "$stage/$SHARE_STATUS_DIR/$SHARE_STATUS_NAME" "$RCLONE_DRIVE:$RCLONE_PATH/$SHARE_STATUS_DIR/$SHARE_STATUS_NAME"
+      ;;
+    *)
+      return 0
+      ;;
+  esac
 }
 
 function write_archive_status () {
@@ -2559,6 +2758,15 @@ function archive_teslacam_clips () {
   fi
 
   local archive_success=true
+  # Results for the status file on the share (write_share_status). Reset
+  # here so a cycle with nothing new reports that, not the previous cycle.
+  ARCHIVE_LAST_RESULT=nothing_new
+  ARCHIVE_LAST_START=$(date +%s)
+  ARCHIVE_LAST_END=$ARCHIVE_LAST_START
+  ARCHIVE_LAST_ARCHIVED=0
+  ARCHIVE_LAST_LEFT=0
+  ARCHIVE_LAST_CLIP=""
+  ARCHIVE_PLAN_START="" ARCHIVE_SHARE_STATE=idle
   if [[ "$total_count" -gt 0 ]]
   then
     log "Starting recording archiving"
@@ -2635,6 +2843,13 @@ function archive_teslacam_clips () {
     # checksummed against the archive server's copy afterwards.
     local -r linktargets=/tmp/archive_link_targets
     record_archive_link_targets "$overlaylower" "${sentrylist}" "$linktargets"
+
+    # Tell tools reading the share a transfer is starting: which clips, and
+    # when it should be done (see the status file notes above).
+    plan_share_transfer "${sentrylist}" "$overlaymerged"
+    ARCHIVE_SHARE_STATE=transferring ARCHIVE_LAST_RESULT=in_progress
+    write_share_status || log "WARNING: could not write $SHARE_STATUS_DIR/$SHARE_STATUS_NAME to the archive"
+    ARCHIVE_SHARE_STATE=idle
 
     local travel_active=0
     if travel_mode_active; then travel_active=1; fi
@@ -2747,6 +2962,15 @@ function archive_teslacam_clips () {
     fi
     local -r end_ts=$(date --utc --date "now" +%s)
     local -r delta=$((end_ts - start_ts))
+    ARCHIVE_LAST_START=$start_ts
+    ARCHIVE_LAST_END=$end_ts
+    ARCHIVE_LAST_ARCHIVED=$((sentry_archived + trackmode_archived))
+    ARCHIVE_LAST_LEFT=$((total_count - ARCHIVE_LAST_ARCHIVED))
+    if [ "$archive_success" = "true" ]; then ARCHIVE_LAST_RESULT=ok; else ARCHIVE_LAST_RESULT=failed; fi
+    # Newest clip moved this cycle, by clip name (Tesla names sort by time).
+    ARCHIVE_LAST_CLIP=$(awk -F/ '$NF ~ /\.mp4$/ { print $NF "\t" $0 }' "$newly_archived" 2>/dev/null |
+      LC_ALL=C sort | tail -1 | cut -f2-)
+    record_archive_throughput || log "WARNING: could not save the archive throughput estimate"
     message+=" in $(convert_seconds_to_nice_time $delta)"
     if [ "$archive_success" = "false" ] && [ -n "$fail_temp" ]; then
       message+=". SoC temp at failure: $fail_temp"
@@ -3042,6 +3266,9 @@ function archive_clips () {
   # Set by archive_teslacam_clips when it starts this cycle's Live Activity;
   # post-archive-process.sh sends processing progress only for that one.
   export LIVE_ACTIVITY_ACTIVE=0
+  # This cycle's verification results, for the status file on the share.
+  ARCHIVE_VERIFY_RAN=0 ARCHIVE_VERIFY_STOPPED="" ARCHIVE_VERIFY_MATCHED=0
+  ARCHIVE_VERIFY_RESEND=0 ARCHIVE_VERIFY_NOSOURCE=0 ARCHIVE_VERIFY_LEFT=0
 
   if ! archive_run_command /root/bin/connect-archive.sh
   then
@@ -3147,6 +3374,11 @@ function archive_clips () {
   if [ "$clips_ok" = true ] && ! travel_mode_active; then
     verify_archived_clips || { ARCHIVE_ALL_STAGES_OK=0; log "Archive verification stopped before finishing; the rest is checked next cycle"; }
     if archive_cancel_requested; then archive_cancel_cleanup; return 125; fi
+  fi
+  # Tell tools reading the share what this cycle did, failures included.
+  if archive_is_reachable; then
+    ARCHIVE_SHARE_STATE=idle
+    write_share_status || log "WARNING: could not write $SHARE_STATUS_DIR/$SHARE_STATUS_NAME to the archive"
   fi
   archive_run_command /root/bin/post-archive-process.sh || { ARCHIVE_ALL_STAGES_OK=0; log "Post-archive processing stopped (exit $?)"; }
   if archive_cancel_requested; then archive_cancel_cleanup; return 125; fi

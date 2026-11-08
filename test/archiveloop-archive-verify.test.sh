@@ -17,7 +17,9 @@ extract() {
 for fn in sortfile prunefile archive_conf_value archive_verify_enabled archive_auto_delete_enabled \
   record_archive_link_targets queue_archived_for_verification archive_ssh_command \
   archive_remote_sha256 archive_set_aside_remote verify_archive_batch prune_archive_verify_ledger \
-  queue_archive_rechecks snapshot_verified_twice auto_delete_verified_snapshots verify_archived_clips
+  queue_archive_rechecks snapshot_verified_twice auto_delete_verified_snapshots verify_archived_clips \
+  json_string json_int json_bool build_share_status_json plan_share_transfer record_archive_throughput \
+  write_share_status
 do
   src=$(extract "$fn")
   [ -n "$src" ] || { echo "function $fn not found in $script" >&2; exit 1; }
@@ -153,6 +155,48 @@ echo 'export ARCHIVE_VERIFY=false' > "$workdir/sentryusb.conf"
 echo "x"$'\t'"y" > "$ARCHIVE_VERIFY_QUEUE"
 verify_archived_clips
 [ ! -e "$ARCHIVE_VERIFY_QUEUE" ] || fail "disabled verification left the queue behind"
+
+# --- status file on the share ---------------------------------------------
+echo 'export ARCHIVE_AUTO_DELETE_VERIFIED=true' > "$workdir/sentryusb.conf"
+travel_mode_active() { return 1; }
+SHARE_STATUS_DIR=.sentryusb SHARE_STATUS_NAME=archive-status.json
+ARCHIVE_THROUGHPUT_FILE="$workdir/mutable/archive_throughput"
+validate_json() { python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])), sort_keys=True))' "$1"; }
+status_json="$ARCHIVE_MOUNT/.sentryusb/archive-status.json"
+
+# Start of a transfer: range, size and deadlines from the default 2 MB/s.
+printf '%s\n' RecentClips/2026-11-07/2026-11-07_10-00-00-front.mp4 'SentryClips/ev "1"/2026-11-07_09-59-00-back.mp4' > "$workdir/plan"
+mkdir -p "$workdir/planroot/RecentClips/2026-11-07" "$workdir/planroot/SentryClips/ev \"1\""
+head -c 3000000 /dev/zero > "$workdir/planroot/RecentClips/2026-11-07/2026-11-07_10-00-00-front.mp4"
+head -c 1000000 /dev/zero > "$workdir/planroot/SentryClips/ev \"1\"/2026-11-07_09-59-00-back.mp4"
+plan_share_transfer "$workdir/plan" "$workdir/planroot"
+[ "$ARCHIVE_PLAN_BYTES" = 4000000 ] || fail "planned bytes $ARCHIVE_PLAN_BYTES"
+[ $((ARCHIVE_PLAN_FINISH - ARCHIVE_PLAN_START)) = 62 ] || fail "expected 4 MB / 2 MB/s + 60 s"
+[ $((ARCHIVE_PLAN_GIVE_UP - ARCHIVE_PLAN_FINISH)) = 900 ] || fail "give-up grace should be at least 15 min"
+ARCHIVE_SHARE_STATE=transferring ARCHIVE_LAST_RESULT=in_progress
+write_share_status || fail "status write failed"
+out=$(validate_json "$status_json") || fail "status file is not valid JSON: $(cat "$status_json")"
+for want in '"state": "transferring"' '"result": "in_progress"' '"files": 2' \
+  '"first_clip": "SentryClips/ev \"1\"/2026-11-07_09-59-00-back.mp4"' \
+  '"last_clip": "RecentClips/2026-11-07/2026-11-07_10-00-00-front.mp4"' '"auto_delete_enabled": true'
+do
+  grep -qF "$want" <<< "$out" || fail "status file lacks $want: $out"
+done
+ls -A "$ARCHIVE_MOUNT/.sentryusb" | grep -qv '^archive-status.json$' && fail "temp file left beside the status file"
+
+# End of the cycle: idle with results; throughput learned for next time.
+ARCHIVE_SHARE_STATE=idle ARCHIVE_LAST_RESULT=ok ARCHIVE_LAST_ARCHIVED=2 ARCHIVE_LAST_LEFT=0
+ARCHIVE_LAST_END=$((ARCHIVE_PLAN_START + 40)) ARCHIVE_LAST_CLIP=RecentClips/2026-11-07/2026-11-07_10-00-00-front.mp4
+ARCHIVE_VERIFY_RAN=1 ARCHIVE_VERIFY_MATCHED=2 ARCHIVE_VERIFY_STOPPED=""
+record_archive_throughput
+[ "$(cat "$ARCHIVE_THROUGHPUT_FILE")" = 100000 ] || fail "throughput should be 4 MB / 40 s"
+write_share_status
+out=$(validate_json "$status_json") || fail "idle status file is not valid JSON"
+for want in '"state": "idle"' '"result": "ok"' '"files_archived": 2' '"matched": 2' '"ran": true' '"stopped": null'; do
+  grep -qF "$want" <<< "$out" || fail "idle status lacks $want: $out"
+done
+ARCHIVE_PLAN_START="" ; write_share_status
+grep -q '"transfer": null' "$status_json" || fail "no transfer this cycle should write transfer: null"
 
 if [ "$failures" -gt 0 ]; then
   echo "$failures failure(s)" >&2

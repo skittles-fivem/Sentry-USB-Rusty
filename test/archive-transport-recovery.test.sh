@@ -251,6 +251,11 @@ clear_archive_status() { :; }
 copy_music_files() { music=$((music + 1)); }
 ensure_usb_drives_connected() { ensures=$((ensures + 1)); }
 cloud_upload_step() { cloud=$((cloud + 1)); }
+# Archive verification and the share status file have their own tests
+# (archiveloop-archive-verify.test.sh); here they only need to exist.
+verify_archived_clips() { :; }
+write_share_status() { :; }
+SHARE_STATUS_DIR=.sentryusb SHARE_STATUS_NAME=archive-status.json
 archive_transport_recover() { checks=$((checks + 1)); }
 archive_cancel_cleanup() { :; }
 ARCHIVE_SYSTEM=rsync MUSIC_SHARE_NAME=Music MUSIC_MOUNT=$work/music

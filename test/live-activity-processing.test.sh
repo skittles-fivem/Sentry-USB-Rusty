@@ -35,6 +35,11 @@ archive_is_reachable() { return 0; }
 clear_archive_status() { :; }
 cloud_upload_step() { echo cloud >> "$work/calls"; }
 travel_mode_active() { return 1; }
+# Archive verification and the share status file have their own tests
+# (archiveloop-archive-verify.test.sh); here they only need to exist.
+verify_archived_clips() { :; }
+write_share_status() { :; }
+SHARE_STATUS_DIR=.sentryusb SHARE_STATUS_NAME=archive-status.json
 ensure_usb_drives_connected() { :; }
 MUSIC_MOUNT="$work/no-music"
 LOG_FILE="$work/log"

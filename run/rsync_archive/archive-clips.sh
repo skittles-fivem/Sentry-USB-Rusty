@@ -13,20 +13,29 @@
 # transfer isn't killed by a brief mobile-link hiccup. Normal mode keeps the
 # original snappy values byte-for-byte so "drive away from home" recovery is
 # unchanged.
+# An interrupted transfer is kept for resuming, but never under the clip's
+# final name: plain --partial left a truncated .mp4 at the real path until the
+# next cycle finished it, and tools reading the share (Sentry Manager) counted
+# that half-copied clip. A relative --partial-dir puts the partial in a hidden
+# folder inside the clip's destination folder; rsync resumes from it next
+# cycle, moves the finished file into place, removes the folder once empty,
+# and excludes the folder from the transfer itself.
+RSYNC_PARTIAL_DIR=.sentryusb-partial
+
 if [ "${TRAVEL_MODE_ACTIVE:-0}" = "1" ]; then
   MONITOR_MISSES=20            # ~minutes of sustained loss before giving up
   MONITOR_TIMEOUT=20           # must exceed the patient probe (ping 4 + ssh 8 ~= 12s)
   export ARCHIVE_PING_TIMEOUT=4 ARCHIVE_SSH_TIMEOUT=8
-  RSYNC_EXTRA=(--partial)      # resume an interrupted large clip next cycle
+  RSYNC_EXTRA=(--partial-dir="$RSYNC_PARTIAL_DIR")  # resume an interrupted large clip next cycle
 else
   MONITOR_MISSES=5             # unchanged
   MONITOR_TIMEOUT=6            # unchanged
-  # --partial in normal mode too: with the archive reads now running at low
-  # I/O priority behind the car's writes, rsync's own --timeout=600 can
-  # abort a slowed-but-wanted transfer; without --partial the in-flight
-  # clip would restart from byte 0 next cycle, re-reading gigabytes against
-  # the same contended disk.
-  RSYNC_EXTRA=(--partial)
+  # Keep partial transfers in normal mode too: with the archive reads now
+  # running at low I/O priority behind the car's writes, rsync's own
+  # --timeout=600 can abort a slowed-but-wanted transfer; without a kept
+  # partial the in-flight clip would restart from byte 0 next cycle,
+  # re-reading gigabytes against the same contended disk.
+  RSYNC_EXTRA=(--partial-dir="$RSYNC_PARTIAL_DIR")
 fi
 
 # Optional non-standard SSH port (RSYNC_SSH_PORT in sentryusb.conf). It has
