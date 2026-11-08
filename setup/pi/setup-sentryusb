@@ -147,6 +147,8 @@ then
   # source the conf file directly to get REPO, BRANCH or download_sources
   # in case they're set
   safesource /root/sentryusb.conf
+  # REPO may name a whole repository (owner/name), as the update source does.
+  if [[ "${REPO:-}" == */* ]]; then REPO_NAME=${REPO#*/}; REPO=${REPO%%/*}; fi
   REPO=${REPO:-Sentry-Six}
   REPO_NAME=${REPO_NAME:-Sentry-USB-Rusty}
   BRANCH=${BRANCH:-main}

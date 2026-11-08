@@ -136,7 +136,12 @@ async fn latest_stable(current: &str) -> Result<Option<String>> {
     let tag = v.get("tag_name").and_then(|v| v.as_str()).context("Release has no tag")?;
     let draft = v.get("draft").and_then(|v| v.as_bool()).context("Release draft flag missing")?;
     let pre = v.get("prerelease").and_then(|v| v.as_bool()).context("Release prerelease flag missing")?;
-    ensure!(numeric_version(current).is_some() && numeric_version(tag).is_some(), "Unrecognized version format");
+    ensure!(crate::update::parse_semver(current).is_some(), "Unrecognized version format");
+    // A non-semver latest release (a fork's old `1.22`) is never a target.
+    if numeric_version(tag).is_none() {
+        tracing::info!("auto-update: latest release tag {tag:?} is not vX.Y.Z; skipping");
+        return Ok(None);
+    }
     Ok(stable_target_is_newer(current, tag, draft, pre).then(|| tag.to_owned()))
 }
 
@@ -371,12 +376,13 @@ fn numeric_version(value: &str) -> Option<[u64; 3]> {
     Some(version)
 }
 
+/// Only a plain `X.Y.Z` stable release is ever a target. The installed
+/// version may be a prerelease, such as a fork's `X.Y.Z-test.N` test build:
+/// semver ranks the official `X.Y.Z` above it, so the device returns to
+/// official in one update once the source is official again.
 fn stable_target_is_newer(installed: &str, candidate: &str, draft: bool, prerelease: bool) -> bool {
-    if draft || prerelease { return false; }
-    match (numeric_version(installed), numeric_version(candidate)) {
-        (Some(current), Some(target)) => target > current,
-        _ => false,
-    }
+    if draft || prerelease || numeric_version(candidate).is_none() { return false; }
+    crate::update::compare_versions(candidate, installed) == Some(std::cmp::Ordering::Greater)
 }
 
 #[cfg(test)]
@@ -503,6 +509,15 @@ mod tests {
             ("dev", "v4.0.0", false, false, false),
             ("v3.10.22", "v4.0.0.1", false, false, false),
             ("v3.10.22", "v4.0.0-beta", false, false, false),
+            // A test build moves to the official release it previews, never back.
+            ("v4.98.1-test.2", "v4.98.1", false, false, true),
+            ("v4.98.1-test.2", "v4.98.0", false, false, false),
+            ("v4.98.1", "v4.98.1-test.3", false, false, false),
+            ("v4.98.1-test.2", "v4.98.1-test.3", false, true, false),
+            // A fork's old non-semver release is never installed.
+            ("v3.28.9", "1.22", false, false, false),
+            ("v3.28.9", "latest", false, false, false),
+            ("v3.28.9", "", false, false, false),
         ] {
             assert_eq!(stable_target_is_newer(current, candidate, draft, pre), expected,
                 "{current} -> {candidate}, draft={draft}, prerelease={pre}");

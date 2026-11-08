@@ -105,6 +105,8 @@ function read_setup_variables {
   done
 
   # set defaults for things not set in the config
+  # REPO may name a whole repository (owner/name), as the update source does.
+  if [[ "${REPO:-}" == */* ]]; then REPO_NAME=${REPO#*/}; REPO=${REPO%%/*}; fi
   REPO=${REPO:-Sentry-Six}
   REPO_NAME=${REPO_NAME:-Sentry-USB-Rusty}
   SNAPSHOTS_ENABLED=${SNAPSHOTS_ENABLED:-true}

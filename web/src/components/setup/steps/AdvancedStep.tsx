@@ -484,12 +484,13 @@ export function AdvancedStep({ data, onChange, setupAlreadyFinished }: StepProps
         </div>
         <p className="mb-2 text-xs text-slate-500">
           GitHub source used for both initial setup tarball downloads and OTA
-          updates. Forks must keep the original repo name (Sentry-USB-Rusty)
-          and use semver-compatible release tags (e.g. v1.2.3).
+          updates. Enter an owner (the repo name stays Sentry-USB-Rusty) or a
+          full owner/name for a fork with another name. Tag fork test builds
+          v&lt;next patch&gt;-test.&lt;n&gt; (e.g. v1.2.4-test.1).
         </p>
         <div className="grid gap-3 sm:grid-cols-2">
           <Field label="GitHub Repo" field="REPO" placeholder="Sentry-Six"
-            data={data} onChange={onChange} hint="GitHub user/org. Used for both setup downloads and OTA updates." />
+            data={data} onChange={onChange} hint="GitHub owner, or owner/name. Used for both setup downloads and OTA updates." />
           <Field label="Branch" field="BRANCH" placeholder="main"
             data={data} onChange={onChange} hint="Setup-time tarball downloads only. OTA updates always use GitHub Releases." />
         </div>

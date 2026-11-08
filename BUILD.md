@@ -124,6 +124,57 @@ builds its image. To rebuild or test, run the workflow by hand with a tag;
 turn off "publish" to keep the result as a workflow artifact instead of
 attaching it.
 
+### Test builds from a fork
+
+A Pi can update from a fork instead of official: in Settings > Software
+Updates > Update source, choose **Custom repository** and enter the fork as
+`owner/name` (the field starts at `skittles-fivem/Sentry-USB-Rusty`). This
+writes `REPO` in `sentryusb.conf`; `REPO=owner` (the repository name stays
+`Sentry-USB-Rusty`) and `REPO=owner/name` both work. Choosing **Official**
+removes `REPO` again. A custom source always lists its pre-releases, since
+that is what test builds are.
+
+**Tag format.** Fork releases must use `v<semver>` tags, and test builds take
+the *next* official patch version plus `-test.<n>`. With official at `v4.98.0`,
+tag `v4.98.1-test.1`, then `v4.98.1-test.2`, and so on. Semver ranks a release
+above its own pre-releases, so the official `v4.98.1` is newer than every
+`v4.98.1-test.N`: after switching the source back to Official, the Pi offers
+`v4.98.1` (or whatever official latest is by then) as one update. Before
+official `v4.98.1` exists, the Settings page offers "Revert to Stable" back to
+`v4.98.0`. Never tag a fork release with a plain `vX.Y.Z` version the official
+project hasn't shipped: it would outrank, or collide with, the real release.
+Tags that aren't semver at all (`1.22`, `latest`) are ignored: the Pi never
+offers or installs them.
+
+**Publishing a fork release the Pi can install.**
+
+1. In the fork, enable GitHub Actions (forks start with workflows disabled)
+   and allow `GITHUB_TOKEN` read and write access (Settings > Actions >
+   General > Workflow permissions) so the workflow can create the release.
+2. Commit to the fork's `main`, then push the tag:
+   `git tag v4.98.1-test.1 && git push origin v4.98.1-test.1`.
+3. `Build & Release` (`.github/workflows/build.yml`) runs on the `v*` tag,
+   builds every variant and creates the GitHub Release with the assets listed
+   above. A tag containing `-` is marked as a pre-release automatically, and
+   the `SD Card Image` workflow skips pre-releases.
+4. The Pi needs, from that release: `sentryusb-<variant>` for its board
+   (required), and `sentryusb-tesla-telemetry-<variant>` and
+   `sentryusb-ble-action-<variant>` (optional; without them those components
+   stay on the previous version). It also fetches the tag's source archive
+   and `setup/pi/apply-runtime-patches.sh` at that tag from the same
+   repository, which GitHub serves for every tag. Don't attach binaries by
+   hand under other names.
+5. On the Pi, check for updates and install the build from the Pre-release
+   card, which names the repository it comes from.
+
+Downloads from a fork are verified the same way as official ones: the file
+size and, when GitHub lists one, the SHA-256 digest of each release asset. Official
+releases aren't signed, so a fork needs no key. Automatic installation only
+takes stable releases, so `-test.N` builds are always installed by hand. A
+device on a test build is moved to the next official stable release
+automatically once the source is Official again (if automatic installation is
+on).
+
 armv6 (Pi Zero W / Pi 1) is no longer built — the board is too underpowered
 to run the daemon comfortably, and dropping the matrix entry keeps the
 release artifact count manageable.
