@@ -1702,7 +1702,14 @@ function intersect {
 #                          leaves are checked the next time it's home.
 #   ARCHIVE_VERIFY_LEDGER  one line per check:
 #                          "<relpath>\t<size>\t<sha256>\t<unix>\t<status>\t<times verified>\t<Pi source path>"
-#                          status: ok | mismatch | missing | nosource
+#                          status: ok | converted | converted_unconfirmed |
+#                                  mismatch | missing | nosource
+#                          converted: Sentry Manager re-encoded the server copy
+#                          in place (H.265/AV1), and the original is confirmed
+#                          by Manager's checksum record or by an earlier match.
+#                          Counts like ok. converted_unconfirmed: re-encoded
+#                          before anything could confirm the original. Kept,
+#                          never re-sent, never counts toward auto-delete.
 #                          "times verified" counts consecutive ok checks of
 #                          the same bytes; any failure resets it to 0.
 #
@@ -1872,6 +1879,90 @@ function archive_set_aside_remote () {
   esac
 }
 
+# Re-encoded footage. Sentry Manager can convert clips on the share to
+# H.265/AV1 in place (its "replace" output mode), keeping the name. The
+# converted file can't match the Pi's SHA-256, and must not be treated as
+# damaged: renaming it aside and re-sending the original would undo the
+# conversion and loop forever. A server copy that differs is "converted" when
+# its video track is H.265/AV1 and the Pi's copy isn't. The codec is read from
+# the MP4 sample-entry tag (hvc1/hev1 for H.265, av01 for AV1) in the first and
+# last MiB of the file, where the moov box lives (Tesla writes it last,
+# re-encoders usually first), so a check never reads a whole clip. grep -c
+# (not -q) reads all of that input: -q would stop at the first match and
+# break the pipe under head/tail, which pipefail would report as failure.
+ARCHIVE_REENCODED_TAGS='hvc1|hev1|av01'
+
+# True if the local file $1 is already H.265/AV1.
+function archive_local_is_reencoded () {
+  [ -f "$1" ] || return 1
+  { head -c 1048576 -- "$1"; tail -c 1048576 -- "$1"; } 2>/dev/null |
+    grep -a -c -E "$ARCHIVE_REENCODED_TAGS" >/dev/null
+}
+
+# True if the archive server's copy of relpath $1 is H.265/AV1.
+function archive_remote_is_reencoded () {
+  local rel=$1
+  case "${ARCHIVE_SYSTEM:-none}" in
+    cifs|nfs)
+      # shellcheck disable=SC2016 # $1 is expanded by the inner bash
+      timeout 120 bash -c '{ head -c 1048576 -- "$1"; tail -c 1048576 -- "$1"; } 2>/dev/null' _ "$ARCHIVE_MOUNT/$rel" |
+        grep -a -c -E "$ARCHIVE_REENCODED_TAGS" >/dev/null ;;
+    rsync)
+      local -a ssh_cmd
+      archive_ssh_command
+      local remote
+      remote="cd $(printf %q "$RSYNC_PATH") && { head -c 1048576 -- $(printf %q "$rel"); tail -c 1048576 -- $(printf %q "$rel"); } 2>/dev/null"
+      timeout 120 "${ssh_cmd[@]}" "$RSYNC_USER@$RSYNC_SERVER" "$remote" |
+        grep -a -c -E "$ARCHIVE_REENCODED_TAGS" >/dev/null ;;
+    rclone)
+      local -a rc_cmd=(rclone --config /root/.config/rclone/rclone.conf cat)
+      { timeout 120 "${rc_cmd[@]}" --head 1048576 "$RCLONE_DRIVE:$RCLONE_PATH/$rel"
+        timeout 120 "${rc_cmd[@]}" --tail 1048576 "$RCLONE_DRIVE:$RCLONE_PATH/$rel"; } 2>/dev/null |
+        grep -a -c -E "$ARCHIVE_REENCODED_TAGS" >/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+
+# Sentry Manager's record of originals it re-encoded in place, at the share
+# root, in sha256sum format ("<sha256>  <relpath>", relpath from the share
+# root, one line per clip, written BEFORE the original is replaced). With
+# it, a clip Manager converted before the Pi could check it is still
+# verified by checksum: the Pi's SHA-256 is compared with Manager's hash of
+# the original. Absent file or line: the Pi falls back to the codec check.
+ARCHIVE_MANAGER_CHECKSUMS=.sentrymanager/original-checksums.sha256
+
+# Print "<sha256>\t<relpath>" from Manager's record for the relpaths in $1.
+# Prints nothing (and succeeds) when the record doesn't exist.
+function archive_manager_original_sums () {
+  local rels=$1 out
+  out="$ARCHIVE_VERIFY_WORK/manager-sums"
+  : > "$out"
+  case "${ARCHIVE_SYSTEM:-none}" in
+    cifs|nfs)
+      [ -f "$ARCHIVE_MOUNT/$ARCHIVE_MANAGER_CHECKSUMS" ] || return 0
+      timeout 120 grep -a -F -f "$rels" -- "$ARCHIVE_MOUNT/$ARCHIVE_MANAGER_CHECKSUMS" > "$out" 2>/dev/null ;;
+    rsync)
+      # The server filters its own record; only matching lines come back.
+      local -a ssh_cmd
+      archive_ssh_command
+      timeout 120 "${ssh_cmd[@]}" "$RSYNC_USER@$RSYNC_SERVER" \
+        "cd $(printf %q "$RSYNC_PATH") && if [ -f $(printf %q "$ARCHIVE_MANAGER_CHECKSUMS") ]; then grep -a -F -f - -- $(printf %q "$ARCHIVE_MANAGER_CHECKSUMS"); fi" \
+        < "$rels" > "$out" 2>/dev/null ;;
+    rclone)
+      timeout 300 rclone --config /root/.config/rclone/rclone.conf cat \
+        "$RCLONE_DRIVE:$RCLONE_PATH/$ARCHIVE_MANAGER_CHECKSUMS" 2>/dev/null |
+        grep -a -F -f "$rels" > "$out" ;;
+  esac
+  # grep -F matched substrings; keep exact relpaths only (newest line wins).
+  awk -v rels="$rels" '
+    FILENAME == rels { want[$0] = 1; next }
+    substr($0, 65, 2) == "  " && substr($0, 1, 64) ~ /^[0-9a-f]+$/ {
+      rel = substr($0, 67); sub(/^\*/, "", rel)
+      if (rel in want) print substr($0, 1, 64) "\t" rel
+    }' "$rels" "$out"
+  return 0
+}
+
 # Check one batch of queue lines ($1) and append the results to the ledger.
 # $ARCHIVE_VERIFY_WORK/prev holds each clip's latest ledger line from before
 # this run, which carries the "times verified" count forward.
@@ -1913,6 +2004,56 @@ function verify_archive_batch () {
         count = (ps[$1] == "ok" && ph[$1] == $3) ? pc[$1] + 1 : 1
       print $1 "\t" $2 "\t" $3 "\t" now "\t" status "\t" count "\t" $4
     }' "$ARCHIVE_VERIFY_WORK/prev" "$ARCHIVE_VERIFY_WORK/remote" "$localsums" > "$ARCHIVE_VERIFY_WORK/results"
+
+  # A mismatch that is Sentry Manager's in-place re-encode (server copy
+  # H.265/AV1, Pi copy not) is never renamed aside or re-sent as damage:
+  # that would undo the conversion and loop forever. It is:
+  #  - converted: Manager's record of the original's SHA-256 matches the
+  #    Pi's, or (no record) the clip already matched by checksum before it
+  #    was converted. "Times verified" keeps counting;
+  #  - mismatch: Manager's record exists but doesn't match the Pi's copy, so
+  #    Manager converted a bad upload; re-send the original as usual;
+  #  - converted_unconfirmed: no record and never matched before conversion.
+  #    Kept, but it never counts toward auto-delete.
+  # A re-check whose Pi copy is gone is judged by its stored hash.
+  local reclass="$ARCHIVE_VERIFY_WORK/reclass" manager_sums="$ARCHIVE_VERIFY_WORK/manager"
+  : > "$reclass"
+  if grep -q $'\tmismatch\t' "$ARCHIVE_VERIFY_WORK/results"
+  then
+    awk -F'\t' '$5 == "mismatch" { print $1 }' "$ARCHIVE_VERIFY_WORK/results" > "$ARCHIVE_VERIFY_WORK/mismatched"
+    archive_manager_original_sums "$ARCHIVE_VERIFY_WORK/mismatched" > "$manager_sums"
+    local orig prev_status
+    while IFS=$'\t' read -r rel _ sum _ status _ src
+    do
+      [ "$status" = mismatch ] || continue
+      archive_remote_is_reencoded "$rel" || continue
+      ! archive_local_is_reencoded "$src" || continue
+      orig=$(awk -F'\t' -v r="$rel" '$2 == r { s = $1 } END { print s }' "$manager_sums")
+      prev_status=$(awk -F'\t' -v r="$rel" '$1 == r { s = $5 } END { print s }' "$ARCHIVE_VERIFY_WORK/prev")
+      if [ -n "$orig" ] && [ "$orig" = "$sum" ]; then
+        printf '%s\tconverted\n' "$rel" >> "$reclass"
+      elif [ -n "$orig" ]; then
+        log "ERROR: archive verification: Sentry Manager re-encoded $rel from a copy that doesn't match the Pi's (SHA-256); renaming its output aside and sending the original again"
+      elif [ "$prev_status" = ok ] || [ "$prev_status" = converted ]; then
+        printf '%s\tconverted\n' "$rel" >> "$reclass"
+      else
+        printf '%s\tconverted_unconfirmed\n' "$rel" >> "$reclass"
+      fi
+    done < "$ARCHIVE_VERIFY_WORK/results"
+  fi
+  if [ -s "$reclass" ]
+  then
+    awk -F'\t' -v OFS='\t' -v prev="$ARCHIVE_VERIFY_WORK/prev" -v rc="$reclass" '
+      FILENAME == prev { ps[$1] = $5; pc[$1] = $6 + 0; next }
+      FILENAME == rc { to[$1] = $2; next }
+      ($1 in to) && $5 == "mismatch" {
+        $5 = to[$1]
+        if ($5 == "converted") $6 = (ps[$1] == "ok" || ps[$1] == "converted") ? pc[$1] + 1 : 1
+        else $6 = 0
+      }
+      { print }' "$ARCHIVE_VERIFY_WORK/prev" "$reclass" "$ARCHIVE_VERIFY_WORK/results" > "$ARCHIVE_VERIFY_WORK/results.new" &&
+      mv "$ARCHIVE_VERIFY_WORK/results.new" "$ARCHIVE_VERIFY_WORK/results"
+  fi
 
   # Send mismatched and missing clips again next cycle.
   local resend="$ARCHIVE_VERIFY_WORK/resend"
@@ -1979,7 +2120,7 @@ function queue_archive_rechecks () {
     END {
       for (r in last) {
         split(last[r], f, "\t")
-        if (f[5] == "ok" && f[6] + 0 == 1 && f[4] + 0 <= cutoff)
+        if ((f[5] == "ok" || f[5] == "converted") && f[6] + 0 == 1 && f[4] + 0 <= cutoff)
           print f[1] "\t" f[7] "\t" f[2] "\t" f[3]
       }
     }' "$ARCHIVE_VERIFY_LEDGER" >> "$ARCHIVE_VERIFY_QUEUE"
@@ -2003,7 +2144,7 @@ function snapshot_verified_twice () {
       return p
     }
     FILENAME == ledger {
-      if ($5 == "ok" && $6 + 0 >= 2) { k = key($1); if (!(k in vs) || $2 + 0 > vs[k]) vs[k] = $2 + 0 }
+      if (($5 == "ok" || $5 == "converted") && $6 + 0 >= 2) { k = key($1); if (!(k in vs) || $2 + 0 > vs[k]) vs[k] = $2 + 0 }
       next
     }
     {
@@ -2189,14 +2330,16 @@ function verify_archived_clips () {
   fi
   prune_archive_verify_ledger || log "WARNING: could not prune the archive verification ledger"
 
-  local ok bad nosource left=0
+  local ok bad nosource converted left=0
   ok=$(awk -F'\t' '$5 == "ok"' "$ARCHIVE_VERIFY_WORK/results-all" | wc -l)
+  converted=$(awk -F'\t' '$5 == "converted" || $5 == "converted_unconfirmed"' "$ARCHIVE_VERIFY_WORK/results-all" | wc -l)
   bad=$(awk -F'\t' '$5 == "mismatch" || $5 == "missing"' "$ARCHIVE_VERIFY_WORK/results-all" | wc -l)
   nosource=$(awk -F'\t' '$5 == "nosource"' "$ARCHIVE_VERIFY_WORK/results-all" | wc -l)
   [ ! -s "$ARCHIVE_VERIFY_QUEUE" ] || left=$(wc -l < "$ARCHIVE_VERIFY_QUEUE")
-  log "Archive verification: $ok matched, $bad to re-send, $nosource with no Pi copy left to compare, $left still queued${stopped:+ ($stopped)}"
+  log "Archive verification: $ok matched, $converted re-encoded on the server by Sentry Manager, $bad to re-send, $nosource with no Pi copy left to compare, $left still queued${stopped:+ ($stopped)}"
   ARCHIVE_VERIFY_RAN=1
   ARCHIVE_VERIFY_MATCHED=$ok
+  ARCHIVE_VERIFY_CONVERTED=$converted
   ARCHIVE_VERIFY_RESEND=$bad
   ARCHIVE_VERIFY_NOSOURCE=$nosource
   ARCHIVE_VERIFY_LEFT=$left
@@ -2236,6 +2379,7 @@ function verify_archived_clips () {
 #     "enabled": true|false,      SHA-256 check of archived clips is on
 #     "ran": true|false,          a check ran this cycle
 #     "matched": N,               server copy matched the Pi's (this cycle)
+#     "converted": N,             re-encoded in place by Sentry Manager; kept
 #     "resending": N,             mismatched or missing; sent again next cycle
 #     "no_pi_copy": N,            snapshot gone before it could be compared
 #     "still_queued": N,          left for the next cycle
@@ -2308,6 +2452,7 @@ function build_share_status_json () {
   printf '    "enabled": %s,\n' "$(json_bool archive_verify_enabled)"
   printf '    "ran": %s,\n' "$ran"
   printf '    "matched": %s,\n' "$(json_int "${ARCHIVE_VERIFY_MATCHED:-0}")"
+  printf '    "converted": %s,\n' "$(json_int "${ARCHIVE_VERIFY_CONVERTED:-0}")"
   printf '    "resending": %s,\n' "$(json_int "${ARCHIVE_VERIFY_RESEND:-0}")"
   printf '    "no_pi_copy": %s,\n' "$(json_int "${ARCHIVE_VERIFY_NOSOURCE:-0}")"
   printf '    "still_queued": %s,\n' "$(json_int "${ARCHIVE_VERIFY_LEFT:-0}")"
@@ -3302,7 +3447,7 @@ function archive_clips () {
   export LIVE_ACTIVITY_ACTIVE=0
   # This cycle's verification results, for the status file on the share.
   ARCHIVE_VERIFY_RAN=0 ARCHIVE_VERIFY_STOPPED="" ARCHIVE_VERIFY_MATCHED=0
-  ARCHIVE_VERIFY_RESEND=0 ARCHIVE_VERIFY_NOSOURCE=0 ARCHIVE_VERIFY_LEFT=0
+  ARCHIVE_VERIFY_RESEND=0 ARCHIVE_VERIFY_NOSOURCE=0 ARCHIVE_VERIFY_LEFT=0 ARCHIVE_VERIFY_CONVERTED=0
 
   if ! archive_run_command /root/bin/connect-archive.sh
   then

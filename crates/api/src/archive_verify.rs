@@ -8,7 +8,12 @@
 //! <archive relpath>\t<size>\t<sha256>\t<unix>\t<status>\t<times verified>\t<Pi source>
 //! ```
 //!
-//! `status` is `ok`, `mismatch`, `missing` or `nosource`; `times verified`
+//! `status` is `ok`, `converted`, `converted_unconfirmed`, `mismatch`,
+//! `missing` or `nosource`. `converted`: Sentry Manager re-encoded the server
+//! copy in place (H.265/AV1) and the original is confirmed by Manager's
+//! checksum record or an earlier match; it counts as verified.
+//! `converted_unconfirmed`: re-encoded before anything confirmed the
+//! original; kept on the server but never counted as verified; `times verified`
 //! counts consecutive `ok` checks of the same bytes. Clips waiting to be
 //! checked are listed in `/mutable/archive_verify_pending`.
 //!
@@ -124,6 +129,13 @@ pub struct Coverage {
     pub verified: usize,
     /// Clips verified at least twice (what auto-delete requires).
     pub verified_twice: usize,
+    /// Of `verified`, clips Sentry Manager re-encoded in place on the server
+    /// (H.265/AV1), with the original confirmed by checksum.
+    pub converted: usize,
+    /// Clips Sentry Manager re-encoded before the Pi or Manager's checksum
+    /// record could confirm the original. Not verified; they keep the
+    /// snapshot from being auto-deleted.
+    pub unconfirmed: usize,
     /// Clips sent and waiting for their checksum check.
     pub pending: usize,
     /// Clips whose latest check failed (mismatch or missing).
@@ -201,6 +213,8 @@ fn coverage(
         clips: 0,
         verified: 0,
         verified_twice: 0,
+        converted: 0,
+        unconfirmed: 0,
         pending: 0,
         failed: 0,
         not_archived: 0,
@@ -224,11 +238,18 @@ fn coverage(
         match ledger.get(&key) {
             // The server copy must be at least as large as this snapshot's:
             // an older snapshot can hold a clip the car was still writing.
-            Some(e) if e.status == "ok" && e.size >= size => {
+            Some(e) if (e.status == "ok" || e.status == "converted") && e.size >= size => {
                 c.verified += 1;
+                if e.status == "converted" {
+                    c.converted += 1;
+                }
                 if e.times >= 2 {
                     c.verified_twice += 1;
                 }
+                c.last_checked_unix = c.last_checked_unix.max(Some(e.unix));
+            }
+            Some(e) if e.status == "converted_unconfirmed" => {
+                c.unconfirmed += 1;
                 c.last_checked_unix = c.last_checked_unix.max(Some(e.unix));
             }
             Some(e) if (e.status == "mismatch" || e.status == "missing") && !queue.contains(&key) => {
@@ -500,6 +521,28 @@ mod tests {
         // Once checked, the ledger decides, not the archived list.
         let l = ledger(&["SentryClips/ev/2026-11-07_10-00-00-back.mp4\t150000\th\t20\tmismatch\t0\tx"]);
         assert_eq!(coverage(TOC, &l, &HashSet::new(), &archived, &settings(true, true)).state, "failed");
+    }
+
+    #[test]
+    fn clips_re_encoded_by_sentry_manager_count_as_verified() {
+        let l = ledger(&[
+            "RecentClips/2026-11-07/2026-11-07_10-00-00-front.mp4\t150000\th\t10\tconverted\t2\tx",
+            "SentryClips/ev/2026-11-07_10-00-00-back.mp4\t150000\th\t20\tok\t2\tx",
+        ]);
+        let c = coverage(TOC, &l, &HashSet::new(), &HashSet::new(), &settings(true, true));
+        assert_eq!((c.state, c.verified, c.converted, c.verified_twice), ("verified", 2, 1, 2));
+        assert!(c.ready_to_delete);
+    }
+
+    #[test]
+    fn clips_re_encoded_before_any_check_are_not_verified() {
+        let l = ledger(&[
+            "RecentClips/2026-11-07/2026-11-07_10-00-00-front.mp4\t150000\th\t10\tconverted_unconfirmed\t0\tx",
+            "SentryClips/ev/2026-11-07_10-00-00-back.mp4\t150000\th\t20\tok\t2\tx",
+        ]);
+        let c = coverage(TOC, &l, &HashSet::new(), &HashSet::new(), &settings(true, true));
+        assert_eq!((c.state, c.verified, c.unconfirmed), ("partial", 1, 1));
+        assert!(!c.ready_to_delete);
     }
 
     #[test]

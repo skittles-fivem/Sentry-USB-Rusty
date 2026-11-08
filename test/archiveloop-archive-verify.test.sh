@@ -17,6 +17,7 @@ extract() {
 for fn in sortfile prunefile archive_conf_value archive_verify_enabled archive_auto_delete_enabled \
   record_archive_link_targets queue_archived_for_verification archive_ssh_command \
   archive_remote_sha256 archive_set_aside_remote verify_archive_batch prune_archive_verify_ledger \
+  archive_local_is_reencoded archive_remote_is_reencoded archive_manager_original_sums \
   queue_unverified_archived queue_archive_rechecks snapshot_verified_twice auto_delete_verified_snapshots verify_archived_clips \
   json_string json_int json_bool build_share_status_json plan_share_transfer record_archive_throughput \
   write_share_status
@@ -54,6 +55,8 @@ export ARCHIVE_RECENTCLIPS=true
 ARCHIVE_VERIFY_QUEUE="$workdir/mutable/archive_verify_pending"
 ARCHIVE_VERIFY_LEDGER="$workdir/mutable/archive_verified.tsv"
 ARCHIVE_VERIFY_WORK="$workdir/work"
+ARCHIVE_REENCODED_TAGS='hvc1|hev1|av01'
+ARCHIVE_MANAGER_CHECKSUMS=.sentrymanager/original-checksums.sha256
 SNAPSHOT_LOCK_DIR="$workdir/backingfiles/snapshots"
 : > "$workdir/sentryusb.conf"
 
@@ -110,7 +113,7 @@ grep -q 10-01-00 "$workdir/mutable/sentry_files_archived" && fail "damaged clip 
 grep -q 11-00-00 "$workdir/mutable/sentry_files_archived" && fail "missing clip still marked archived (would never be re-sent)"
 grep -q 10-00-00 "$workdir/mutable/sentry_files_archived" || fail "verified clip dropped from the archived list"
 [ ! -e "$ARCHIVE_VERIFY_QUEUE" ] || fail "queue not emptied after a complete pass"
-grep -q "1 matched, 2 to re-send" <<< "$logs" || fail "summary line wrong: $logs"
+grep -q "1 matched, 0 re-encoded on the server by Sentry Manager, 2 to re-send" <<< "$logs" || fail "summary line wrong: $logs"
 
 # --- re-send, then second check; auto-delete off releases nothing ------------
 (cd "$lower" && for f in RecentClips/2026-11-07/2026-11-07_10-01-00-front.mp4 RecentClips/2026-11-07/2026-11-07_11-00-00-front.mp4; do cp -L "$f" "$workdir/share/$f"; done)
@@ -173,6 +176,81 @@ grep -q "Queueing 1 previously archived file(s)" "$workdir/log" || fail "backlog
 : > "$workdir/log"
 verify_archived_clips
 grep -q "previously archived" "$workdir/log" && fail "backlog clip queued twice: $(cat "$workdir/log")"
+
+# --- Sentry Manager re-encodes a clip in place on the share -----------------
+# First check matches; then the share copy is replaced by an "H.265" file
+# (same name, different bytes, an hvc1 sample entry). The second check must
+# call it converted: kept, not renamed aside, not re-sent, and still counted
+# toward auto-delete.
+conv_rel=RecentClips/2026-11-07/2026-11-07_13-00-00-front.mp4
+echo 'export ARCHIVE_AUTO_DELETE_VERIFIED=true ARCHIVE_VERIFY_RECHECK_SECONDS=0' > "$workdir/sentryusb.conf"
+{ head -c 4000 /dev/urandom; printf 'stsd....hvc1....'; head -c 4000 /dev/urandom; } > "$workdir/share/$conv_rel"
+: > "$workdir/log"
+verify_archived_clips
+[ "$(status_of "$conv_rel")" = converted/2 ] || fail "re-encoded copy should be converted/2, got $(status_of "$conv_rel"): $(cat "$workdir/log")"
+grep -q "1 re-encoded on the server by Sentry Manager" "$workdir/log" || fail "summary should count the conversion: $(cat "$workdir/log")"
+ls "$workdir/share/RecentClips/2026-11-07/" | grep -q '13-00-00-front.mp4.mismatch' && fail "re-encoded copy was renamed aside"
+grep -q 13-00-00 "$workdir/mutable/sentry_files_archived" || fail "re-encoded clip dropped from the archived list (would be re-sent)"
+grep -q "doesn't match" "$workdir/log" && fail "a conversion was logged as a mismatch"
+[ "$(snapshot_verified_twice "$snaps/snap-000003/snap.bin.toc")" = "yes 1" ] || fail "converted clips should count toward auto-delete"
+
+# A server copy that differs and is NOT a re-encode is still a mismatch,
+# even when its name says .mp4.
+mismatch_rel=RecentClips/2026-11-07/2026-11-07_14-00-00-front.mp4
+make_snap snap-000004 2026-11-07_14-00-00-front.mp4
+ln -s "$snaps/snap-000004/mnt/TeslaCam/RecentClips/2026-11-07_14-00-00-front.mp4" "$lower/$mismatch_rel"
+head -c 150000 /dev/urandom > "$workdir/share/$mismatch_rel"
+echo "$mismatch_rel" >> "$workdir/mutable/sentry_files_archived"
+: > "$workdir/log"
+verify_archived_clips
+[ "$(status_of "$mismatch_rel")" = mismatch/0 ] || fail "garbage server copy should be a mismatch, got $(status_of "$mismatch_rel")"
+
+# --- re-encoded BEFORE the Pi's first check --------------------------------
+# new_reencoded <hh>: a snapshot clip whose share copy is already "H.265".
+new_reencoded() {
+  local name="2026-11-07_$1-00-00-front.mp4" rel="RecentClips/2026-11-07/2026-11-07_$1-00-00-front.mp4"
+  make_snap "snap-0000$1" "$name"
+  ln -s "$snaps/snap-0000$1/mnt/TeslaCam/RecentClips/$name" "$lower/$rel"
+  { head -c 4000 /dev/urandom; printf 'stsd....hvc1....'; } > "$workdir/share/$rel"
+  echo "$rel" >> "$workdir/mutable/sentry_files_archived"
+}
+pi_sum() { sha256sum < "$snaps/snap-0000$1/mnt/TeslaCam/RecentClips/2026-11-07_$1-00-00-front.mp4" | cut -c1-64; }
+echo 'export ARCHIVE_AUTO_DELETE_VERIFIED=true' > "$workdir/sentryusb.conf"
+
+# No Manager record: kept, not re-sent, but unconfirmed (no auto-delete).
+new_reencoded 15
+: > "$workdir/log"
+verify_archived_clips
+r15=RecentClips/2026-11-07/2026-11-07_15-00-00-front.mp4
+[ "$(status_of $r15)" = converted_unconfirmed/0 ] || fail "early re-encode without a record should be unconfirmed, got $(status_of $r15)"
+ls "$workdir/share/RecentClips/2026-11-07/" | grep -q '15-00-00-front.mp4.mismatch' && fail "unconfirmed re-encode was renamed aside"
+grep -q 15-00-00 "$workdir/mutable/sentry_files_archived" || fail "unconfirmed re-encode would be re-sent"
+[ "$(snapshot_verified_twice "$snaps/snap-000015/snap.bin.toc")" = "no 1 1 0" ] || fail "unconfirmed re-encode must block auto-delete"
+
+# Manager's record matches the Pi's copy: converted, confirmed by checksum.
+new_reencoded 16
+r16=RecentClips/2026-11-07/2026-11-07_16-00-00-front.mp4
+mkdir -p "$workdir/share/.sentrymanager"
+printf '%s  %s\n' "$(pi_sum 16)" "$r16" >> "$workdir/share/$ARCHIVE_MANAGER_CHECKSUMS"
+# A substring of another path must not match (grep -F alone would).
+printf '%s  %s\n' "$(printf 'f%.0s' {1..64})" "x$r16" >> "$workdir/share/$ARCHIVE_MANAGER_CHECKSUMS"
+verify_archived_clips
+[ "$(status_of $r16)" = converted/1 ] || fail "early re-encode with a matching record should be converted/1, got $(status_of $r16)"
+
+# Manager's record doesn't match: Manager converted a bad upload; re-send.
+new_reencoded 17
+r17=RecentClips/2026-11-07/2026-11-07_17-00-00-front.mp4
+printf '%s  %s\n' "$(printf '0%.0s' {1..64})" "$r17" >> "$workdir/share/$ARCHIVE_MANAGER_CHECKSUMS"
+: > "$workdir/log"
+verify_archived_clips
+[ "$(status_of $r17)" = mismatch/0 ] || fail "re-encode of a bad copy should be a mismatch, got $(status_of $r17)"
+grep -q "re-encoded $r17 from a copy that doesn't match" "$workdir/log" || fail "bad-source re-encode not explained: $(cat "$workdir/log")"
+ls "$workdir/share/RecentClips/2026-11-07/" | grep -q '17-00-00-front.mp4.mismatch' || fail "bad-source re-encode not renamed aside"
+grep -q 17-00-00 "$workdir/mutable/sentry_files_archived" && fail "bad-source re-encode not queued for re-send"
+
+# A Pi copy that is itself H.265 proves nothing about a differing server copy.
+printf 'hvc1' >> "$snaps/snap-000004/mnt/TeslaCam/RecentClips/2026-11-07_14-00-00-front.mp4"
+archive_local_is_reencoded "$snaps/snap-000004/mnt/TeslaCam/RecentClips/2026-11-07_14-00-00-front.mp4" || fail "local hvc1 not detected"
 
 # --- verification off: queue is dropped, nothing runs ----------------------
 echo 'export ARCHIVE_VERIFY=false' > "$workdir/sentryusb.conf"
