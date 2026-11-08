@@ -44,6 +44,7 @@ pub mod logs;
 pub mod devices;
 pub mod cloud;
 pub mod snapshots;
+pub mod archive_verify;
 pub mod keep_accessory;
 pub mod charging;
 pub mod climate;

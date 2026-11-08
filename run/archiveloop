@@ -1687,6 +1687,489 @@ function intersect {
   mv /tmp/prune_tmp.$$ "$1"
 }
 
+# ── Archive verification ───────────────────────────────────────────────────
+#
+# After clips are moved to the archive server, check each one by SHA-256:
+# hash the copy on the Pi (the snapshot the clip was sent from) and the copy
+# on the server, and compare. Results go to a ledger the Snapshots page
+# reads to tag snapshots "Verified on archive".
+#
+#   ARCHIVE_VERIFY_QUEUE   clips still to check, one per line:
+#                          "<archive relpath>\t<Pi source path>[\t<size>\t<sha256>]"
+#                          (size/sha256 are only on re-checks, so a re-check
+#                          still works after the source snapshot is gone).
+#                          Durable, so clips archived just before the car
+#                          leaves are checked the next time it's home.
+#   ARCHIVE_VERIFY_LEDGER  one line per check:
+#                          "<relpath>\t<size>\t<sha256>\t<unix>\t<status>\t<times verified>\t<Pi source path>"
+#                          status: ok | mismatch | missing | nosource
+#                          "times verified" counts consecutive ok checks of
+#                          the same bytes; any failure resets it to 0.
+#
+# A mismatched server copy is renamed to "<name>.mismatch-<unix>" (never
+# deleted) and a missing one is noted; both are dropped from the
+# archived-files list so the next archive cycle sends them again from the
+# snapshot, and the re-sent copy is verified like any other.
+#
+# Optional auto-delete (ARCHIVE_AUTO_DELETE_VERIFIED=true, off by default,
+# toggled in Settings): once every clip in a snapshot has been verified
+# twice, at least ARCHIVE_VERIFY_RECHECK_SECONDS apart, the snapshot is
+# released from the Pi. See auto_delete_verified_snapshots for the rules.
+#
+# sentryusb.conf settings, read fresh each cycle so the Settings toggles
+# apply without a restart:
+#   ARCHIVE_VERIFY=false              turn verification off (default on)
+#   ARCHIVE_AUTO_DELETE_VERIFIED=true delete snapshots verified twice (default off)
+#   ARCHIVE_VERIFY_MAX_SECONDS        time budget per cycle (default 1800);
+#                                     the rest stays queued for next cycle
+#   ARCHIVE_VERIFY_RECHECK_SECONDS    minimum gap before the second check
+#                                     (default 3600)
+ARCHIVE_VERIFY_QUEUE=/mutable/archive_verify_pending
+ARCHIVE_VERIFY_LEDGER=/mutable/archive_verified.tsv
+ARCHIVE_VERIFY_WORK=/tmp/archive-verify
+
+# Print a setting from sentryusb.conf, read fresh (same file search order
+# and isolated-subshell parsing as travel_mode_active).
+function archive_conf_value () {
+  local conf
+  for conf in /root/sentryusb.conf /boot/firmware/sentryusb.conf /boot/sentryusb.conf
+  do
+    [ -f "$conf" ] || continue
+    # shellcheck disable=SC1090 # the device config, absent in the checkout
+    ( set +eu; . "$conf" >/dev/null 2>&1; printf '%s' "${!1:-}" )
+    return 0
+  done
+  printf '%s' "${!1:-}"
+}
+
+function archive_verify_enabled () {
+  [ "${ARCHIVE_SYSTEM:-none}" != "none" ] || return 1
+  local v
+  v=$(archive_conf_value ARCHIVE_VERIFY)
+  case "${v,,}" in
+    false|no|0|off) return 1 ;;
+  esac
+  return 0
+}
+
+function archive_auto_delete_enabled () {
+  local v
+  v=$(archive_conf_value ARCHIVE_AUTO_DELETE_VERIFIED)
+  case "${v,,}" in
+    true|yes|1|on) return 0 ;;
+  esac
+  return 1
+}
+
+# Record where each clip about to be archived really lives:
+# "<relpath>\t<link target>" (target empty for a plain file). find's %l is a
+# single-level readlink, so building this never mounts a snapshot.
+function record_archive_link_targets () {
+  local lower=$1 list=$2 out=$3
+  : > "$out" 2>/dev/null || return 0
+  archive_verify_enabled || return 0
+  [ -s "$list" ] || return 0
+  (cd "$lower" && grep -v $'\t' "$list" |
+     xargs -r -d '\n' sh -c 'find "$@" -maxdepth 0 -printf "%p\t%l\n"' _) > "$out" 2>/dev/null || true
+}
+
+# Queue the clips archived this cycle for verification. $1 lists their
+# relpaths, $2 is the record_archive_link_targets output, $3 the link farm.
+function queue_archived_for_verification () {
+  local archived=$1 targets=$2 lower=$3
+  archive_verify_enabled || return 0
+  [ -s "$archived" ] || return 0
+  [ -e "$targets" ] || : > "$targets"
+  awk -F'\t' -v lower="$lower" -v targets="$targets" '
+    FILENAME == targets { t[$1] = $2; next }
+    $0 != "" {
+      target = ($0 in t) ? t[$0] : ""
+      if (target == "") {
+        target = lower "/" $0
+      } else if (substr(target, 1, 1) != "/") {
+        dir = $0; sub(/[^\/]*$/, "", dir); target = lower "/" dir target
+      }
+      print $0 "\t" target
+    }' "$targets" "$archived" >> "$ARCHIVE_VERIFY_QUEUE" ||
+    log "WARNING: could not queue archived clips for verification"
+}
+
+# The ssh command used for the rsync archive, as an array in ssh_cmd.
+function archive_ssh_command () {
+  if [ -n "${RSYNC_RSH:-}" ]; then
+    read -r -a ssh_cmd <<< "$RSYNC_RSH"
+  else
+    ssh_cmd=(ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3)
+    [ -z "${RSYNC_SSH_PORT:-}" ] || ssh_cmd+=(-p "$RSYNC_SSH_PORT")
+  fi
+}
+
+# Print "<sha256>\t<relpath>" for each relpath in $1 as stored on the
+# archive server. A file that isn't there prints nothing. Returns non-zero
+# only when the server could not be asked at all, so "not there" is never
+# confused with "couldn't check".
+function archive_remote_sha256 () {
+  local rels=$1 rc=0
+  case "${ARCHIVE_SYSTEM:-none}" in
+    cifs|nfs)
+      # The share is mounted here, so the Pi reads the server's copy back.
+      timeout 10 [ -d "${ARCHIVE_MOUNT:-}" ] || return 1
+      local rel sum
+      while IFS= read -r rel
+      do
+        [ -f "$ARCHIVE_MOUNT/$rel" ] || continue
+        sum=$(timeout 900 ionice -c2 -n7 nice -n19 sha256sum < "$ARCHIVE_MOUNT/$rel") || return 1
+        printf '%s\t%s\n' "${sum%% *}" "$rel"
+      done < "$rels"
+      ;;
+    rsync)
+      # The server hashes its own copies; only the hashes cross the network.
+      local -a ssh_cmd
+      archive_ssh_command
+      local remote
+      remote="cd $(printf %q "$RSYNC_PATH") && if command -v sha256sum >/dev/null 2>&1; then xargs -0 sha256sum --; else xargs -0 shasum -a 256 --; fi"
+      tr '\n' '\0' < "$rels" |
+        timeout 1800 "${ssh_cmd[@]}" "$RSYNC_USER@$RSYNC_SERVER" "$remote" > "$ARCHIVE_VERIFY_WORK/rsync-out" 2>/dev/null || rc=$?
+      # 123: xargs saw some files fail (not on the server); the rest hashed.
+      [ "$rc" = 0 ] || [ "$rc" = 123 ] || return 1
+      awk '/^[0-9a-f]{64}  / { print substr($0, 1, 64) "\t" substr($0, 67) }' "$ARCHIVE_VERIFY_WORK/rsync-out"
+      ;;
+    rclone)
+      local -a rc_cmd=(rclone --config /root/.config/rclone/rclone.conf hashsum sha256 --files-from "$rels")
+      # Ask the backend for stored SHA-256s first; backends that don't keep
+      # them (or leave some blank) are re-checked by downloading.
+      if ! timeout 1800 "${rc_cmd[@]}" "$RCLONE_DRIVE:$RCLONE_PATH" > "$ARCHIVE_VERIFY_WORK/rclone-out" 2>/dev/null ||
+         awk '!/^[0-9a-f]{64}  / { bad = 1 } END { exit !bad }' "$ARCHIVE_VERIFY_WORK/rclone-out"
+      then
+        timeout 3600 "${rc_cmd[@]}" --download "$RCLONE_DRIVE:$RCLONE_PATH" > "$ARCHIVE_VERIFY_WORK/rclone-out" 2>/dev/null || rc=$?
+        # rclone exits non-zero for missing files too; with no output at all
+        # the remote couldn't be read.
+        [ "$rc" = 0 ] || [ -s "$ARCHIVE_VERIFY_WORK/rclone-out" ] || return 1
+      fi
+      awk '/^[0-9a-f]{64}  / { print substr($0, 1, 64) "\t" substr($0, 67) }' "$ARCHIVE_VERIFY_WORK/rclone-out"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# Rename the server's copy of $1 aside so the next cycle sends a fresh one.
+function archive_set_aside_remote () {
+  local rel=$1 aside
+  aside="$1.mismatch-$(date +%s)"
+  case "${ARCHIVE_SYSTEM:-none}" in
+    cifs|nfs) timeout 60 mv -f -- "$ARCHIVE_MOUNT/$rel" "$ARCHIVE_MOUNT/$aside" ;;
+    rsync)
+      local -a ssh_cmd
+      archive_ssh_command
+      timeout 60 "${ssh_cmd[@]}" "$RSYNC_USER@$RSYNC_SERVER" \
+        "cd $(printf %q "$RSYNC_PATH") && mv -f -- $(printf %q "$rel") $(printf %q "$aside")" ;;
+    rclone)
+      timeout 300 rclone --config /root/.config/rclone/rclone.conf moveto \
+        "$RCLONE_DRIVE:$RCLONE_PATH/$rel" "$RCLONE_DRIVE:$RCLONE_PATH/$aside" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Check one batch of queue lines ($1) and append the results to the ledger.
+# $ARCHIVE_VERIFY_WORK/prev holds each clip's latest ledger line from before
+# this run, which carries the "times verified" count forward.
+# Returns non-zero if the server couldn't be asked (the batch stays queued).
+function verify_archive_batch () {
+  local batch=$1 rel src ksize ksum sum size
+  local localsums="$ARCHIVE_VERIFY_WORK/local" rels="$ARCHIVE_VERIFY_WORK/rels"
+  : > "$localsums"
+  cut -f1 "$batch" > "$rels"
+  # Hash the Pi's copy: the snapshot file the clip was sent from. A re-check
+  # whose snapshot is gone falls back to the hash taken the first time.
+  while IFS=$'\t' read -r rel src ksize ksum
+  do
+    if [ -n "$src" ] && [ -f "$src" ] &&
+       sum=$(ionice -c2 -n7 nice -n19 sha256sum < "$src") &&
+       size=$(stat -L -c %s -- "$src")
+    then
+      printf '%s\t%s\t%s\t%s\n' "$rel" "$size" "${sum%% *}" "$src" >> "$localsums"
+    elif [ -n "${ksum:-}" ]
+    then
+      printf '%s\t%s\t%s\t%s\n' "$rel" "$ksize" "$ksum" "$src" >> "$localsums"
+    else
+      printf '%s\t-\t-\t%s\n' "$rel" "$src" >> "$localsums"
+    fi
+  done < "$batch"
+
+  archive_remote_sha256 "$rels" > "$ARCHIVE_VERIFY_WORK/remote" || return 1
+
+  awk -F'\t' -v now="$(date +%s)" -v remote="$ARCHIVE_VERIFY_WORK/remote" -v prev="$ARCHIVE_VERIFY_WORK/prev" '
+    FILENAME == prev   { ps[$1] = $5; ph[$1] = $3; pc[$1] = $6 + 0; next }
+    FILENAME == remote { r[$2] = $1; next }
+    {
+      if ($3 == "-")          status = "nosource"
+      else if (!($1 in r))    status = "missing"
+      else if (r[$1] == $3)   status = "ok"
+      else                    status = "mismatch"
+      count = 0
+      if (status == "ok")
+        count = (ps[$1] == "ok" && ph[$1] == $3) ? pc[$1] + 1 : 1
+      print $1 "\t" $2 "\t" $3 "\t" now "\t" status "\t" count "\t" $4
+    }' "$ARCHIVE_VERIFY_WORK/prev" "$ARCHIVE_VERIFY_WORK/remote" "$localsums" > "$ARCHIVE_VERIFY_WORK/results"
+
+  # Send mismatched and missing clips again next cycle.
+  local resend="$ARCHIVE_VERIFY_WORK/resend"
+  : > "$resend"
+  while IFS=$'\t' read -r rel _ _ _ status _
+  do
+    case "$status" in
+      mismatch)
+        if archive_set_aside_remote "$rel"
+        then
+          log "ERROR: archive verification: $rel on the archive server doesn't match the Pi's copy (SHA-256); renamed it aside and will send it again"
+        else
+          log "ERROR: archive verification: $rel on the archive server doesn't match the Pi's copy (SHA-256), and it couldn't be renamed aside; will send it again"
+        fi
+        echo "$rel" >> "$resend" ;;
+      missing)
+        log "ERROR: archive verification: $rel isn't on the archive server after archiving; will send it again"
+        echo "$rel" >> "$resend" ;;
+    esac
+  done < "$ARCHIVE_VERIFY_WORK/results"
+  if [ -s "$resend" ] && [ -e /mutable/sentry_files_archived ]
+  then
+    cp /mutable/sentry_files_archived "$ARCHIVE_VERIFY_WORK/archived"
+    prunefile "$ARCHIVE_VERIFY_WORK/archived" "$resend"
+    cp "$ARCHIVE_VERIFY_WORK/archived" /mutable/sentry_files_archived.new &&
+      mv /mutable/sentry_files_archived.new /mutable/sentry_files_archived
+  fi
+
+  cat "$ARCHIVE_VERIFY_WORK/results" >> "$ARCHIVE_VERIFY_LEDGER"
+  cat "$ARCHIVE_VERIFY_WORK/results" >> "$ARCHIVE_VERIFY_WORK/results-all"
+}
+
+# Keep the newest ledger line per clip, and only for clips some snapshot on
+# the Pi still holds, so the ledger never outgrows the snapshots it explains.
+function prune_archive_verify_ledger () {
+  [ -s "$ARCHIVE_VERIFY_LEDGER" ] || return 0
+  local -a tocs=(/backingfiles/snapshots/snap-*/snap.bin.toc)
+  # No TOCs at all (drive not mounted?) proves nothing: keep everything.
+  [ -e "${tocs[0]}" ] || return 0
+  awk -F'\t' -v ledger="$ARCHIVE_VERIFY_LEDGER" '
+    function key(p,   n, a) {
+      sub(/^TeslaCam\//, "", p)
+      if (p ~ /^RecentClips\//) { n = split(p, a, "/"); p = "RecentClips/" a[n] }
+      return p
+    }
+    FILENAME != ledger { p = $0; sub(/^[0-9]+ /, "", p); keep[key(p)] = 1; next }
+    key($1) in keep { last[$1] = $0; order[$1] = FNR }
+    END { for (r in last) print order[r] "\t" last[r] }' "${tocs[@]}" "$ARCHIVE_VERIFY_LEDGER" |
+    sort -n | cut -f2- > "$ARCHIVE_VERIFY_LEDGER.new" &&
+    mv "$ARCHIVE_VERIFY_LEDGER.new" "$ARCHIVE_VERIFY_LEDGER"
+}
+
+# With auto-delete on, queue the second check for clips verified once at
+# least ARCHIVE_VERIFY_RECHECK_SECONDS ago. The queue line carries the first
+# check's size and hash, so it still works if the source snapshot is gone.
+function queue_archive_rechecks () {
+  archive_auto_delete_enabled || return 0
+  [ -s "$ARCHIVE_VERIFY_LEDGER" ] || return 0
+  local gap
+  gap=$(archive_conf_value ARCHIVE_VERIFY_RECHECK_SECONDS)
+  [[ "$gap" =~ ^[0-9]+$ ]] || gap=3600
+  awk -F'\t' -v cutoff="$(( $(date +%s) - gap ))" '
+    { last[$1] = $0 }
+    END {
+      for (r in last) {
+        split(last[r], f, "\t")
+        if (f[5] == "ok" && f[6] + 0 == 1 && f[4] + 0 <= cutoff)
+          print f[1] "\t" f[7] "\t" f[2] "\t" f[3]
+      }
+    }' "$ARCHIVE_VERIFY_LEDGER" >> "$ARCHIVE_VERIFY_QUEUE"
+}
+
+# Decide whether one snapshot's footage is all verified twice on the archive
+# server. Prints "yes <clips>" or "no <clips> <unverified> <not archived>".
+# Every clip (an .mp4 of at least 100000 bytes, the same short-recording
+# cutoff the archive uses) must be in a folder this device archives AND
+# have a ledger line that is ok, verified at least twice, and at least as
+# large as the snapshot's copy. One clip from a folder that isn't archived
+# (e.g. RecentClips with ARCHIVE_RECENTCLIPS off) keeps the snapshot.
+function snapshot_verified_twice () {
+  local toc=$1
+  awk -F'\t' -v ledger="$ARCHIVE_VERIFY_LEDGER" \
+      -v saved="${ARCHIVE_SAVEDCLIPS:-true}" -v sentry="${ARCHIVE_SENTRYCLIPS:-true}" \
+      -v recent="${ARCHIVE_RECENTCLIPS:-false}" -v track="${ARCHIVE_TRACKMODECLIPS:-true}" '
+    function key(p,   n, a) {
+      sub(/^TeslaCam\//, "", p)
+      if (p ~ /^RecentClips\//) { n = split(p, a, "/"); p = "RecentClips/" a[n] }
+      return p
+    }
+    FILENAME == ledger {
+      if ($5 == "ok" && $6 + 0 >= 2) { k = key($1); if (!(k in vs) || $2 + 0 > vs[k]) vs[k] = $2 + 0 }
+      next
+    }
+    {
+      sp = index($0, " ")
+      if (sp < 2) next
+      size = substr($0, 1, sp - 1) + 0
+      p = substr($0, sp + 1)
+      sub(/^TeslaCam\//, "", p)
+      if (tolower(p) !~ /\.mp4$/ || size < 100000) next
+      cat = p; sub(/\/.*/, "", cat)
+      on = "false"
+      if (cat == "SavedClips") on = saved
+      else if (cat == "SentryClips") on = sentry
+      else if (cat == "RecentClips") on = recent
+      else if (cat == "TeslaTrackMode") on = track
+      if (on != "true") { notarchived++; next }
+      clips++
+      k = key(p)
+      if (!(k in vs) || vs[k] < size) unverified++
+    }
+    END {
+      if (clips > 0 && unverified + 0 == 0 && notarchived + 0 == 0) print "yes " clips
+      else print "no " clips + 0 " " unverified + 0 " " notarchived + 0
+    }' "$ARCHIVE_VERIFY_LEDGER" "$toc"
+}
+
+# Release snapshots whose footage is all verified twice on the archive
+# server (only with ARCHIVE_AUTO_DELETE_VERIFIED=true).
+#
+# Runs while holding the snapshots-dir lock, the same lock make_snapshot.sh,
+# Clips refresh and the space manager take, so no snapshot is being created,
+# linked or released while this decides; each snapshot is re-checked under
+# the lock immediately before it's released. Verification itself runs
+# without the lock (hashing can take many minutes, and holding the lock that
+# long would delay the hourly snapshot and lose RecentClips); it only reads
+# snapshots, and a snapshot removed mid-read just fails to hash and is
+# recorded as unverified, never as verified.
+#
+# Never released: the newest snapshot (by slot and by time, the one the
+# next snapshot is compared against), a snapshot still owed links
+# (snap.bin.relink_pending), and any snapshot without a TOC.
+function auto_delete_verified_snapshots () {
+  archive_auto_delete_enabled || return 0
+  [ -s "$ARCHIVE_VERIFY_LEDGER" ] || return 0
+  (
+    if ! flock -x -w 60 9
+    then
+      log "Auto-delete: snapshots are busy; will try again next cycle"
+      exit 0
+    fi
+    local newest_slot="" newest_time="" dir verdict released=0
+    local -a dirs=()
+    # Slot names are zero-padded, so glob order is slot order.
+    for dir in /backingfiles/snapshots/snap-*
+    do
+      [ -d "$dir" ] || continue
+      dirs+=("$dir")
+      newest_slot=$dir
+      if [ -e "$dir/snap.bin" ] && { [ -z "$newest_time" ] || [ "$dir/snap.bin" -nt "$newest_time/snap.bin" ]; }
+      then
+        newest_time=$dir
+      fi
+    done
+    for dir in "${dirs[@]}"
+    do
+      if [ "$dir" = "$newest_slot" ] || [ "$dir" = "$newest_time" ]; then continue; fi
+      if [ ! -e "$dir/snap.bin" ] || [ ! -s "$dir/snap.bin.toc" ]; then continue; fi
+      if [ -e "$dir/snap.bin.relink_pending" ]; then continue; fi
+      archive_cancel_requested && break
+      verdict=$(snapshot_verified_twice "$dir/snap.bin.toc")
+      case "$verdict" in
+        yes\ *)
+          log "Auto-delete: releasing ${dir##*/}; all ${verdict#yes } clip(s) in it are verified twice on the archive server (SHA-256)"
+          if /root/bin/release_snapshot.sh "$dir"
+          then
+            released=$((released + 1))
+          else
+            log "ERROR: Auto-delete: could not release ${dir##*/}"
+          fi
+          ;;
+      esac
+    done
+    [ "$released" = 0 ] || log "Auto-delete: released $released snapshot(s) verified twice on the archive server"
+  ) 9< "$SNAPSHOT_LOCK_DIR"
+}
+
+# Verify queued archived clips against the archive server, then (if turned
+# on) release snapshots verified twice. Runs with the archive connected and
+# the car's USB drive already back online.
+function verify_archived_clips () {
+  if ! archive_verify_enabled
+  then
+    rm -f "$ARCHIVE_VERIFY_QUEUE"
+    return 0
+  fi
+  queue_archive_rechecks || log "WARNING: could not queue archive re-checks"
+  if [ ! -s "$ARCHIVE_VERIFY_QUEUE" ]
+  then
+    auto_delete_verified_snapshots || log "WARNING: auto-delete of verified snapshots failed"
+    return 0
+  fi
+  rm -rf "$ARCHIVE_VERIFY_WORK"
+  mkdir -p "$ARCHIVE_VERIFY_WORK" || return 1
+  : > "$ARCHIVE_VERIFY_WORK/results-all"
+
+  # Each clip's latest ledger line, to carry its "times verified" forward.
+  if [ -s "$ARCHIVE_VERIFY_LEDGER" ]
+  then
+    awk -F'\t' '{ last[$1] = $0 } END { for (r in last) print last[r] }' "$ARCHIVE_VERIFY_LEDGER" > "$ARCHIVE_VERIFY_WORK/prev"
+  else
+    : > "$ARCHIVE_VERIFY_WORK/prev"
+  fi
+
+  # One line per clip (the newest), oldest first.
+  awk -F'\t' 'NF >= 2 && $1 != "" { last[$1] = $0; order[$1] = NR }
+    END { for (r in last) print order[r] "\t" last[r] }' "$ARCHIVE_VERIFY_QUEUE" |
+    sort -n | cut -f2- > "$ARCHIVE_VERIFY_WORK/queue"
+  local total
+  total=$(wc -l < "$ARCHIVE_VERIFY_WORK/queue")
+  log "Verifying $total archived file(s) against the archive server (SHA-256)"
+
+  local max
+  max=$(archive_conf_value ARCHIVE_VERIFY_MAX_SECONDS)
+  [[ "$max" =~ ^[0-9]+$ ]] || max=1800
+  local deadline batch stopped=""
+  deadline=$(( $(uptime_seconds) + max ))
+  split -l 50 -d -a 6 "$ARCHIVE_VERIFY_WORK/queue" "$ARCHIVE_VERIFY_WORK/batch-"
+  for batch in "$ARCHIVE_VERIFY_WORK"/batch-*
+  do
+    [ -e "$batch" ] || continue
+    if archive_cancel_requested; then stopped="archive cancelled"; break; fi
+    if [ "$(uptime_seconds)" -ge "$deadline" ]; then stopped="time limit of ${max}s reached"; break; fi
+    if ! archive_is_reachable; then stopped="archive server unreachable"; break; fi
+    if ! verify_archive_batch "$batch"
+    then
+      stopped="couldn't read checksums from the archive server"
+      break
+    fi
+    rm -f "$batch"
+  done
+
+  # Whatever wasn't checked stays queued for the next cycle.
+  cat "$ARCHIVE_VERIFY_WORK"/batch-* > "$ARCHIVE_VERIFY_QUEUE.new" 2>/dev/null || true
+  if [ -s "$ARCHIVE_VERIFY_QUEUE.new" ]
+  then
+    mv "$ARCHIVE_VERIFY_QUEUE.new" "$ARCHIVE_VERIFY_QUEUE"
+  else
+    rm -f "$ARCHIVE_VERIFY_QUEUE.new" "$ARCHIVE_VERIFY_QUEUE"
+  fi
+  prune_archive_verify_ledger || log "WARNING: could not prune the archive verification ledger"
+
+  local ok bad nosource left=0
+  ok=$(awk -F'\t' '$5 == "ok"' "$ARCHIVE_VERIFY_WORK/results-all" | wc -l)
+  bad=$(awk -F'\t' '$5 == "mismatch" || $5 == "missing"' "$ARCHIVE_VERIFY_WORK/results-all" | wc -l)
+  nosource=$(awk -F'\t' '$5 == "nosource"' "$ARCHIVE_VERIFY_WORK/results-all" | wc -l)
+  [ ! -s "$ARCHIVE_VERIFY_QUEUE" ] || left=$(wc -l < "$ARCHIVE_VERIFY_QUEUE")
+  log "Archive verification: $ok matched, $bad to re-send, $nosource with no Pi copy left to compare, $left still queued${stopped:+ ($stopped)}"
+
+  # Only release snapshots after a complete, clean pass.
+  if [ -z "$stopped" ]
+  then
+    auto_delete_verified_snapshots || log "WARNING: auto-delete of verified snapshots failed"
+  fi
+  [ -z "$stopped" ] || [ "$stopped" = "archive cancelled" ]
+}
+
 function write_archive_status () {
   echo "$1" > /tmp/archive_status.json.tmp
   mv /tmp/archive_status.json.tmp /tmp/archive_status.json
@@ -2148,6 +2631,11 @@ function archive_teslacam_clips () {
     archive_progress_monitor "$total_count" "${sentrylist}" "$overlaymerged" "$resume_hash" "$resume_offset" "$resume_total" &
     local progress_pid=$!
 
+    # Note which snapshot file each clip is sent from, so it can be
+    # checksummed against the archive server's copy afterwards.
+    local -r linktargets=/tmp/archive_link_targets
+    record_archive_link_targets "$overlaylower" "${sentrylist}" "$linktargets"
+
     local travel_active=0
     if travel_mode_active; then travel_active=1; fi
     if TRAVEL_MODE_ACTIVE="$travel_active" archive_run_command /root/bin/archive-clips.sh "$overlaymerged" "${sentrylist}" "${triggerdir}" "${triggerlist}"
@@ -2195,6 +2683,8 @@ function archive_teslacam_clips () {
     local -r remaining_list=/tmp/sentry_files_remaining
     local remaining_list_valid=true
     if ! true > "$remaining_list"; then remaining_list_valid=false; fi
+    local -r newly_archived=/tmp/archive_newly_archived
+    true > "$newly_archived" || true
 
     while read -r line
     do
@@ -2209,6 +2699,7 @@ function archive_teslacam_clips () {
             ;;
         esac
         echo "$line" >> "${sentrylist_archived}"
+        echo "$line" >> "$newly_archived" || true
       elif [[ "$remaining_list_valid" == true ]] && ! printf '%s\n' "$line" >> "$remaining_list"; then
         remaining_list_valid=false
       fi
@@ -2222,6 +2713,9 @@ function archive_teslacam_clips () {
     then
       mark_cam_cleanup_pending || true
     fi
+
+    # Queue what actually moved this cycle for SHA-256 verification.
+    queue_archived_for_verification "$newly_archived" "$linktargets" "$overlaylower"
 
     # copy the list of archived files back to /mutable if it has changed
     if ! diff -q -N "${sentrylist_archived}" "${sentrylist_previously_archived}" > /dev/null
@@ -2643,6 +3137,16 @@ function archive_clips () {
     archive_transport_recover
   else
     ensure_usb_drives_connected || log "ERROR: failed to ensure USB gadget after archive"
+  fi
+  # Checksum the clips just archived against the archive server (and, if
+  # turned on, release snapshots verified twice). Placed after the USB drive
+  # is back with the car, so checking never keeps the car without its drive.
+  # Skipped after a failed clip transfer (the link just failed) and in
+  # Travel Mode (reading copies back over a mobile link costs data); the
+  # queue is durable, so those clips are checked on the next good cycle.
+  if [ "$clips_ok" = true ] && ! travel_mode_active; then
+    verify_archived_clips || { ARCHIVE_ALL_STAGES_OK=0; log "Archive verification stopped before finishing; the rest is checked next cycle"; }
+    if archive_cancel_requested; then archive_cancel_cleanup; return 125; fi
   fi
   archive_run_command /root/bin/post-archive-process.sh || { ARCHIVE_ALL_STAGES_OK=0; log "Post-archive processing stopped (exit $?)"; }
   if archive_cancel_requested; then archive_cancel_cleanup; return 125; fi

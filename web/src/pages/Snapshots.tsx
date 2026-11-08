@@ -1,16 +1,30 @@
 import { SelectMenu } from "@/components/ui/SelectMenu"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { DeleteIcon, HardDriveIcon, ProgressActivityIcon } from "@/components/icons"
+import { CheckCircleIcon, DeleteIcon, ErrorIcon, HardDriveIcon, ProgressActivityIcon, ScheduleIcon } from "@/components/icons"
 import { Modal } from "@/components/ui/Modal"
 import type { ManagedStorageHealth } from "@/lib/api"
 import { responseError } from "@/lib/file-upload"
 
+/** How much of a snapshot's footage is verified (SHA-256) on the archive
+ *  server. Absent when verification is off or there is no archive server. */
+export interface ArchiveCoverage {
+  state: "verified" | "pending" | "partial" | "failed" | "unverified" | "nothing"
+  clips: number
+  verified: number
+  verified_twice: number
+  pending: number
+  failed: number
+  not_archived: number
+  ready_to_delete: boolean
+  last_checked_unix: number | null
+}
 interface SnapshotEntry {
   id: string
   // Reclaim is cumulative: this snapshot and every older holder of shared blocks.
   cumulative_reclaim_bytes: number | null
   older_count: number
   created_unix: number
+  archive?: ArchiveCoverage | null
 }
 interface FreeSpace {
   total_bytes: number
@@ -33,6 +47,57 @@ function formatBytes(bytes: number): string {
 }
 function formatDate(unix: number) {
   return unix ? new Date(unix * 1000).toLocaleString() : "Unknown date"
+}
+
+const tagClass = "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium"
+
+/** "Verified on archive" and related tags for one snapshot row. */
+export function ArchiveTag({ archive }: { archive?: ArchiveCoverage | null }) {
+  if (!archive || archive.state === "nothing") return null
+  const checked = archive.last_checked_unix ? ` Last checked ${formatDate(archive.last_checked_unix)}.` : ""
+  const notArchived = archive.not_archived
+    ? ` ${archive.not_archived} clip(s) are in a folder this device doesn't archive, so this snapshot is never deleted automatically.`
+    : ""
+  switch (archive.state) {
+    case "verified":
+      return (
+        <span className={`${tagClass} border-emerald-400/30 bg-emerald-400/10 text-emerald-300`}
+          title={`All ${archive.clips} clips were sent to the archive server and their SHA-256 checksums match the Pi's copy.${archive.verified_twice === archive.clips ? " Every clip has been checked twice." : ""}${checked}`}>
+          <CheckCircleIcon className="h-3 w-3" />
+          Verified on archive{archive.verified_twice === archive.clips ? " ×2" : ""}
+        </span>
+      )
+    case "pending":
+      return (
+        <span className={`${tagClass} border-sky-400/30 bg-sky-400/10 text-sky-300`}
+          title={`Sent to the archive server; ${archive.pending} clip(s) waiting for their checksum check.${checked}`}>
+          <ScheduleIcon className="h-3 w-3" />
+          Sent · verifying
+        </span>
+      )
+    case "failed":
+      return (
+        <span className={`${tagClass} border-red-400/30 bg-red-400/10 text-red-300`}
+          title={`${archive.failed} clip(s) on the archive server didn't match the Pi's copy or were missing. They're sent again on the next archive.${checked}`}>
+          <ErrorIcon className="h-3 w-3" />
+          Checksum mismatch · re-sending
+        </span>
+      )
+    case "partial":
+      return (
+        <span className={`${tagClass} border-amber-400/30 bg-amber-400/10 text-amber-300`}
+          title={`${archive.verified} of ${archive.clips} clips verified on the archive server.${notArchived}${checked}`}>
+          {archive.verified} / {archive.clips} on archive
+        </span>
+      )
+    default:
+      return (
+        <span className={`${tagClass} border-white/10 bg-white/5 text-slate-400`}
+          title={`None of this snapshot's ${archive.clips} clips are verified on the archive server yet.${notArchived}`}>
+          Not archived yet
+        </span>
+      )
+  }
 }
 
 export default function Snapshots() {
@@ -262,7 +327,16 @@ export default function Snapshots() {
             <li key={s.id} data-snapshot-id={s.id} data-delete-preview={previewIds.has(s.id) || undefined}
               className={`flex flex-wrap items-center justify-between gap-3 border-l-2 px-4 py-3 transition-colors ${previewIds.has(s.id) ? "border-l-red-400 bg-red-500/10 shadow-[inset_0_0_20px_rgba(239,68,68,0.04)]" : "border-l-transparent"}`}>
               <div className="min-w-48 flex-1">
-                <p className="text-sm font-medium text-slate-200">{formatDate(s.created_unix)}</p>
+                <p className="flex flex-wrap items-center gap-2 text-sm font-medium text-slate-200">
+                  {formatDate(s.created_unix)}
+                  <ArchiveTag archive={s.archive} />
+                  {s.archive?.ready_to_delete && (
+                    <span className={`${tagClass} border-white/10 bg-white/5 text-slate-400`}
+                      title="Auto-delete is on and every clip is verified twice: this snapshot is deleted at the next archive cycle.">
+                      Deleting after next archive
+                    </span>
+                  )}
+                </p>
                 <p className="mt-1 text-xs text-slate-400">
                   {s.id} ·{" "}
                   {s.cumulative_reclaim_bytes === null
@@ -344,6 +418,17 @@ export default function Snapshots() {
               ? "Reclaimed space depends on blocks shared with remaining snapshots."
               : `Estimated space freed: ${formatBytes(deletion.estimate)}.`}
           </p>
+          {(() => {
+            const unverified = deletion.entries.filter(
+              (e) => e.archive && e.archive.state !== "verified" && e.archive.state !== "nothing",
+            ).length
+            return unverified > 0 ? (
+              <p className="mt-3 text-sm text-amber-300">
+                {unverified} of the selected {deletion.entries.length === 1 ? "snapshot is" : "snapshots are"} not
+                fully verified on the archive server. Their footage may not be anywhere else.
+              </p>
+            ) : null
+          })()}
           <p className="mt-3 text-sm text-red-300">
             Footage stored only in these snapshots will be lost. This cannot be undone. Live dashcam
             files are unaffected.

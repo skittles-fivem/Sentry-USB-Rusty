@@ -87,6 +87,23 @@ export SHARE_PASSWORD='password'
 #export ARCHIVE_SENTRYCLIPS=false
 #export ARCHIVE_TRACKMODECLIPS=false
 
+# After each archive, every clip sent is checked by SHA-256: the copy on the
+# Pi against the copy on the archive server. Mismatched or missing clips are
+# sent again next time. Snapshots whose clips all match are tagged
+# "Verified on archive" on the Snapshots page. Uncomment to turn this off.
+#export ARCHIVE_VERIFY=false
+
+# Delete a snapshot from the Pi once every clip in it has been verified on
+# the archive server twice (the second check at least an hour after the
+# first). The newest snapshot, and any snapshot holding clips from a folder
+# that isn't archived, are always kept. Also in Settings > System.
+#export ARCHIVE_AUTO_DELETE_VERIFIED=true
+
+# Most time one archive cycle spends verifying (seconds); the rest is
+# checked next cycle. Minimum gap before a clip's second check (seconds).
+#export ARCHIVE_VERIFY_MAX_SECONDS=1800
+#export ARCHIVE_VERIFY_RECHECK_SECONDS=3600
+
 # Enable post-archive drive auto-processing. When set to true, after each
 # archive_clips run completes, /root/bin/post-archive-process.sh fires
 # `POST /api/drives/process?post_archive=1` so newly archived clips get

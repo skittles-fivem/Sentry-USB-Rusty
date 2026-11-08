@@ -265,3 +265,47 @@ test("a timed out deletion unlocks the modal, preserves unknown IDs and never co
     win.close()
   }
 })
+
+test("archive tags show verification state and the delete dialog warns about unverified footage", async () => {
+  const win = new Window({ url: "http://localhost/snapshots" })
+  const values = { window: win, document: win.document, navigator: win.navigator, IS_REACT_ACT_ENVIRONMENT: true }
+  const originals = Object.keys(values).map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)] as const)
+  for (const [key, value] of Object.entries(values)) Object.defineProperty(globalThis, key, { configurable: true, value })
+  const oldFetch = globalThis.fetch
+  const coverage = (state: string, extra: object = {}) => ({
+    state, clips: 4, verified: 0, verified_twice: 0, pending: 0, failed: 0, not_archived: 0,
+    ready_to_delete: false, last_checked_unix: 50, ...extra,
+  })
+  globalThis.fetch = async input => String(input).includes("free-space") ? Response.json({ mounted: false }) : Response.json({ snapshots: [
+    { id: "twice", created_unix: 100, older_count: 0, cumulative_reclaim_bytes: 1024,
+      archive: coverage("verified", { verified: 4, verified_twice: 4, ready_to_delete: true }) },
+    { id: "bad", created_unix: 200, older_count: 1, cumulative_reclaim_bytes: 2048, archive: coverage("failed", { failed: 1 }) },
+    { id: "half", created_unix: 300, older_count: 2, cumulative_reclaim_bytes: 4096, archive: coverage("partial", { verified: 2 }) },
+    { id: "off", created_unix: 400, older_count: 3, cumulative_reclaim_bytes: 8192 },
+  ] })
+  const { createRoot } = await import("react-dom/client")
+  const container = win.document.createElement("div"); win.document.body.append(container)
+  const root = createRoot(container)
+  const row = (id: string) => container.querySelector(`[data-snapshot-id="${id}"]`)!.textContent
+  try {
+    await act(async () => root.render(createElement(Snapshots)))
+    assert.match(row("twice"), /Verified on archive ×2/)
+    assert.match(row("twice"), /Deleting after next archive/)
+    assert.match(row("bad"), /Checksum mismatch · re-sending/)
+    assert.match(row("half"), /2 \/ 4 on archive/)
+    assert.doesNotMatch(row("off"), /archive/i, "no tag when verification is off")
+
+    // Only the verified snapshot selected: no warning.
+    await act(async () => container.querySelector<HTMLElement>('[aria-label="Delete only twice"]')!.click())
+    assert.doesNotMatch(win.document.body.textContent, /not\s+fully verified/)
+    await act(async () => [...win.document.querySelectorAll("button")].find(b => b.textContent === "Cancel")!.click())
+
+    // Through "half": two of the three aren't fully verified.
+    await act(async () => container.querySelector<HTMLElement>('[aria-label="Delete through half"]')!.click())
+    assert.match(win.document.body.textContent, /2 of the selected snapshots are not\s+fully verified/)
+  } finally {
+    await act(async () => root.unmount()); globalThis.fetch = oldFetch
+    for (const [key, descriptor] of originals) { if (descriptor) Object.defineProperty(globalThis, key, descriptor); else Reflect.deleteProperty(globalThis, key) }
+    win.close()
+  }
+})

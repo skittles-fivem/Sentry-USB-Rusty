@@ -41,6 +41,10 @@ struct SnapshotEntry {
     older_count: usize,
     /// Unix epoch seconds from `snap.bin` mtime.
     created_unix: i64,
+    /// How much of this snapshot's footage is verified (SHA-256) on the
+    /// archive server. `None` when verification is off, there is no archive
+    /// server, or the snapshot has no TOC yet.
+    archive: Option<crate::archive_verify::Coverage>,
 }
 
 /// How long a measurement stays usable before we re-measure.
@@ -188,6 +192,7 @@ pub async fn list_snapshots(
             cumulative_reclaim_bytes: None,
             older_count: 0,
             created_unix,
+            archive: None,
         });
     }
 
@@ -195,6 +200,26 @@ pub async fn list_snapshots(
     entries.sort_by_key(|e| e.created_unix);
     for (i, e) in entries.iter_mut().enumerate() {
         e.older_count = i;
+    }
+
+    // Archive verification status. Auto-delete never releases the newest
+    // snapshot (by slot or by time), so never mark that one as ready.
+    let ids_for_coverage: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
+    if let Ok(Some(mut coverage)) = tokio::task::spawn_blocking(move || {
+        crate::archive_verify::coverage_for(std::path::Path::new(SNAPSHOTS_DIR), &ids_for_coverage)
+    })
+    .await
+    {
+        let newest_slot = entries.iter().map(|e| e.id.clone()).max();
+        let newest_time = entries.last().map(|e| e.id.clone());
+        for id in [newest_slot, newest_time].into_iter().flatten() {
+            if let Some(c) = coverage.get_mut(&id) {
+                c.ready_to_delete = false;
+            }
+        }
+        for e in entries.iter_mut() {
+            e.archive = coverage.remove(&e.id);
+        }
     }
 
     // A stale value may describe a different snapshot set, so omit it and refresh.

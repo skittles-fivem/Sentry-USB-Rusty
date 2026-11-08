@@ -8,6 +8,7 @@ import {
 import { PrefCard, PrefGrid } from "@/components/settings/PrefCard"
 import { ConfigBackupSection } from "@/components/settings/sections/ConfigBackupSection"
 import { StorageRepairCard } from "@/components/settings/sections/StorageRepairCard"
+import { ArchiveVerifySection } from "@/components/settings/sections/ArchiveVerifySection"
 import { InfoButton } from "@/components/ui/InfoButton"
 import { Toggle } from "@/components/ui/Toggle"
 
@@ -118,6 +119,9 @@ export function SystemTab({ onOpenRawConfig, onOpenWizard, version, hostname }: 
       <>
       {/* Storage repair */}
       <StorageRepairCard />
+
+      {/* SHA-256 check of archived clips + optional auto-delete */}
+      <ArchiveVerifySection />
 
       {/* Setup and resources */}
       <PrefCard icon={<WandStarsIcon className="h-3.5 w-3.5" />} halo="accent" title="Setup Wizard"

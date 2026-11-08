@@ -64,6 +64,12 @@ pub fn build_router(state: AppState) -> Router {
         // Snapshots
         .route("/api/snapshots", get(crate::snapshots::list_snapshots))
         .route("/api/snapshots/{id}", delete(crate::snapshots::delete_snapshot))
+        // SHA-256 verification of archived clips, and auto-delete of
+        // snapshots verified twice (both read by archiveloop each cycle).
+        .route(
+            "/api/archive-verify/settings",
+            get(crate::archive_verify::get_settings).post(crate::archive_verify::set_settings),
+        )
         .route("/api/backingfiles/free-space", get(crate::snapshots::get_free_space))
         // Clips
         .route("/api/clips", get(crate::clips::get_clips))

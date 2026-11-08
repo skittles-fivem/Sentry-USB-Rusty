@@ -376,6 +376,7 @@ jobs:
           bash test/archiveloop-gadget-cycle-min.test.sh
           bash test/archiveloop-exfat-reclaim.test.sh
           bash test/archiveloop-camdisk-supervisor.test.sh
+          bash test/archiveloop-archive-verify.test.sh
           bash -n run/release_snapshot.sh
           bash -n run/make_snapshot.sh
           bash test/release-snapshot.test.sh
