@@ -2709,12 +2709,43 @@ function timesyncloop {
   done
 }
 
+# Seconds since boot (CLOCK_BOOTTIME), so NTP/RTC steps can't shift the
+# snapshot schedule.
+function uptime_seconds {
+  local up
+  read -r up _ < /proc/uptime
+  echo "${up%%.*}"
+}
+
+# The car keeps about an hour of RecentClips and deletes older minutes
+# continuously, and SNAPSHOT_INTERVAL is meant to be how far apart two
+# snapshots are (default 58 min, a 2-minute margin). This loop used to sleep
+# the full interval AFTER the previous snapshot finished and then wait up to
+# 90 s for an idle gap, so the real spacing was interval + idle wait + the
+# previous run's fsck/scan/link time. While driving or in Sentry the car never
+# idles, so the wait always burned its 90 s, and with the fsck on top the
+# spacing regularly passed 60 min: the car deleted the oldest minutes before
+# any snapshot caught them, leaving 1-3 minute holes in the day's footage.
+# Schedule each snapshot from when the previous one STARTED, and skip the idle
+# wait: a mid-write copy is safe (make_snapshot fscks the copy), as the
+# boot-time snapshot already relies on.
 function snapshotloop {
   echo -n snapshotloop > /proc/self/comm
+  local interval="${SNAPSHOT_INTERVAL:-3480}"
+  [[ "$interval" =~ ^[0-9]+$ ]] && [ "$interval" -gt 0 ] || interval=3480
+  local next=$(( $(uptime_seconds) + interval ))
+  local now late
   while true
   do
-    sleep "${SNAPSHOT_INTERVAL:-3480}"
-    /root/bin/waitforidle || true
+    now=$(uptime_seconds)
+    if [ "$now" -lt "$next" ]
+    then
+      sleep $(( next - now ))
+    else
+      late=$(( now - next ))
+      [ "$late" -lt 60 ] || log "snapshot is ${late}s behind schedule (previous snapshot ran long)"
+    fi
+    next=$(( $(uptime_seconds) + interval ))
     # A failed snapshot is already logged and keeps its image for recovery;
     # under errexit it must not take down this worker and its siblings.
     /root/bin/make_snapshot.sh || log "ERROR: make_snapshot.sh failed (exit $?)"
