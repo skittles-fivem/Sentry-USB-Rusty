@@ -136,7 +136,8 @@ pub async fn run_startup_migration() -> bool {
 
     let script = migration_script_for_mode(&repo, &tarball_url, &script_ref, automatic);
 
-    // Retry up to 3 times with exponential backoff. The script itself
+    // Retry network failures with backoff for up to NETWORK_RETRY_WINDOW (see
+    // network_retry_delay). The script itself
     // fails fast on `curl: Could not resolve host: github.com` when DNS
     // isn't ready yet — and that's exactly the state we hit racing
     // network-online.target at boot. Every retry is a full script run;
@@ -148,8 +149,10 @@ pub async fn run_startup_migration() -> bool {
     // primary fix; this is belt-and-suspenders for the edge case where
     // the resolver comes up but its first query fails because the
     // upstream DNS cache is cold.
-    let mut last_err: Option<String> = None;
-    for attempt in 1..=3 {
+    let started = std::time::Instant::now();
+    let mut attempt = 0u32;
+    let last_err = loop {
+        attempt += 1;
         match sentryusb_shell::run_with_timeout(
             Duration::from_secs(180),
             "bash",
@@ -217,27 +220,47 @@ pub async fn run_startup_migration() -> bool {
                     || msg.contains("Temporary failure in name resolution")
                     || msg.contains("Connection timed out")
                     || msg.contains("Network is unreachable");
-                if attempt < 3 && transient {
-                    let wait = Duration::from_secs(5 * attempt as u64);
+                if let Some(wait) = transient.then(|| network_retry_delay(attempt, started.elapsed())).flatten() {
                     warn!(
-                        "[migrate] Startup migration attempt {}/3 hit a transient failure ({}); retrying in {:?}",
+                        "[migrate] Startup migration attempt {} hit a transient failure ({}); retrying in {:?}",
                         attempt, msg, wait
                     );
                     tokio::time::sleep(wait).await;
-                    last_err = Some(msg);
                     continue;
                 }
-                last_err = Some(msg);
-                break;
+                break msg;
             }
         }
-    }
+    };
     warn!(
         "[migrate] Warning: startup migration failed after retries: {}",
-        last_err.as_deref().unwrap_or("unknown")
+        last_err
     );
     // Don't write marker — retry on next boot.
     false
+}
+
+/// How long the startup migration keeps retrying network failures. It runs
+/// in the background right after boot, usually before Wi-Fi has connected
+/// (the server is ready in ~9 s, Wi-Fi associates at ~20 s), so three quick
+/// tries 15 s apart gave up before the network existed, on every boot. In
+/// the car, with no network at all, it simply stops after this window and
+/// tries again on the next boot, as before.
+const NETWORK_RETRY_WINDOW: Duration = Duration::from_secs(15 * 60);
+
+/// Wait before retry `attempt + 1` after a transient (network) failure, or
+/// `None` once `elapsed` has used up the retry window: 5 s, 10 s, 20 s,
+/// 30 s, then once a minute.
+fn network_retry_delay(attempt: u32, elapsed: Duration) -> Option<Duration> {
+    let wait = match attempt {
+        1 => 5,
+        2 => 10,
+        3 => 20,
+        4 => 30,
+        _ => 60,
+    };
+    let wait = Duration::from_secs(wait);
+    (elapsed + wait <= NETWORK_RETRY_WINDOW).then_some(wait)
 }
 
 fn migration_script_for_mode(repo: &str, tarball_url: &str, release_ref: &str, automatic: bool) -> String {
@@ -762,6 +785,21 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(!refresh_tzdata("sleep 10", Duration::from_millis(100)).await);
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn network_failures_keep_retrying_until_wifi_has_had_time_to_connect() {
+        let s = Duration::from_secs;
+        assert_eq!(network_retry_delay(1, s(1)), Some(s(5)));
+        assert_eq!(network_retry_delay(2, s(6)), Some(s(10)));
+        assert_eq!(network_retry_delay(3, s(16)), Some(s(20)));
+        assert_eq!(network_retry_delay(4, s(36)), Some(s(30)));
+        assert_eq!(network_retry_delay(9, s(300)), Some(s(60)));
+        // Wi-Fi typically connects ~20 s after boot: still retrying then.
+        assert!(network_retry_delay(3, s(20)).is_some());
+        // Gives up once the window is spent; the next boot tries again.
+        assert_eq!(network_retry_delay(20, s(15 * 60 - 30)), None);
+        assert_eq!(network_retry_delay(20, s(15 * 60)), None);
     }
 
     #[test]

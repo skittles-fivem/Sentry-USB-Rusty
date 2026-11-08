@@ -3589,6 +3589,35 @@ with open('/dev/rtc0', 'wb') as f:
 " 2>/dev/null
 }
 
+# Clock checkpoint for Pis without a battery-backed RTC. At boot,
+# fake-hwclock sets the clock from /etc/fake-hwclock.data (a link to
+# /mutable/etc/fake-hwclock.data), but it only saves that file at a clean
+# shutdown or from an hourly cron job. This Pi loses power instead of
+# shutting down, and minimal images have no cron, so the file kept a
+# weeks-old time. Every boot then started weeks in the past until Wi-Fi time
+# sync, logs were misdated, and a snapshot taken before the sync was stamped
+# with the old date, sorting as the oldest snapshot. Saving the time after
+# each sync, each snapshot and every hour keeps a boot at most about an hour
+# behind, and never earlier than the newest snapshot.
+FAKE_HWCLOCK_DATA=/etc/fake-hwclock.data
+
+function save_clock_checkpoint () {
+  # A battery-backed RTC (RTC_BATTERY_ENABLED, Pi 5) keeps time itself.
+  [ "${RTC_BATTERY_ENABLED:-false}" != "true" ] || return 0
+  local file now saved
+  file=$(readlink -f "$FAKE_HWCLOCK_DATA" 2>/dev/null) || return 0
+  [ -n "$file" ] && [ -d "${file%/*}" ] || return 0
+  now=$(date -u +%s)
+  # Only ever move it forward: before time sync the clock may still hold
+  # the old time, and writing that back would undo a newer checkpoint.
+  if [ -s "$file" ]; then
+    saved=$(date -u -d "$(head -1 "$file")" +%s 2>/dev/null || echo 0)
+    [ "$now" -gt "$saved" ] || return 0
+  fi
+  # fake-hwclock's own format: UTC "YYYY-MM-DD HH:MM:SS".
+  date -u '+%Y-%m-%d %H:%M:%S' > "$file.new" 2>/dev/null && mv -f "$file.new" "$file" 2>/dev/null
+}
+
 function set_time () {
   log "Trying to set time..."
   local -r uptime_start=$(awk '{print $1}' /proc/uptime)
@@ -3601,6 +3630,7 @@ function set_time () {
       local -r uptime_end=$(awk '{print $1}' /proc/uptime)
       local -r clocktime_end=$(date +%s.%N)
       log "$(awk "BEGIN {printf \"Time adjusted by %f seconds after %f seconds\", $clocktime_end-$clocktime_start, $uptime_end-$uptime_start}")"
+      save_clock_checkpoint || true
       return
     fi
     log "sntp failed, retrying..."
@@ -3620,6 +3650,9 @@ function timesyncloop {
         rtc_sync_systohc || true
       fi
     fi
+    # Hourly checkpoint even without a network: the clock still runs
+    # forward from wherever it started.
+    save_clock_checkpoint || true
     sleep "${TIME_SYNC_INTERVAL:-3600}"
   done
 }
@@ -3664,6 +3697,8 @@ function snapshotloop {
     # A failed snapshot is already logged and keeps its image for recovery;
     # under errexit it must not take down this worker and its siblings.
     /root/bin/make_snapshot.sh || log "ERROR: make_snapshot.sh failed (exit $?)"
+    # The next boot's clock must not start before this snapshot.
+    save_clock_checkpoint || true
     # Incrementally process new clips after each snapshot.
     # The processor skips already-processed files, so this is lightweight.
     # Runs in a subshell so the snapshot loop isn't blocked.
@@ -4636,6 +4671,7 @@ else
     # make_snapshot fscks the copy (default mode), and a partial in-flight
     # clip was always possible across the power-loss boundary anyway.
     /root/bin/make_snapshot.sh || log "ERROR: boot make_snapshot.sh failed (exit $?)"
+    save_clock_checkpoint || true
   fi
 fi
 
