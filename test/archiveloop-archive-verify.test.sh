@@ -17,7 +17,7 @@ extract() {
 for fn in sortfile prunefile archive_conf_value archive_verify_enabled archive_auto_delete_enabled \
   record_archive_link_targets queue_archived_for_verification archive_ssh_command \
   archive_remote_sha256 archive_set_aside_remote verify_archive_batch prune_archive_verify_ledger \
-  queue_archive_rechecks snapshot_verified_twice auto_delete_verified_snapshots verify_archived_clips \
+  queue_unverified_archived queue_archive_rechecks snapshot_verified_twice auto_delete_verified_snapshots verify_archived_clips \
   json_string json_int json_bool build_share_status_json plan_share_transfer record_archive_throughput \
   write_share_status
 do
@@ -41,7 +41,12 @@ nice() { shift; "$@"; }
 CLOCK=1000
 uptime_seconds() { echo "$CLOCK"; }
 : > "$workdir/released"
-fake_release() { echo "${1##*/}" >> "$workdir/released"; rm -rf "$1"; }
+# Like release_snapshot.sh: remove the snapshot and the links into it.
+fake_release() {
+  echo "${1##*/}" >> "$workdir/released"
+  rm -rf "$1"
+  find "$workdir/mutable/TeslaCam" -lname "*/${1##*/}/*" -delete
+}
 
 mkdir -p "$workdir/mutable/TeslaCam" "$workdir/share" "$workdir/backingfiles/snapshots"
 export ARCHIVE_SYSTEM=cifs ARCHIVE_MOUNT="$workdir/share"
@@ -149,6 +154,25 @@ verdict=$(snapshot_verified_twice "$snaps/snap-000000/snap.bin.toc")
 export ARCHIVE_SAVEDCLIPS=true
 verdict=$(snapshot_verified_twice "$snaps/snap-000000/snap.bin.toc")
 [ "$verdict" = "no 2 1 0" ] || fail "unverified SavedClips clip should keep the snapshot, got '$verdict'"
+
+# --- clips archived before verification existed get checked ---------------
+# On the archived list (sent by an older version), no ledger line, no queue
+# entry: the next pass must queue and verify it.
+make_snap snap-000003 2026-11-07_13-00-00-front.mp4
+touch -d '2026-11-07 13:00' "$snaps/snap-000003/snap.bin"
+old_rel=RecentClips/2026-11-07/2026-11-07_13-00-00-front.mp4
+ln -s "$snaps/snap-000003/mnt/TeslaCam/RecentClips/2026-11-07_13-00-00-front.mp4" "$lower/$old_rel"
+cp -L "$lower/$old_rel" "$workdir/share/$old_rel"
+echo "$old_rel" >> "$workdir/mutable/sentry_files_archived"
+echo 'export ARCHIVE_VERIFY=true' > "$workdir/sentryusb.conf"
+: > "$workdir/log"
+verify_archived_clips || fail "backlog pass failed: $(cat "$workdir/log")"
+grep -q "Queueing 1 previously archived file(s)" "$workdir/log" || fail "backlog clip not queued: $(cat "$workdir/log")"
+[ "$(status_of "$old_rel")" = ok/1 ] || fail "backlog clip should verify ok/1, got $(status_of "$old_rel")"
+# Already checked: the next pass doesn't queue it again.
+: > "$workdir/log"
+verify_archived_clips
+grep -q "previously archived" "$workdir/log" && fail "backlog clip queued twice: $(cat "$workdir/log")"
 
 # --- verification off: queue is dropped, nothing runs ----------------------
 echo 'export ARCHIVE_VERIFY=false' > "$workdir/sentryusb.conf"

@@ -1832,21 +1832,21 @@ function archive_remote_sha256 () {
         timeout 1800 "${ssh_cmd[@]}" "$RSYNC_USER@$RSYNC_SERVER" "$remote" > "$ARCHIVE_VERIFY_WORK/rsync-out" 2>/dev/null || rc=$?
       # 123: xargs saw some files fail (not on the server); the rest hashed.
       [ "$rc" = 0 ] || [ "$rc" = 123 ] || return 1
-      awk '/^[0-9a-f]{64}  / { print substr($0, 1, 64) "\t" substr($0, 67) }' "$ARCHIVE_VERIFY_WORK/rsync-out"
+      awk 'substr($0, 65, 2) == "  " && substr($0, 1, 64) ~ /^[0-9a-f]+$/ { print substr($0, 1, 64) "\t" substr($0, 67) }' "$ARCHIVE_VERIFY_WORK/rsync-out"
       ;;
     rclone)
       local -a rc_cmd=(rclone --config /root/.config/rclone/rclone.conf hashsum sha256 --files-from "$rels")
       # Ask the backend for stored SHA-256s first; backends that don't keep
       # them (or leave some blank) are re-checked by downloading.
       if ! timeout 1800 "${rc_cmd[@]}" "$RCLONE_DRIVE:$RCLONE_PATH" > "$ARCHIVE_VERIFY_WORK/rclone-out" 2>/dev/null ||
-         awk '!/^[0-9a-f]{64}  / { bad = 1 } END { exit !bad }' "$ARCHIVE_VERIFY_WORK/rclone-out"
+         awk '!(substr($0, 65, 2) == "  " && substr($0, 1, 64) ~ /^[0-9a-f]+$/) { bad = 1 } END { exit !bad }' "$ARCHIVE_VERIFY_WORK/rclone-out"
       then
         timeout 3600 "${rc_cmd[@]}" --download "$RCLONE_DRIVE:$RCLONE_PATH" > "$ARCHIVE_VERIFY_WORK/rclone-out" 2>/dev/null || rc=$?
         # rclone exits non-zero for missing files too; with no output at all
         # the remote couldn't be read.
         [ "$rc" = 0 ] || [ -s "$ARCHIVE_VERIFY_WORK/rclone-out" ] || return 1
       fi
-      awk '/^[0-9a-f]{64}  / { print substr($0, 1, 64) "\t" substr($0, 67) }' "$ARCHIVE_VERIFY_WORK/rclone-out"
+      awk 'substr($0, 65, 2) == "  " && substr($0, 1, 64) ~ /^[0-9a-f]+$/ { print substr($0, 1, 64) "\t" substr($0, 67) }' "$ARCHIVE_VERIFY_WORK/rclone-out"
       ;;
     *)
       return 1
@@ -2090,6 +2090,39 @@ function auto_delete_verified_snapshots () {
   ) 9< "$SNAPSHOT_LOCK_DIR"
 }
 
+# Clips archived before verification existed (or while it was turned off)
+# are on the archived-files list but have no ledger line, so nothing would
+# ever check them, their snapshots would never show as verified, and
+# auto-delete would never release them. Queue every such clip. Its link in
+# the link farm still points at the snapshot copy, so it can be hashed like
+# a fresh upload. Idempotent: a clip leaves this set as soon as it has a
+# ledger line or a queue entry, so a large backlog simply drains over
+# several cycles within ARCHIVE_VERIFY_MAX_SECONDS each.
+function queue_unverified_archived () {
+  local archived=/mutable/sentry_files_archived lower=/mutable/TeslaCam
+  local work=/tmp/archive-verify-backfill
+  [ -s "$archived" ] || return 0
+  rm -rf "$work"
+  mkdir -p "$work" || return 1
+  # Either file may not exist yet; mawk (the Pi's awk) stops on a missing
+  # input file, so read them through cat.
+  cat "$ARCHIVE_VERIFY_LEDGER" "$ARCHIVE_VERIFY_QUEUE" 2>/dev/null | cut -f1 > "$work/known"
+  awk -v known="$work/known" '
+    FILENAME == known { seen[$0] = 1; next }
+    $0 != "" && !($0 in seen)' "$work/known" "$archived" > "$work/todo" || true
+  [ -s "$work/todo" ] || { rm -rf "$work"; return 0; }
+  # Only clips the link farm still holds: a released snapshot takes its
+  # links with it, and its clips leave the archived list at the next
+  # archive pass. There is no Pi copy left to compare them with.
+  record_archive_link_targets "$lower" "$work/todo" "$work/targets"
+  awk -F'\t' '$2 != ""' "$work/targets" > "$work/linked"
+  [ -s "$work/linked" ] || { rm -rf "$work"; return 0; }
+  cut -f1 "$work/linked" > "$work/todo"
+  log "Queueing $(wc -l < "$work/todo") previously archived file(s) for their first checksum check"
+  queue_archived_for_verification "$work/todo" "$work/linked" "$lower"
+  rm -rf "$work"
+}
+
 # Verify queued archived clips against the archive server, then (if turned
 # on) release snapshots verified twice. Runs with the archive connected and
 # the car's USB drive already back online.
@@ -2099,6 +2132,7 @@ function verify_archived_clips () {
     rm -f "$ARCHIVE_VERIFY_QUEUE"
     return 0
   fi
+  queue_unverified_archived || log "WARNING: could not queue previously archived files for verification"
   queue_archive_rechecks || log "WARNING: could not queue archive re-checks"
   if [ ! -s "$ARCHIVE_VERIFY_QUEUE" ]
   then

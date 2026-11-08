@@ -35,6 +35,10 @@ use crate::router::AppState;
 
 pub const LEDGER: &str = "/mutable/archive_verified.tsv";
 pub const QUEUE: &str = "/mutable/archive_verify_pending";
+/// Relpaths archiveloop has moved to the archive (one per line). A clip on
+/// this list with no ledger line was sent before verification existed (or
+/// while it was off) and is queued for its first check at the next cycle.
+pub const ARCHIVED: &str = "/mutable/sentry_files_archived";
 /// The archive skips `.mp4` files below this size as short recordings.
 const SHORT_RECORDING_BYTES: u64 = 100_000;
 
@@ -174,6 +178,8 @@ fn parse_ledger(text: &str) -> HashMap<String, LedgerEntry> {
     map
 }
 
+/// Clip keys from the queue (`relpath\t…` lines) or the archived list
+/// (bare relpath lines): the key is the text before the first tab.
 fn parse_queue(text: &str) -> HashSet<String> {
     text.lines()
         .filter_map(|l| l.split('\t').next())
@@ -187,6 +193,7 @@ fn coverage(
     toc: &str,
     ledger: &HashMap<String, LedgerEntry>,
     queue: &HashSet<String>,
+    archived: &HashSet<String>,
     settings: &ArchiveSettings,
 ) -> Coverage {
     let mut c = Coverage {
@@ -229,6 +236,9 @@ fn coverage(
                 c.last_checked_unix = c.last_checked_unix.max(Some(e.unix));
             }
             _ if queue.contains(&key) => c.pending += 1,
+            // Sent before verification existed; its first check is queued
+            // at the next archive cycle.
+            None if archived.contains(&key) => c.pending += 1,
             _ => {}
         }
     }
@@ -270,13 +280,14 @@ fn cache() -> &'static CoverageCache {
 /// settings change.
 pub fn coverage_for(snapshots_dir: &Path, ids: &[String]) -> Option<HashMap<String, Coverage>> {
     let settings = ArchiveSettings::read()?;
-    coverage_with(snapshots_dir, Path::new(LEDGER), Path::new(QUEUE), ids, settings)
+    coverage_with(snapshots_dir, Path::new(LEDGER), Path::new(QUEUE), Path::new(ARCHIVED), ids, settings)
 }
 
 fn coverage_with(
     snapshots_dir: &Path,
     ledger_path: &Path,
     queue_path: &Path,
+    archived_path: &Path,
     ids: &[String],
     settings: ArchiveSettings,
 ) -> Option<HashMap<String, Coverage>> {
@@ -286,6 +297,7 @@ fn coverage_with(
     let mut files: Vec<PathBuf> = ids.iter().map(|id| snapshots_dir.join(id).join("snap.bin.toc")).collect();
     files.push(ledger_path.to_path_buf());
     files.push(queue_path.to_path_buf());
+    files.push(archived_path.to_path_buf());
     let key: CacheKey = (files.iter().map(|p| (p.clone(), identity(p))).collect(), settings.clone());
     if let Ok(guard) = cache().lock() {
         if let Some((k, v)) = guard.as_ref() {
@@ -297,11 +309,12 @@ fn coverage_with(
 
     let ledger = parse_ledger(&std::fs::read_to_string(ledger_path).unwrap_or_default());
     let queue = parse_queue(&std::fs::read_to_string(queue_path).unwrap_or_default());
+    let archived = parse_queue(&std::fs::read_to_string(archived_path).unwrap_or_default());
     let mut out = HashMap::new();
     for id in ids {
         // No TOC: the snapshot isn't complete (or is being made); say nothing.
         if let Ok(toc) = std::fs::read_to_string(snapshots_dir.join(id).join("snap.bin.toc")) {
-            out.insert(id.clone(), coverage(&toc, &ledger, &queue, &settings));
+            out.insert(id.clone(), coverage(&toc, &ledger, &queue, &archived, &settings));
         }
     }
     if let Ok(mut guard) = cache().lock() {
@@ -422,13 +435,13 @@ mod tests {
             "RecentClips/2026-11-07/2026-11-07_10-00-00-front.mp4\t150000\th\t10\tok\t2\tx",
             "SentryClips/ev/2026-11-07_10-00-00-back.mp4\t150000\th\t20\tok\t2\tx",
         ]);
-        let c = coverage(TOC, &l, &HashSet::new(), &settings(true, true));
+        let c = coverage(TOC, &l, &HashSet::new(), &HashSet::new(), &settings(true, true));
         assert_eq!(c.state, "verified");
         assert_eq!((c.clips, c.verified, c.verified_twice), (2, 2, 2), "short clip and json ignored");
         assert!(c.ready_to_delete);
         assert_eq!(c.last_checked_unix, Some(20));
         // Same data with auto-delete off: verified, never "ready".
-        assert!(!coverage(TOC, &l, &HashSet::new(), &settings(true, false)).ready_to_delete);
+        assert!(!coverage(TOC, &l, &HashSet::new(), &HashSet::new(), &settings(true, false)).ready_to_delete);
     }
 
     #[test]
@@ -437,7 +450,7 @@ mod tests {
             "RecentClips/2026-11-07/2026-11-07_10-00-00-front.mp4\t150000\th\t10\tok\t1\tx",
             "SentryClips/ev/2026-11-07_10-00-00-back.mp4\t150000\th\t20\tok\t2\tx",
         ]);
-        let c = coverage(TOC, &l, &HashSet::new(), &settings(true, true));
+        let c = coverage(TOC, &l, &HashSet::new(), &HashSet::new(), &settings(true, true));
         assert_eq!(c.state, "verified");
         assert!(!c.ready_to_delete);
     }
@@ -445,7 +458,7 @@ mod tests {
     #[test]
     fn unarchived_folder_blocks_verified_and_auto_delete() {
         let l = ledger(&["SentryClips/ev/2026-11-07_10-00-00-back.mp4\t150000\th\t20\tok\t2\tx"]);
-        let c = coverage(TOC, &l, &HashSet::new(), &settings(false, true));
+        let c = coverage(TOC, &l, &HashSet::new(), &HashSet::new(), &settings(false, true));
         assert_eq!(c.state, "partial");
         assert_eq!(c.not_archived, 1);
         assert!(!c.ready_to_delete);
@@ -454,24 +467,39 @@ mod tests {
     #[test]
     fn failed_pending_and_short_copies() {
         let failed = ledger(&["SentryClips/ev/2026-11-07_10-00-00-back.mp4\t150000\th\t20\tmismatch\t0\tx"]);
-        assert_eq!(coverage(TOC, &failed, &HashSet::new(), &settings(true, false)).state, "failed");
+        assert_eq!(coverage(TOC, &failed, &HashSet::new(), &HashSet::new(), &settings(true, false)).state, "failed");
 
         // Re-queued after the failure: being re-sent, not failed.
         let queue = parse_queue("RecentClips/2026-11-07/2026-11-07_10-00-00-front.mp4\tsrc\n\
                                  SentryClips/ev/2026-11-07_10-00-00-back.mp4\tsrc\n");
-        assert_eq!(coverage(TOC, &failed, &queue, &settings(true, false)).state, "pending");
+        assert_eq!(coverage(TOC, &failed, &queue, &HashSet::new(), &settings(true, false)).state, "pending");
 
         // A server copy smaller than this snapshot's doesn't cover it.
         let small = ledger(&[
             "RecentClips/2026-11-07/2026-11-07_10-00-00-front.mp4\t100\th\t10\tok\t2\tx",
             "SentryClips/ev/2026-11-07_10-00-00-back.mp4\t150000\th\t20\tok\t2\tx",
         ]);
-        let c = coverage(TOC, &small, &HashSet::new(), &settings(true, true));
+        let c = coverage(TOC, &small, &HashSet::new(), &HashSet::new(), &settings(true, true));
         assert_eq!((c.state, c.verified), ("partial", 1));
         assert!(!c.ready_to_delete);
 
-        assert_eq!(coverage("", &small, &HashSet::new(), &settings(true, true)).state, "nothing");
-        assert_eq!(coverage(TOC, &HashMap::new(), &HashSet::new(), &settings(true, true)).state, "unverified");
+        assert_eq!(coverage("", &small, &HashSet::new(), &HashSet::new(), &settings(true, true)).state, "nothing");
+        assert_eq!(coverage(TOC, &HashMap::new(), &HashSet::new(), &HashSet::new(), &settings(true, true)).state, "unverified");
+    }
+
+    #[test]
+    fn clips_archived_before_verification_show_as_pending() {
+        // Both clips sent before verification existed: on the archived
+        // list, no ledger line yet. They're "sent, check queued", never
+        // "not archived".
+        let archived = parse_queue("RecentClips/2026-11-07/2026-11-07_10-00-00-front.mp4\n\
+                                    SentryClips/ev/2026-11-07_10-00-00-back.mp4\n");
+        let c = coverage(TOC, &HashMap::new(), &HashSet::new(), &archived, &settings(true, true));
+        assert_eq!((c.state, c.pending, c.verified), ("pending", 2, 0));
+        assert!(!c.ready_to_delete);
+        // Once checked, the ledger decides, not the archived list.
+        let l = ledger(&["SentryClips/ev/2026-11-07_10-00-00-back.mp4\t150000\th\t20\tmismatch\t0\tx"]);
+        assert_eq!(coverage(TOC, &l, &HashSet::new(), &archived, &settings(true, true)).state, "failed");
     }
 
     #[test]
@@ -507,10 +535,10 @@ mod tests {
         let queue_path = d.path().join("queue");
         std::fs::write(&ledger_path, "SentryClips/ev/2026-11-07_10-00-00-back.mp4\t150000\th\t20\tok\t1\tx\n").unwrap();
         let ids = vec!["snap-000001".to_string(), "snap-000002".to_string()];
-        let out = coverage_with(&snaps, &ledger_path, &queue_path, &ids, settings(true, false)).unwrap();
+        let out = coverage_with(&snaps, &ledger_path, &queue_path, &d.path().join("archived"), &ids, settings(true, false)).unwrap();
         assert_eq!(out["snap-000001"].state, "partial");
         assert!(!out.contains_key("snap-000002"), "no TOC, no claim");
         let off = ArchiveSettings { verify: false, ..settings(true, false) };
-        assert!(coverage_with(&snaps, &ledger_path, &queue_path, &ids, off).is_none());
+        assert!(coverage_with(&snaps, &ledger_path, &queue_path, &d.path().join("archived"), &ids, off).is_none());
     }
 }
