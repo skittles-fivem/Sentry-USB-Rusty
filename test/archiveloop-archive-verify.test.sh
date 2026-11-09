@@ -290,6 +290,31 @@ echo 'export ARCHIVE_AUTO_DELETE_VERIFIED=true ARCHIVE_VERIFY_MANAGER_WAIT_HOURS
 verify_archived_clips
 [ "$(status_of $mw)" = ok/1 ] || fail "clip past the wait should be read back and ok/1, got $(status_of $mw)"
 
+# Already re-encoded with no line (converted before the record existed),
+# past the wait: classified from its codec, never downloaded. Proved by a
+# sha256sum on the share copy that would fail the test if it ran.
+mc=RecentClips/2026-11-07/2026-11-07_21-00-00-front.mp4
+make_snap snap-000021 2026-11-07_21-00-00-front.mp4
+ln -s "$snaps/snap-000021/mnt/TeslaCam/RecentClips/2026-11-07_21-00-00-front.mp4" "$lower/$mc"
+{ head -c 4000 /dev/urandom; printf 'stsd....hvc1....'; } > "$workdir/share/$mc"
+echo "$mc" >> "$workdir/mutable/sentry_files_archived"
+# The Pi hashes a share copy with `timeout … sha256sum < file`, so watch
+# timeout: a sha256sum whose stdin is this clip's share copy is a download.
+# It runs in a $( ) subshell, so it leaves a marker file rather than calling fail.
+timeout() {
+  if [[ "$*" == *sha256sum* ]] &&
+     [ "$(readlink -f "/proc/$BASHPID/fd/0" 2>/dev/null)" = "$(readlink -f "$workdir/share/$mc")" ]
+  then
+    touch "$workdir/downloaded"
+  fi
+  command timeout "$@"
+}
+verify_archived_clips
+unset -f timeout
+[ ! -e "$workdir/downloaded" ] || fail "downloaded a re-encoded clip to hash it"
+[ "$(status_of $mc)" = converted_unconfirmed/0 ] || fail "re-encoded clip without a line should be converted_unconfirmed, got $(status_of $mc)"
+ls "$workdir/share/RecentClips/2026-11-07/" | grep -q '21-00-00-front.mp4.mismatch' && fail "re-encoded clip without a line was renamed aside"
+
 # --- briefly absent (Manager's no-hard-link replace) is not missing ---------
 # The clip is gone at the first look and back by the re-check: verified,
 # not re-sent.

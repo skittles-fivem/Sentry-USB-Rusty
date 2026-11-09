@@ -2125,6 +2125,24 @@ function verify_archive_batch () {
   done < "$todo"
   rm -f "$todo"
 
+  # A clip Manager already re-encoded without recording it (before its
+  # record existed) can't match whatever the Pi reads back, so don't
+  # download it to find out: its codec, read from 2 MiB at most, says so.
+  # Those go straight to the re-encode classification below. Only with
+  # Manager's record present, where re-encoded clips are expected.
+  local codec_only="$ARCHIVE_VERIFY_WORK/codec-only"
+  : > "$codec_only"
+  if [ "${ARCHIVE_MANAGER_RECORD:-0}" = 1 ] && [ -s "$readback" ]
+  then
+    local still="$ARCHIVE_VERIFY_WORK/readback-still"
+    : > "$still"
+    while IFS= read -r rel
+    do
+      if archive_remote_is_reencoded "$rel"; then echo "$rel" >> "$codec_only"; else echo "$rel" >> "$still"; fi
+    done < "$readback"
+    mv "$still" "$readback"
+  fi
+
   : > "$ARCHIVE_VERIFY_WORK/remote"
   if [ -s "$readback" ]
   then
@@ -2151,13 +2169,15 @@ function verify_archive_batch () {
   # means the share held exactly the uploaded bytes when Manager converted
   # them ("converted"); different goes on as a mismatch, which the
   # reclassification below explains as a bad-source conversion.
-  awk -F'\t' -v now="$(date +%s)" -v remote="$ARCHIVE_VERIFY_WORK/remote" -v prev="$ARCHIVE_VERIFY_WORK/prev" -v pre="$pre" '
+  awk -F'\t' -v now="$(date +%s)" -v remote="$ARCHIVE_VERIFY_WORK/remote" -v prev="$ARCHIVE_VERIFY_WORK/prev" -v pre="$pre" -v codec="$codec_only" '
     FILENAME == prev   { ps[$1] = $5; ph[$1] = $3; pc[$1] = $6 + 0; next }
     FILENAME == pre    { m[$2] = $1; next }
+    FILENAME == codec  { reenc[$0] = 1; next }
     FILENAME == remote { r[$2] = $1; next }
     {
       if ($3 == "-")          status = "nosource"
       else if ($1 in m)       status = (m[$1] == $3) ? "converted" : "mismatch"
+      else if ($1 in reenc)   status = "mismatch"   # classified as a re-encode below
       else if (!($1 in r))    status = "missing"
       else if (r[$1] == $3)   status = "ok"
       else                    status = "mismatch"
@@ -2167,7 +2187,7 @@ function verify_archive_batch () {
       else if (status == "converted")
         count = (ps[$1] == "ok" || ps[$1] == "converted") ? pc[$1] + 1 : 1
       print $1 "\t" $2 "\t" $3 "\t" now "\t" status "\t" count "\t" $4
-    }' "$ARCHIVE_VERIFY_WORK/prev" "$pre" "$ARCHIVE_VERIFY_WORK/remote" "$localsums" > "$ARCHIVE_VERIFY_WORK/results"
+    }' "$ARCHIVE_VERIFY_WORK/prev" "$pre" "$codec_only" "$ARCHIVE_VERIFY_WORK/remote" "$localsums" > "$ARCHIVE_VERIFY_WORK/results"
 
   # A mismatch that is Sentry Manager's in-place re-encode (server copy
   # H.265/AV1, Pi copy not) is never renamed aside or re-sent as damage:
