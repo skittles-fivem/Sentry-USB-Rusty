@@ -1230,14 +1230,20 @@ function home_verify_backlog () {
         # record its checksum. Check back in a while rather than giving up
         # until the next trip home; stop if the car leaves.
         log "Waiting for Sentry Manager's checksums for ${ARCHIVE_VERIFY_WAITING} file(s); checking again in ${ARCHIVE_VERIFY_MANAGER_POLL_SECONDS:-900}s"
+        archive_work_progress waiting_manager "Waiting for Sentry Manager's checksums" 0 "$ARCHIVE_VERIFY_WAITING" "" \
+          "$(( $(date +%s) + ${ARCHIVE_VERIFY_MANAGER_POLL_SECONDS:-900} ))"
         local waited=0
         while [ "$waited" -lt "${ARCHIVE_VERIFY_MANAGER_POLL_SECONDS:-900}" ]
         do
           sleep 30
           waited=$((waited + 30))
-          archive_is_reachable || return 0
-          [ ! -e /tmp/archive_is_unreachable ] || return 0
+          if ! archive_is_reachable || [ -e /tmp/archive_is_unreachable ]
+          then
+            archive_work_done waiting_manager
+            return 0
+          fi
         done
+        archive_work_done waiting_manager
         continue
       fi
       log "Backlog check made no progress${ARCHIVE_VERIFY_STOPPED:+ ($ARCHIVE_VERIFY_STOPPED)}; trying again next cycle"
@@ -2141,10 +2147,16 @@ function precompute_local_hashes () {
       awk -F'\t' -v have="$ARCHIVE_LOCAL_SUMS" 'FILENAME == have { h[$1] = 1; next }
         substr($2, 1, 1) == "/" && !($2 in h) { print }' "$ARCHIVE_LOCAL_SUMS" - |
       sort -t$'\t' -k1,1r > "$work/todo"
+    local todo_n seen=0
+    todo_n=$(wc -l < "$work/todo")
+    [ "$todo_n" = 0 ] || archive_work_progress prehashing "Pre-hashing clips on the Pi" 0 "$todo_n"
     while IFS=$'\t' read -r rel target
     do
       [ "$(uptime_seconds)" -lt "$deadline" ] || break
       [ ! -e "$ARCHIVE_CONTROL_DIR/archive-cycle" ] || break
+      seen=$((seen + 1))
+      # Every clip looked at counts toward the progress, hashed or skipped.
+      [ $((seen % 5)) -ne 0 ] || archive_work_progress prehashing "Pre-hashing clips on the Pi" "$seen" "$todo_n"
       size=$(stat -L -c %s -- "$target" 2>/dev/null) || continue
       # Short recordings aren't archived.
       if [ "$size" -lt 100000 ] && [[ "$rel" == *.mp4 ]]; then continue; fi
@@ -2157,6 +2169,7 @@ function precompute_local_hashes () {
       printf '%s\t%s\t%s\t%s\n' "$target" "$size" "${sum%% *}" "$fp" >> "$ARCHIVE_LOCAL_SUMS"
       n=$((n + 1))
     done < "$work/todo"
+    archive_work_done prehashing
     [ "$n" = 0 ] || log "Pre-hashed $n clip(s) on the Pi for archive verification"
     rm -rf "$work"
   ) 8> /tmp/archive-precheck.lock
@@ -2736,6 +2749,67 @@ function archive_verify_progress () {
   return 0
 }
 
+# The long task running right now, for the Dashboard's archive card (which
+# otherwise only knows the upload and said "Preparing the next phase…"):
+# {"phase": "verifying"|"prehashing"|"waiting_manager", "label": "...",
+#  "done": N, "total": N, "detail": "..."|null, "next_check_unix": N|null,
+#  "started_unix": N, "updated_unix": N, "eta_seconds": N|null}
+# The estimate is the pace so far in this phase applied to what's left.
+# Written atomically; removed when the phase ends (only by the phase that
+# wrote it, so a background pre-hash finishing can't erase a check's status).
+ARCHIVE_WORK_PROGRESS=/tmp/archive-work-progress.json
+
+# archive_work_progress <phase> <label> <done> <total> [detail] [next_check_unix]
+function archive_work_progress () {
+  local phase=$1 label=$2 done=$3 total=$4 detail=${5:-} next=${6:-} now eta=null d=null n=null
+  now=$(date +%s)
+  if [ "${ARCHIVE_WORK_PHASE:-}" != "$phase" ]
+  then
+    ARCHIVE_WORK_PHASE=$phase
+    ARCHIVE_WORK_STARTED=$now
+  fi
+  if [ "$done" -gt 0 ] && [ "$total" -gt "$done" ]
+  then
+    eta=$(( (now - ARCHIVE_WORK_STARTED) * (total - done) / done ))
+  elif [ "$total" -gt 0 ] && [ "$done" -ge "$total" ]
+  then
+    eta=0
+  fi
+  [ -z "$detail" ] || d=$(json_string "$detail")
+  [ -z "$next" ] || n=$(json_int "$next")
+  printf '{"phase": %s, "label": %s, "done": %s, "total": %s, "detail": %s, "next_check_unix": %s, "started_unix": %s, "updated_unix": %s, "eta_seconds": %s}\n' \
+    "$(json_string "$phase")" "$(json_string "$label")" "$(json_int "$done")" "$(json_int "$total")" \
+    "$d" "$n" "$ARCHIVE_WORK_STARTED" "$now" "$eta" > "$ARCHIVE_WORK_PROGRESS.new" 2>/dev/null &&
+    mv -f "$ARCHIVE_WORK_PROGRESS.new" "$ARCHIVE_WORK_PROGRESS" 2>/dev/null
+  return 0
+}
+
+# archive_work_done <phase>: clear the status if this phase wrote it.
+function archive_work_done () {
+  if grep -q "\"phase\": \"$1\"" "$ARCHIVE_WORK_PROGRESS" 2>/dev/null
+  then
+    rm -f "$ARCHIVE_WORK_PROGRESS"
+  fi
+  [ "${ARCHIVE_WORK_PHASE:-}" != "$1" ] || ARCHIVE_WORK_PHASE=""
+  return 0
+}
+
+# How this pass's clips were checked so far, for the progress detail.
+function archive_verify_methods () {
+  awk -F'\t' '
+    $5 == "converted" { m++ } $5 == "ok_quick" { q++ } $5 == "ok" { r++ }
+    $5 == "mismatch" || $5 == "missing" { b++ } $5 == "converted_unconfirmed" { u++ }
+    END {
+      s = ""
+      if (m) s = s sprintf("%s%d via Sentry Manager'"'"'s record", (s ? " · " : ""), m)
+      if (q) s = s sprintf("%s%d by quick check", (s ? " · " : ""), q)
+      if (r) s = s sprintf("%s%d read back", (s ? " · " : ""), r)
+      if (u) s = s sprintf("%s%d unconfirmed", (s ? " · " : ""), u)
+      if (b) s = s sprintf("%s%d to re-send", (s ? " · " : ""), b)
+      print s
+    }' "$1" 2>/dev/null
+}
+
 # Verify queued archived clips against the archive server, then (if turned
 # on) release snapshots verified twice. Runs with the archive connected and
 # the car's USB drive already back online.
@@ -2778,6 +2852,7 @@ function verify_archived_clips () {
   total=$(wc -l < "$ARCHIVE_VERIFY_WORK/queue")
   log "Verifying $total archived file(s) against the archive server (SHA-256)"
   archive_verify_progress true 0 "$total" ""
+  archive_work_progress verifying "Verifying archived clips" 0 "$total"
 
   local max
   max=$(archive_conf_value ARCHIVE_VERIFY_MAX_SECONDS)
@@ -2798,6 +2873,8 @@ function verify_archived_clips () {
     fi
     rm -f "$batch"
     archive_verify_progress true "$(wc -l < "$ARCHIVE_VERIFY_WORK/results-all")" "$total" ""
+    archive_work_progress verifying "Verifying archived clips" "$(wc -l < "$ARCHIVE_VERIFY_WORK/results-all")" "$total" \
+      "$(archive_verify_methods "$ARCHIVE_VERIFY_WORK/results-all")"
   done
 
   # Whatever wasn't checked, or is waiting for Manager's line, stays queued.
@@ -2821,6 +2898,7 @@ function verify_archived_clips () {
   log "Archive verification: $ok matched, $quickok matched by quick check, $converted re-encoded on the server by Sentry Manager, $bad to re-send, $nosource with no Pi copy left to compare, $left still queued ($waiting waiting for Sentry Manager's checksum)${stopped:+ ($stopped)}"
   ARCHIVE_VERIFY_WAITING=$waiting
   archive_verify_progress false "$(wc -l < "$ARCHIVE_VERIFY_WORK/results-all")" "$total" "$stopped"
+  archive_work_done verifying
   ARCHIVE_VERIFY_RAN=1
   ARCHIVE_VERIFY_MATCHED=$((ok + quickok))
   ARCHIVE_VERIFY_CONVERTED=$converted

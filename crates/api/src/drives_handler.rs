@@ -76,6 +76,28 @@ fn read_archive_status() -> Option<serde_json::Value> {
     serde_json::from_str(&data).ok()
 }
 
+/// The long archive task running now (verifying, pre-hashing, waiting for
+/// Sentry Manager's checksums), written by archiveloop. Null when there is
+/// none, or when it has gone stale: no update for 15 minutes, or a wait
+/// whose next check is more than 5 minutes overdue (the loop or the Pi
+/// restarted mid-task).
+const WORK_PROGRESS: &str = "/tmp/archive-work-progress.json";
+
+fn read_work_progress(path: &std::path::Path, now: i64) -> serde_json::Value {
+    let Some(v) = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+    else {
+        return serde_json::Value::Null;
+    };
+    let updated = v.get("updated_unix").and_then(|x| x.as_i64()).unwrap_or(0);
+    let fresh = match v.get("next_check_unix").and_then(|x| x.as_i64()) {
+        Some(next) => now <= next + 300,
+        None => now - updated < 900,
+    };
+    if fresh { v } else { serde_json::Value::Null }
+}
+
 /// Shell preamble shared with archiveloop's keep-awake management.
 pub(crate) const AWAKE_PREAMBLE: &str = r#"source /root/bin/envsetup.sh 2>/dev/null || true
 declare -F log > /dev/null 2>&1 || {
@@ -462,6 +484,14 @@ pub async fn processing_status(
             }
         }
     }
+
+    resp["work"] = read_work_progress(
+        std::path::Path::new(WORK_PROGRESS),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
+    );
 
     let control = sentryusb_drives::archive_control::ArchiveControl::default();
     resp["archive_cycle"] = match control.active_cycle() {
@@ -1627,5 +1657,27 @@ mod export_temp_tests {
         remove_export_files(&path);
         assert!(!std::path::Path::new(&path).exists());
         assert!(!std::path::Path::new(&format!("{}.tmp", path)).exists());
+    }
+}
+
+#[cfg(test)]
+mod work_progress_tests {
+    use super::*;
+
+    #[test]
+    fn work_progress_is_reported_while_fresh() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("w.json");
+        std::fs::write(&p, r#"{"phase": "verifying", "label": "Verifying archived clips", "done": 1, "total": 7006, "detail": null, "next_check_unix": null, "started_unix": 990, "updated_unix": 1000, "eta_seconds": null}"#).unwrap();
+        let v = read_work_progress(&p, 1060);
+        assert_eq!(v["label"], "Verifying archived clips");
+        assert_eq!(v["total"], 7006);
+        // No update for 15 minutes: stale, not shown.
+        assert!(read_work_progress(&p, 1000 + 900).is_null());
+        // A wait is judged by its next check, not its last update.
+        std::fs::write(&p, r#"{"phase": "waiting_manager", "label": "Waiting for Sentry Manager's checksums", "done": 0, "total": 40, "detail": null, "next_check_unix": 1900, "started_unix": 1000, "updated_unix": 1000, "eta_seconds": null}"#).unwrap();
+        assert_eq!(read_work_progress(&p, 1890)["phase"], "waiting_manager");
+        assert!(read_work_progress(&p, 1900 + 301).is_null());
+        assert!(read_work_progress(&d.path().join("missing"), 1000).is_null());
     }
 }

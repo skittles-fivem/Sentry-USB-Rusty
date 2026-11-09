@@ -160,3 +160,57 @@ test('optional keep-awake menu is keyboard operable and automatic Away Mode has 
     win.close()
   }
 })
+
+test('the archive card shows long tasks (verifying, pre-hashing, waiting for Manager) instead of "Preparing the next phase…"', async () => {
+  const win = new Window({ url: 'http://localhost/' })
+  class TestSocket { static OPEN = 1; readyState = 1; close() {}; send() {} }
+  const values = { window: win, document: win.document, navigator: win.navigator, localStorage: win.localStorage, WebSocket: TestSocket, IS_REACT_ACT_ENVIRONMENT: true }
+  const originals = Object.keys(values).map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)] as const)
+  for (const [key, value] of Object.entries(values)) Object.defineProperty(globalThis, key, { configurable: true, value })
+  const oldFetch = globalThis.fetch
+  const now = Math.floor(Date.now() / 1000)
+  let drive: Record<string, unknown> = {
+    running: false, archive_cycle: { id: 'cycle', cancelling: false },
+    work: { phase: 'verifying', label: 'Verifying archived clips', done: 1250, total: 7006, detail: "1,200 via Sentry Manager's record · 50 by quick check", next_check_unix: null, started_unix: now - 300, updated_unix: now, eta_seconds: 1380 },
+  }
+  win.localStorage.setItem('cloud-bar-dismissed', '1')
+  const fixtures: Record<string, unknown> = {
+    '/api/status': { cpu_temp: '50000', num_snapshots: '2', snapshot_oldest: '', snapshot_newest: '', total_space: '1000000', free_space: '45000', uptime: '60', drives_active: 'yes', udc_state: 'configured', wifi_ssid: 'Test', wifi_strength: '60/70', wifi_ip: '192.0.2.1', ether_ip: '', ether_speed: '', fan_speed: '', storage_health: { state: 'healthy', message: 'Storage managed automatically' } },
+    '/api/drives/stats': { processed_count: 10, drives_count: 2, total_distance_km: 20, total_distance_mi: 12, fsd_percent: 50, latest_drive_end: null },
+    '/api/telemetry/tire-history?days=30': { points: [] },
+    '/api/status/storage': { cam_size: 100000, music_size: 0, lightshow_size: 0, boombox_size: 0, snapshots_size: 855000, total_space: 1000000, free_space: 45000 },
+  }
+  globalThis.fetch = async (input: RequestInfo | URL) => {
+    const path = String(input)
+    if (path === '/api/drives/status') return Response.json(drive)
+    return Response.json(fixtures[path] ?? {})
+  }
+  const { createRoot } = await import('react-dom/client')
+  const Dashboard = (await import('./Dashboard')).default
+  const container = win.document.createElement('div'); win.document.body.append(container)
+  const root = createRoot(container)
+  const card = () => container.querySelector('[aria-label="Archive and library"]')?.textContent ?? ''
+  try {
+    await act(async () => root.render(createElement(MemoryRouter, null, createElement(Dashboard))))
+    await act(async () => { await new Promise(r => setTimeout(r, 50)) })
+    assert.match(card(), /Verifying archived clips/)
+    assert.match(card(), /1,250 \/ 7,006/)
+    assert.match(card(), /About 23 min remaining/)
+    assert.match(card(), /1,200 via Sentry Manager's record · 50 by quick check/)
+    assert.doesNotMatch(card(), /Preparing the next phase/)
+    assert.match(card(), /Verifying/)
+    // Waiting for Manager: count and when it checks again; no bar.
+    drive = { running: false, archive_cycle: { id: 'cycle', cancelling: false },
+      work: { phase: 'waiting_manager', label: "Waiting for Sentry Manager's checksums", done: 0, total: 340, detail: null, next_check_unix: now + 720, started_unix: now, updated_unix: now, eta_seconds: null } }
+    root.unmount()
+    const root2 = createRoot(container)
+    await act(async () => root2.render(createElement(MemoryRouter, null, createElement(Dashboard))))
+    await act(async () => { await new Promise(r => setTimeout(r, 50)) })
+    assert.match(card(), /Waiting for Sentry Manager's checksums for 340 clips · checking again in 12 min/)
+    await act(async () => root2.unmount())
+  } finally {
+    globalThis.fetch = oldFetch
+    for (const [key, descriptor] of originals) { if (descriptor) Object.defineProperty(globalThis, key, descriptor); else Reflect.deleteProperty(globalThis, key) }
+    win.close()
+  }
+})

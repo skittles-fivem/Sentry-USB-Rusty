@@ -28,7 +28,7 @@ import { useWifiFirmware } from "@/hooks/useWifiFirmware"
 import { WifiFirmwareModal } from "@/components/dashboard/WifiFirmwareModal"
 import { fetchCurrentCharge } from "@/api/charging"
 import type { CurrentCharge } from "@/types/charging"
-import type { PiStatus, DriveStats, StorageBreakdown, ArchiveCycle } from "@/lib/api"
+import type { PiStatus, DriveStats, StorageBreakdown, ArchiveCycle, WorkProgress } from "@/lib/api"
 import { wsClient } from "@/lib/ws"
 import { formatUptime, formatBytes, formatTemp } from "@/lib/utils"
 import { useUnits } from "@/lib/units"
@@ -128,6 +128,7 @@ export default function Dashboard() {
     useState<StorageBreakdown | null>(null)
   const [archiveProgress, setArchiveProgress] = useState<ProcessProgress | null>(null)
   const [archiveCycle, setArchiveCycle] = useState<ArchiveCycle | null>(null)
+  const [work, setWork] = useState<WorkProgress | null>(null)
   const [processing, setProcessing] = useState(false)
   const [processProgress, setProcessProgress] = useState<ProcessProgress | null>(null)
   // Units come from the shared store — coherent defaults and live-synced with
@@ -202,6 +203,7 @@ export default function Dashboard() {
         if (progress.status !== "fulfilled") return
         const driveStatus = progress.value
         setArchiveCycle(driveStatus.archive_cycle ?? null)
+        setWork(driveStatus.work ?? null)
         if (eventVersion === processEventVersion) {
           setProcessing(driveStatus.running)
           setProcessProgress(driveStatus.running && (driveStatus.process_total ?? 0) > 0 ? {
@@ -550,7 +552,7 @@ export default function Dashboard() {
       <CloudStatusBar />
 
       <ActivityTile driveStats={driveStats} archiveCycle={archiveCycle} archiveProgress={archiveProgress}
-        processProgress={processProgress} processing={processing} metric={metric} status={status} />
+        processProgress={processProgress} processing={processing} work={work} metric={metric} status={status} />
 
       <div className="dashboard-status-grid grid items-stretch gap-3 md:grid-cols-2 xl:grid-cols-3">
         <SystemTile status={status} uptime={uptime} useFahrenheit={systemUseFahrenheit} keepAwakeIdle={keepAwakeMode === ""} />
@@ -879,19 +881,62 @@ function StorageTile({
   )
 }
 
-function ActivityTile({ driveStats, archiveCycle, archiveProgress, processProgress, processing, metric, status }: {
+/** Short pill text for a long archive task. */
+const WORK_PILL: Record<string, string> = {
+  verifying: "Verifying",
+  prehashing: "Pre-hashing",
+  waiting_manager: "Waiting",
+}
+
+/** Progress for a long archive task (verifying, pre-hashing, waiting for
+ *  Sentry Manager), shown when there's no upload or processing progress. */
+function WorkBlock({ work }: { work: WorkProgress }) {
+  // A clock for the wait's countdown, updated every 15 s.
+  const [now, setNow] = useState(() => Date.now() / 1000)
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now() / 1000), 15_000)
+    return () => clearInterval(timer)
+  }, [])
+  if (work.phase === "waiting_manager") {
+    const next = work.next_check_unix ? Math.max(0, work.next_check_unix - now) : null
+    return (
+      <p className="text-sm text-slate-300">
+        Waiting for Sentry Manager's checksums for {work.total.toLocaleString()} clip{work.total === 1 ? "" : "s"}
+        {next !== null && ` · checking again in ${next < 60 ? "under a minute" : `${Math.round(next / 60)} min`}`}
+      </p>
+    )
+  }
+  const estimate = progressEstimate({
+    current: work.done, total: work.total, etaSeconds: work.eta_seconds,
+    etaState: work.eta_seconds == null ? "estimating" : undefined, sampledAt: work.updated_unix,
+  })
+  return (
+    <>
+      {work.total > 0
+        ? <ProgressBlock current={work.done} total={work.total} eta={estimate} color="blue" />
+        : <p className="text-sm text-slate-400">Starting…</p>}
+      {work.detail && <p className="text-xs text-slate-400">{work.detail}</p>}
+    </>
+  )
+}
+
+function ActivityTile({ driveStats, archiveCycle, archiveProgress, processProgress, processing, work, metric, status }: {
   driveStats: DriveStats | null
   archiveCycle: ArchiveCycle | null
   archiveProgress: ProcessProgress | null
   processProgress: ProcessProgress | null
   processing: boolean
+  work: WorkProgress | null
   metric: boolean
   status: PiStatus
 }) {
   const keepAwake = useKeepAwake()
-  const active = Boolean(archiveProgress || processing || archiveCycle)
+  const active = Boolean(archiveProgress || processing || archiveCycle || work)
   const progress = archiveProgress ?? processProgress
-  const title = archiveProgress ? "Archiving footage" : processing ? "Processing clips" : archiveCycle ? "Archive in progress" : "Your library"
+  // A long task (verifying, pre-hashing, waiting for Manager) shows when
+  // there's no upload or processing progress to show.
+  const showWork = !progress && work !== null
+  const title = archiveProgress ? "Archiving footage" : processing ? "Processing clips" : showWork ? work!.label : archiveCycle ? "Archive in progress" : "Your library"
   const wifiRates = status.wifi_adapters
     ? status.wifi_adapters.filter(adapter => adapter.connected).map(adapter => ({ bps: adapter.tx_bps, state: adapter.rate_state }))
     : [{ bps: status.wifi_tx_bps ?? 0, state: status.wifi_rate_state }]
@@ -902,11 +947,13 @@ function ActivityTile({ driveStats, archiveCycle, archiveProgress, processProgre
     <section aria-label="Archive and library" className="glass-card p-4 sm:p-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <h2 className="flex items-center gap-2 text-base font-semibold text-slate-100"><BoltIcon className="h-5 w-5 text-emerald-400" />{title}</h2>
-        {active && <Pill kind="accent"><LiveDot />{archiveProgress ? "Transfer" : processing ? "Processing" : "Working"}</Pill>}
+        {active && <Pill kind="accent"><LiveDot />{archiveProgress ? "Transfer" : processing ? "Processing" : showWork ? WORK_PILL[work!.phase] ?? "Working" : "Working"}</Pill>}
       </div>
       {active && (
         <div className="mt-4 space-y-3">
-          {progress && progress.total > 0 ? <ProgressBlock current={progress.current} total={progress.total} eta={progressEstimate(progress)} color={archiveProgress ? "emerald" : "blue"} /> : <p className="text-sm text-slate-400">Preparing the next phase…</p>}
+          {progress && progress.total > 0
+            ? <ProgressBlock current={progress.current} total={progress.total} eta={progressEstimate(progress)} color={archiveProgress ? "emerald" : "blue"} />
+            : showWork ? <WorkBlock work={work!} /> : <p className="text-sm text-slate-400">Preparing the next phase…</p>}
           <div className="flex flex-wrap items-center justify-between gap-3">
             <span className="text-xs text-slate-400">{archiveProgress ? `Upload ${upload} · estimate for transfer` : "Estimates apply to the current phase"}</span>
             <div className="min-w-40"><CancelArchiveButton key={archiveCycle?.id ?? "idle"} cycle={archiveCycle} unavailable={Boolean(archiveProgress)} /></div>

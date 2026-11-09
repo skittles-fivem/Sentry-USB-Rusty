@@ -19,6 +19,7 @@ for fn in sortfile prunefile archive_conf_value archive_verify_enabled archive_a
   archive_remote_sha256 archive_set_aside_remote verify_archive_batch prune_archive_verify_ledger \
   archive_quick_fingerprint archive_remote_quick_fingerprint archive_quick_result archive_verify_quick_mode \
   archive_cached_local_sum precompute_local_hashes archive_local_quick_fingerprint archive_verify_progress \
+  archive_work_progress archive_work_done archive_verify_methods \
   archive_stream_is_reencoded archive_local_is_reencoded archive_remote_is_reencoded archive_manager_original_sums archive_manager_record_present \
   queue_unverified_archived queue_archive_rechecks snapshot_verified_twice auto_delete_verified_snapshots verify_archived_clips \
   json_string json_int json_bool build_share_status_json plan_share_transfer record_archive_throughput \
@@ -65,6 +66,7 @@ export ARCHIVE_VERIFY_ABSENT_RECHECK_SECONDS=0
 ARCHIVE_QUICK_WHOLE_BELOW=2097152
 ARCHIVE_LOCAL_SUMS="$workdir/mutable/archive_local_sums.tsv"
 ARCHIVE_VERIFY_PROGRESS="$workdir/progress.json"
+ARCHIVE_WORK_PROGRESS="$workdir/work-progress.json"
 ARCHIVE_CONTROL_DIR="$workdir/ctl"; mkdir -p "$ARCHIVE_CONTROL_DIR"
 # The "missing" re-check pauses with sleep; a test can hook that pause to
 # simulate the share changing in between.
@@ -446,6 +448,26 @@ echo 'export ARCHIVE_AUTO_DELETE_VERIFIED=true' > "$workdir/sentryusb.conf"
 prog=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["running"], d["checked"], d["total"], d["stopped"])' "$ARCHIVE_VERIFY_PROGRESS") ||
   fail "progress file missing or not JSON"
 [ "${prog%% *}" = False ] || fail "progress should say not running after a pass: $prog"
+
+# --- Dashboard work status --------------------------------------------------
+[ ! -e "$ARCHIVE_WORK_PROGRESS" ] || fail "work status left behind after a verification pass"
+wp() { python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d[sys.argv[2]])' "$ARCHIVE_WORK_PROGRESS" "$1"; }
+ARCHIVE_WORK_PHASE=""
+archive_work_progress verifying "Verifying archived clips" 0 400
+[ "$(wp eta_seconds)" = None ] || fail "no estimate before anything is done"
+ARCHIVE_WORK_STARTED=$(( $(date +%s) - 100 ))
+archive_work_progress verifying "Verifying archived clips" 100 400 "100 via Sentry Manager's record"
+[ "$(wp done)/$(wp total)" = "100/400" ] || fail "work status counts wrong"
+[ "$(wp eta_seconds)" -ge 299 ] && [ "$(wp eta_seconds)" -le 301 ] || fail "estimate should be ~300 s, got $(wp eta_seconds)"
+[ "$(wp detail)" = "100 via Sentry Manager's record" ] || fail "detail wrong: $(wp detail)"
+# Another phase finishing doesn't erase this one's status.
+archive_work_done prehashing
+[ -e "$ARCHIVE_WORK_PROGRESS" ] || fail "pre-hash finishing erased the verification status"
+archive_work_done verifying
+[ ! -e "$ARCHIVE_WORK_PROGRESS" ] || fail "verification status not cleared"
+printf 'a\t1\th\t1\tconverted\t1\tx\nb\t1\th\t1\tok_quick\t1\tx\nc\t1\th\t1\tok_quick\t1\tx\nd\t1\th\t1\tmismatch\t0\tx\n' > "$workdir/methods"
+[ "$(archive_verify_methods "$workdir/methods")" = "1 via Sentry Manager's record · 2 by quick check · 1 to re-send" ] ||
+  fail "methods summary wrong: $(archive_verify_methods "$workdir/methods")"
 
 # --- verification off: queue is dropped, nothing runs ----------------------
 echo 'export ARCHIVE_VERIFY=false' > "$workdir/sentryusb.conf"

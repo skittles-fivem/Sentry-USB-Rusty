@@ -22,6 +22,9 @@ SHARE_STATUS_DIR=.sentryusb SHARE_STATUS_NAME=archive-status.json
 # Stubs: each verify slice checks up to $per_slice queue lines.
 verify_on=true reachable=true cancel_after=0 connect_ok=true per_slice=3 slices=0 cycles=0 status_writes=0 disconnects=0
 archive_verify_enabled() { $verify_on; }
+work_shown="" work_cleared=""
+archive_work_progress() { work_shown="$1:$2:$4"; }
+archive_work_done() { work_cleared+="$1 "; }
 archive_is_reachable() { $reachable; }
 archive_run_command() { "$@"; }
 fake_connect() { $connect_ok; }
@@ -87,6 +90,8 @@ home_verify_backlog
 [ ! -e "$ARCHIVE_VERIFY_QUEUE" ] || fail "didn't come back for the waiting clips"
 [ "$sleeps" = 2 ] || fail "expected two 30 s waits, got $sleeps"
 grep -q "Waiting for Sentry Manager's checksums for 4 file(s)" "$LOG_FILE" || fail "wait not logged: $(cat "$LOG_FILE")"
+[ "$work_shown" = "waiting_manager:Waiting for Sentry Manager's checksums:4" ] || fail "dashboard not told about the wait: $work_shown"
+[[ "$work_cleared" == *waiting_manager* ]] || fail "wait status not cleared after the wait"
 # ...but leaves if the car does while waiting.
 reset 4
 waiting_slices=5 sleeps=0

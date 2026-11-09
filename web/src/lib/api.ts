@@ -120,7 +120,23 @@ export interface ArchiveCycle {
   cancelling: boolean
 }
 
+/** The long archive task running now (GET /api/drives/status → work). */
+export interface WorkProgress {
+  phase: "verifying" | "prehashing" | "waiting_manager" | string
+  label: string
+  done: number
+  total: number
+  /** How the clips were checked so far, e.g. "1,200 via Sentry Manager's record · 40 by quick check". */
+  detail: string | null
+  /** For a wait: when the next check happens. */
+  next_check_unix: number | null
+  started_unix: number
+  updated_unix: number
+  eta_seconds: number | null
+}
+
 export interface DriveStatus {
+  work?: WorkProgress | null
   running: boolean
   routes_count: number
   processed_count: number
