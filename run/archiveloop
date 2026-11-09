@@ -4064,8 +4064,10 @@ function snapshotloop {
     next=$(( $(uptime_seconds) + interval ))
     # Tell the web UI when the next scheduled snapshot is due (wall-clock
     # unix time, for the Snapshots page's Live row). Best effort.
-    echo $(( $(date +%s) + interval )) > "$NEXT_SNAPSHOT_FILE.new" 2>/dev/null &&
+    if echo $(( $(date +%s) + interval )) > "$NEXT_SNAPSHOT_FILE.new" 2>/dev/null
+    then
       mv -f "$NEXT_SNAPSHOT_FILE.new" "$NEXT_SNAPSHOT_FILE" 2>/dev/null || true
+    fi
     # A failed snapshot is already logged and keeps its image for recovery;
     # under errexit it must not take down this worker and its siblings.
     /root/bin/make_snapshot.sh || log "ERROR: make_snapshot.sh failed (exit $?)"
