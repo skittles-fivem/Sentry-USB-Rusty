@@ -133,7 +133,7 @@ every frame's size (`stsz`).
 |---|---|
 | same size, codec and frames | `ok_basic`: verified |
 | Manager's `hvc1`/`hev1`/`av01` re-encode of the Pi's H.264, same frame count, duration within 100 ms | `converted_basic`: verified |
-| Manager's re-encode, frame count differs by exactly one, duration within half a frame (average frame length) | `converted_basic`: verified. Covers Manager's two known one-frame cases, where the total duration is kept: Tesla's encoder skipping a frame_num across the wrap before an IDR, and variable-frame-rate clips |
+| Manager's re-encode, frame count differs by exactly one, duration within three quarters of a frame (average frame length; real re-encodes land about 0.6 frame off) | `converted_basic`: verified. Covers Manager's two known one-frame cases, where the total duration is kept: Tesla's encoder skipping a frame_num across the wrap before an IDR, and variable-frame-rate clips |
 | Manager's re-encode with a different frame count or duration | `converted_unconfirmed`: kept and never re-sent, but that snapshot is never auto-deleted |
 | anything else (cut off, different frames, not on the share) | `mismatch` or `missing`: renamed aside / re-sent as usual |
 

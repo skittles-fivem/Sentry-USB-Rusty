@@ -2501,7 +2501,9 @@ PYBASIC
 #  - the Pi's copy is H.264 and the server's H.265/AV1 (Sentry Manager's
 #    in-place re-encode): converted_basic when the frame count matches and
 #    the duration is within 100 ms, or when the frame count differs by one
-#    and the duration is within half a frame. That covers Manager's two
+#    and the duration is within three quarters of a frame (the original's
+#    average frame length; on real clips the re-encode's duration lands
+#    21-25 ms from a 41.6 ms frame, about 0.6 frame). That covers Manager's two
 #    known one-frame cases, where total duration is kept: Tesla's encoder
 #    skipping a frame_num across the wrap before an IDR (FFmpeg drops the
 #    picture after the gap and the previous frame absorbs its duration), and
@@ -2519,8 +2521,8 @@ function archive_basic_result () {
       d = a[5] - b[5]; if (d < 0) d = -d
       f = a[4] - b[4]; if (f < 0) f = -f
       if (a[4] == b[4] && d <= 100) ok = 1
-      # One frame apart: duration within half of one frame (average length).
-      else if (f == 1 && a[4] > 0 && d * 2 * a[4] <= a[5]) ok = 1
+      # One frame apart: duration within 3/4 of one frame (average length).
+      else if (f == 1 && a[4] > 0 && d * 4 * a[4] <= 3 * a[5]) ok = 1
       else ok = 0
       print ok ? "converted_basic" : "converted_unconfirmed"
       exit
@@ -3090,6 +3092,39 @@ function archive_resolve_batch_sources () {
   done < "$batch" > "$batch.resolved" && mv "$batch.resolved" "$batch"
 }
 
+# Version of archive_basic_result's rule. When it changes, clips the basic
+# check left converted_unconfirmed (and, in basic mode, ones a full check
+# left unconfirmed) are checked once more under the new rule.
+ARCHIVE_BASIC_RULE_VERSION=2
+ARCHIVE_BASIC_RULE_FILE=/mutable/archive_basic_rule
+
+function requeue_unconfirmed_for_basic_rule () {
+  archive_verify_basic_mode || return 0
+  [ "$(cat "$ARCHIVE_BASIC_RULE_FILE" 2>/dev/null)" != "$ARCHIVE_BASIC_RULE_VERSION" ] || return 0
+  if [ -s "$ARCHIVE_VERIFY_LEDGER" ]
+  then
+    local n
+    n=$({ cut -f1 "$ARCHIVE_VERIFY_QUEUE" 2>/dev/null || true; } |
+      awk -F'\t' -v now="$(date +%s)" -v queue="$ARCHIVE_VERIFY_QUEUE.add" '
+        FILENAME == "-" { q[$0] = 1; next }
+        { last[$1] = $0 }
+        END {
+          for (r in last) {
+            split(last[r], f, "\t")
+            if (f[5] == "converted_unconfirmed" && !(r in q)) { print r "\t" f[7] "\t-\t-\t" now > queue; n++ }
+          }
+          print n + 0
+        }' - "$ARCHIVE_VERIFY_LEDGER")
+    if [ -s "$ARCHIVE_VERIFY_QUEUE.add" ]
+    then
+      cat "$ARCHIVE_VERIFY_QUEUE.add" >> "$ARCHIVE_VERIFY_QUEUE"
+      log "Queueing $n re-encoded file(s) left unconfirmed for another basic check (rule version $ARCHIVE_BASIC_RULE_VERSION)"
+    fi
+    rm -f "$ARCHIVE_VERIFY_QUEUE.add"
+  fi
+  echo "$ARCHIVE_BASIC_RULE_VERSION" > "$ARCHIVE_BASIC_RULE_FILE" || true
+}
+
 # Clips whose latest check found no Pi copy ("nosource"), because the
 # snapshot they were sent from was released, are checked again when the Pi
 # still holds them in another snapshot. Only when that copy is a different
@@ -3260,6 +3295,7 @@ function verify_archived_clips () {
   fi
   queue_unverified_archived || log "WARNING: could not queue previously archived files for verification"
   requeue_nosource_with_copy || log "WARNING: could not re-queue files checked without a Pi copy"
+  requeue_unconfirmed_for_basic_rule || log "WARNING: could not re-queue unconfirmed re-encodes"
   queue_archive_rechecks || log "WARNING: could not queue archive re-checks"
   if [ ! -s "$ARCHIVE_VERIFY_QUEUE" ]
   then

@@ -20,7 +20,7 @@ for fn in sortfile prunefile archive_conf_value archive_verify_enabled archive_a
   archive_quick_fingerprint archive_remote_quick_fingerprint archive_quick_result archive_verify_quick_mode \
   archive_cached_local_sum precompute_local_hashes archive_local_quick_fingerprint archive_verify_progress \
   archive_work_progress archive_work_done archive_verify_methods archive_verify_gone_through \
-  archive_basic_describe archive_current_source archive_resolve_batch_sources requeue_nosource_with_copy archive_verify_parallel archive_remote_quick_fingerprints archive_lowprio_fn archive_verify_basic_mode archive_basic_fingerprints archive_basic_result verify_archive_batch_basic archive_verify_finish_batch \
+  requeue_unconfirmed_for_basic_rule archive_basic_describe archive_current_source archive_resolve_batch_sources requeue_nosource_with_copy archive_verify_parallel archive_remote_quick_fingerprints archive_lowprio_fn archive_verify_basic_mode archive_basic_fingerprints archive_basic_result verify_archive_batch_basic archive_verify_finish_batch \
   archive_stream_is_reencoded archive_local_is_reencoded archive_remote_is_reencoded archive_manager_original_sums archive_manager_record_present \
   queue_unverified_archived queue_archive_rechecks snapshot_verified_twice auto_delete_verified_snapshots verify_archived_clips \
   json_string json_int json_bool build_share_status_json plan_share_transfer record_archive_throughput \
@@ -65,6 +65,8 @@ stsd_entry() { printf 'stsd\000\000\000\000\000\000\000\001\000\000\000\126%s' "
 ARCHIVE_MANAGER_CHECKSUMS=.sentrymanager/original-checksums.sha256
 export ARCHIVE_VERIFY_ABSENT_RECHECK_SECONDS=0
 ARCHIVE_QUICK_WHOLE_BELOW=2097152
+eval "$(grep '^ARCHIVE_BASIC_RULE_VERSION=' "$script")"
+ARCHIVE_BASIC_RULE_FILE="$workdir/mutable/archive_basic_rule"
 ARCHIVE_LOCAL_SUMS="$workdir/mutable/archive_local_sums.tsv"
 ARCHIVE_VERIFY_PROGRESS="$workdir/progress.json"
 ARCHIVE_WORK_PROGRESS="$workdir/work-progress.json"
@@ -503,6 +505,12 @@ rm -f "$workdir/share/$b6"
 [ "$(archive_basic_result mp4:1:avc1:100:3000:a mp4:2:hvc1:99:3000:b)" = converted_basic ] || fail "one frame fewer, same duration, should pass"
 [ "$(archive_basic_result mp4:1:avc1:100:3000:a mp4:2:hvc1:101:3010:b)" = converted_basic ] || fail "one frame more within half a frame should pass"
 [ "$(archive_basic_result mp4:1:avc1:100:3000:a mp4:2:hvc1:99:2970:b)" = converted_unconfirmed ] || fail "lost last frame should not pass"
+[ "$(archive_basic_result mp4:1:avc1:100:3000:a mp4:2:hvc1:99:3022:b)" = converted_basic ] || fail "0.73 frame off should pass"
+[ "$(archive_basic_result mp4:1:avc1:100:3000:a mp4:2:hvc1:99:3023:b)" = converted_unconfirmed ] || fail "0.77 frame off should not pass"
+# Real clips from the user's Pi (Sentry Manager's frame_num-gap case).
+[ "$(archive_basic_result mp4:25947755:avc1:1426:59309:a mp4:923168:hvc1:1425:59333:b)" = converted_basic ] || fail "real clip (24 ms off) should pass"
+[ "$(archive_basic_result mp4:26343749:avc1:1443:60065:a mp4:15455623:hvc1:1442:60041:b)" = converted_basic ] || fail "real clip (-24 ms) should pass"
+[ "$(archive_basic_result mp4:26343749:avc1:1443:60065:a mp4:15455623:hvc1:1442:60023:b)" = converted_unconfirmed ] || fail "a whole frame short should not pass"
 [ "$(archive_basic_result mp4:1:avc1:100:3000:a mp4:2:hvc1:98:3000:b)" = converted_unconfirmed ] || fail "two frames apart should not pass"
 [ "$(archive_basic_result mp4:1:avc1:100:3000:a mp4:2:avc1:99:3000:b)" = mismatch ] || fail "same codec with a frame missing is damage, not a re-encode"
 : > "$ARCHIVE_LOCAL_SUMS"
@@ -533,6 +541,20 @@ queue_archive_rechecks
 grep -q "$b1" "$ARCHIVE_VERIFY_QUEUE" || fail "basic match not queued for its second check"
 verify_archived_clips
 [ "$(status_of "$b1")" = ok_basic/2 ] || fail "second basic check should count twice, got $(status_of "$b1")"
+# A rule change re-checks unconfirmed re-encodes once (basic mode only).
+rm -f "$ARCHIVE_VERIFY_QUEUE"
+rm -f "$ARCHIVE_BASIC_RULE_FILE"
+logs=""
+requeue_unconfirmed_for_basic_rule
+grep -q "^$b5"$'\t' "$ARCHIVE_VERIFY_QUEUE" || fail "unconfirmed re-encode not re-queued after a rule change"
+[ "$(cat "$ARCHIVE_BASIC_RULE_FILE")" = "$ARCHIVE_BASIC_RULE_VERSION" ] || fail "rule version not recorded"
+grep -q "left unconfirmed for another basic check" <<< "$logs" || fail "re-queue not logged: $logs"
+rm -f "$ARCHIVE_VERIFY_QUEUE"
+requeue_unconfirmed_for_basic_rule
+[ ! -s "$ARCHIVE_VERIFY_QUEUE" ] || fail "unconfirmed re-encodes re-queued again for the same rule"
+verify_archived_clips
+[ "$(status_of "$b5")" = converted_unconfirmed/0 ] || fail "b5 (10 frames short) should stay unconfirmed, got $(status_of "$b5")"
+
 # A clip first checked when the snapshot it was sent from was already gone
 # ("nosource") is checked again from its copy in a newer snapshot.
 b7=$(basic_clip 07)
