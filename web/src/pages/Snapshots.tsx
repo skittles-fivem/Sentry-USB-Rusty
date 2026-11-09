@@ -91,14 +91,16 @@ export function ArchiveTag({ archive }: { archive?: ArchiveCoverage | null }) {
       return (
         <span className={`${tagClass} border-amber-400/30 bg-amber-400/10 text-amber-300`}
           title={`${archive.verified} of ${archive.clips} clips verified on the archive server.${archive.unconfirmed ? ` ${archive.unconfirmed} clip(s) were re-encoded by Sentry Manager before their original could be checked, so they're on the server but unconfirmed; this snapshot is never deleted automatically.` : ""}${notArchived}${checked}`}>
-          {archive.verified} / {archive.clips} on archive
+          {archive.verified} / {archive.clips} verified
+          {archive.pending > 0 && ` · ${archive.pending} queued`}
+          {(archive.unconfirmed ?? 0) > 0 && ` · ${archive.unconfirmed} unconfirmed`}
         </span>
       )
     default:
       return (
         <span className={`${tagClass} border-white/10 bg-white/5 text-slate-400`}
           title={`None of this snapshot's ${archive.clips} clips are verified on the archive server yet.${notArchived}`}>
-          Not archived yet
+          {archive.pending > 0 ? `0 / ${archive.clips} verified · ${archive.pending} queued` : "Not archived yet"}
         </span>
       )
   }

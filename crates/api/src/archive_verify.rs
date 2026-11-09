@@ -55,6 +55,8 @@ pub struct ArchiveSettings {
     pub archive_system: String,
     pub verify: bool,
     pub auto_delete: bool,
+    /// Count `converted_unconfirmed` clips as verified (opt-in).
+    pub trust_unconfirmed: bool,
     pub saved: bool,
     pub sentry: bool,
     pub recent: bool,
@@ -80,6 +82,7 @@ impl ArchiveSettings {
                 .unwrap_or_else(|| "none".to_string()),
             verify: flag(active, "ARCHIVE_VERIFY", true),
             auto_delete: flag(active, "ARCHIVE_AUTO_DELETE_VERIFIED", false),
+            trust_unconfirmed: flag(active, "ARCHIVE_TRUST_UNCONFIRMED_CONVERSIONS", false),
             saved: flag(active, "ARCHIVE_SAVEDCLIPS", true),
             sentry: flag(active, "ARCHIVE_SENTRYCLIPS", true),
             recent: flag(active, "ARCHIVE_RECENTCLIPS", false),
@@ -248,6 +251,14 @@ fn coverage(
                 }
                 c.last_checked_unix = c.last_checked_unix.max(Some(e.unix));
             }
+            // Opt-in: trusted like a confirmed conversion. There is no
+            // original to check again, so it also counts as checked twice.
+            Some(e) if e.status == "converted_unconfirmed" && settings.trust_unconfirmed && e.size >= size => {
+                c.verified += 1;
+                c.verified_twice += 1;
+                c.converted += 1;
+                c.last_checked_unix = c.last_checked_unix.max(Some(e.unix));
+            }
             Some(e) if e.status == "converted_unconfirmed" => {
                 c.unconfirmed += 1;
                 c.last_checked_unix = c.last_checked_unix.max(Some(e.unix));
@@ -348,6 +359,7 @@ fn coverage_with(
 struct SettingsBody {
     verify: bool,
     auto_delete: bool,
+    trust_unconfirmed: bool,
     archive_system: String,
     /// False when RecentClips aren't archived: snapshots holding them can
     /// never be fully verified, so auto-delete keeps them.
@@ -358,6 +370,7 @@ fn settings_body(s: &ArchiveSettings) -> SettingsBody {
     SettingsBody {
         verify: s.verify,
         auto_delete: s.auto_delete,
+        trust_unconfirmed: s.trust_unconfirmed,
         archive_system: s.archive_system.clone(),
         recent_clips_archived: s.recent,
     }
@@ -377,9 +390,12 @@ pub struct SettingsUpdate {
     verify: Option<bool>,
     #[serde(default)]
     auto_delete: Option<bool>,
+    #[serde(default)]
+    trust_unconfirmed: Option<bool>,
 }
 
-/// POST /api/archive-verify/settings — `{"verify"?: bool, "auto_delete"?: bool}`.
+/// POST /api/archive-verify/settings —
+/// `{"verify"?: bool, "auto_delete"?: bool, "trust_unconfirmed"?: bool}`.
 ///
 /// Writes `ARCHIVE_VERIFY` / `ARCHIVE_AUTO_DELETE_VERIFIED` to sentryusb.conf.
 /// archiveloop reads both fresh each cycle, so no restart is needed.
@@ -397,6 +413,9 @@ pub async fn set_settings(
             if !v {
                 active.insert("ARCHIVE_AUTO_DELETE_VERIFIED".into(), "false".into());
             }
+        }
+        if let Some(v) = body.trust_unconfirmed {
+            active.insert("ARCHIVE_TRUST_UNCONFIRMED_CONVERSIONS".into(), v.to_string());
         }
         if let Some(v) = body.auto_delete {
             let verify_on = flag(&active, "ARCHIVE_VERIFY", true);
@@ -424,6 +443,7 @@ mod tests {
             archive_system: "cifs".into(),
             verify: true,
             auto_delete,
+            trust_unconfirmed: false,
             saved: true,
             sentry: true,
             recent,
@@ -543,6 +563,20 @@ mod tests {
         let c = coverage(TOC, &l, &HashSet::new(), &HashSet::new(), &settings(true, true));
         assert_eq!((c.state, c.verified, c.unconfirmed), ("partial", 1, 1));
         assert!(!c.ready_to_delete);
+    }
+
+    #[test]
+    fn trusting_earlier_conversions_counts_them_as_verified() {
+        let l = ledger(&[
+            "RecentClips/2026-11-07/2026-11-07_10-00-00-front.mp4\t150000\th\t10\tconverted_unconfirmed\t0\tx",
+            "SentryClips/ev/2026-11-07_10-00-00-back.mp4\t150000\th\t20\tok\t2\tx",
+        ]);
+        let off = coverage(TOC, &l, &HashSet::new(), &HashSet::new(), &settings(true, true));
+        assert_eq!((off.state, off.unconfirmed), ("partial", 1));
+        let on = ArchiveSettings { trust_unconfirmed: true, ..settings(true, true) };
+        let c = coverage(TOC, &l, &HashSet::new(), &HashSet::new(), &on);
+        assert_eq!((c.state, c.verified, c.converted, c.unconfirmed), ("verified", 2, 1, 0));
+        assert!(c.ready_to_delete);
     }
 
     #[test]

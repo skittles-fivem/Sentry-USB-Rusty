@@ -231,6 +231,10 @@ r15=RecentClips/2026-11-07/2026-11-07_15-00-00-front.mp4
 ls "$workdir/share/RecentClips/2026-11-07/" | grep -q '15-00-00-front.mp4.mismatch' && fail "unconfirmed re-encode was renamed aside"
 grep -q 15-00-00 "$workdir/mutable/sentry_files_archived" || fail "unconfirmed re-encode would be re-sent"
 [ "$(snapshot_verified_twice "$snaps/snap-000015/snap.bin.toc")" = "no 1 1 0" ] || fail "unconfirmed re-encode must block auto-delete"
+# Opt-in trust counts it, and only while the setting is on.
+echo 'export ARCHIVE_AUTO_DELETE_VERIFIED=true ARCHIVE_TRUST_UNCONFIRMED_CONVERSIONS=true' > "$workdir/sentryusb.conf"
+[ "$(snapshot_verified_twice "$snaps/snap-000015/snap.bin.toc")" = "yes 1" ] || fail "trusted unconfirmed re-encode should allow auto-delete"
+echo 'export ARCHIVE_AUTO_DELETE_VERIFIED=true' > "$workdir/sentryusb.conf"
 
 # Manager's record matches the Pi's copy: converted, confirmed by checksum.
 new_reencoded 16

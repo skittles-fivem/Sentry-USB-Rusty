@@ -7,6 +7,7 @@ import { Toggle } from "@/components/ui/Toggle"
 interface ArchiveVerifySettings {
   verify: boolean
   auto_delete: boolean
+  trust_unconfirmed?: boolean
   archive_system: string
   recent_clips_archived: boolean
 }
@@ -31,7 +32,7 @@ export function ArchiveVerifySection() {
     return () => { active = false }
   }, [])
 
-  async function save(change: Partial<Pick<ArchiveVerifySettings, "verify" | "auto_delete">>) {
+  async function save(change: Partial<Pick<ArchiveVerifySettings, "verify" | "auto_delete" | "trust_unconfirmed">>) {
     setSaving(true)
     setError(null)
     try {
@@ -106,6 +107,27 @@ export function ArchiveVerifySection() {
               </li>
             </ul>
             <p>This cannot be undone. The archive server then holds the only copy of that footage.</p>
+          </InfoButton>
+        }
+      />
+      <Toggle
+        checked={!!settings?.trust_unconfirmed}
+        disabled={!settings || saving || noArchive || !settings.verify}
+        onChange={(trust_unconfirmed) => void save({ trust_unconfirmed })}
+        label="Trust Sentry Manager's earlier conversions"
+        sub="Count clips it re-encoded before they could be checked as verified."
+        help={
+          <InfoButton title="Earlier conversions">
+            <p>
+              Sentry Manager now records each original clip's SHA-256 before it re-encodes it, so the Pi can verify
+              converted clips by checksum. Clips it converted before that, without the Pi having checked them first,
+              can't be verified this way: the original is gone. They show as "unconfirmed", and snapshots holding them
+              are never deleted automatically.
+            </p>
+            <p>
+              Turn this on to count those clips as verified, relying on Sentry Manager's own conversion checks for them.
+              It only affects clips already marked unconfirmed; new conversions are still checked by checksum.
+            </p>
           </InfoButton>
         }
       />

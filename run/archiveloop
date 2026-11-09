@@ -1181,6 +1181,54 @@ function home_archive_retry_pace () {
 
 # Cancellation uses the normal wait-for-departure path, even in Travel Mode.
 # There is no persistent pause flag and no resume operation.
+# While the car stays parked at home after an archive cycle, keep working
+# through the checksum-verification queue. Without this, a large backlog
+# (clips archived before verification existed) got one ARCHIVE_VERIFY_MAX_SECONDS
+# slice per trip home, and ~8,400 clips took about a week of trips.
+#
+# Each slice runs as its own archive cycle, so the web UI's Cancel stops it
+# (until the next cycle); a cancel here only stops checking, it never defers
+# footage cleanup the way cancelling a real archive does. It stops as soon as
+# the archive is unreachable (the car left), when the queue is empty, or
+# when a slice checks nothing (the server can't be read; retried next
+# cycle). Verification doesn't hold the snapshots lock, so the hourly
+# snapshot carries on as usual.
+function home_verify_backlog () {
+  archive_verify_enabled || return 0
+  while [ -s "$ARCHIVE_VERIFY_QUEUE" ]
+  do
+    archive_is_reachable || return 0
+    [ ! -e /tmp/archive_is_unreachable ] || return 0
+    log "Parked at home: checking more of the archive backlog ($(wc -l < "$ARCHIVE_VERIFY_QUEUE") file(s) queued)"
+    archive_cycle_begin
+    ARCHIVE_VERIFY_RAN=0 ARCHIVE_VERIFY_STOPPED="" ARCHIVE_VERIFY_MATCHED=0
+    ARCHIVE_VERIFY_RESEND=0 ARCHIVE_VERIFY_NOSOURCE=0 ARCHIVE_VERIFY_LEFT=0 ARCHIVE_VERIFY_CONVERTED=0
+    if ! archive_run_command /root/bin/connect-archive.sh
+    then
+      log "Couldn't connect to the archive to check the backlog; trying again next cycle"
+      archive_cycle_end || true
+      return 0
+    fi
+    verify_archived_clips || true
+    if archive_is_reachable
+    then
+      ARCHIVE_SHARE_STATE=idle
+      write_share_status || log "WARNING: could not write $SHARE_STATUS_DIR/$SHARE_STATUS_NAME to the archive"
+    fi
+    /root/bin/disconnect-archive.sh 2>> "$LOG_FILE" || true
+    if ! archive_cycle_end
+    then
+      log "Backlog check stopped by user; it continues at the next archive cycle"
+      return 0
+    fi
+    if [ $((ARCHIVE_VERIFY_MATCHED + ARCHIVE_VERIFY_CONVERTED + ARCHIVE_VERIFY_RESEND + ARCHIVE_VERIFY_NOSOURCE)) -eq 0 ]
+    then
+      log "Backlog check made no progress${ARCHIVE_VERIFY_STOPPED:+ ($ARCHIVE_VERIFY_STOPPED)}; trying again next cycle"
+      return 0
+    fi
+  done
+}
+
 function wait_after_archive_cycle () {
   if [ "${ARCHIVE_CYCLE_CANCELLED:-0}" = "1" ]; then
     ARCHIVE_HOME_RETRY_DELAY=0
@@ -1202,6 +1250,7 @@ function wait_after_archive_cycle () {
   else
     ARCHIVE_HOME_RETRY_DELAY=0
     ARCHIVE_HOME_RETRY_PENDING=0
+    home_verify_backlog || log "WARNING: backlog check stopped unexpectedly"
     wait_for_archive_to_be_unreachable
   fi
 }
@@ -1727,6 +1776,13 @@ function intersect {
 # apply without a restart:
 #   ARCHIVE_VERIFY=false              turn verification off (default on)
 #   ARCHIVE_AUTO_DELETE_VERIFIED=true delete snapshots verified twice (default off)
+#   ARCHIVE_TRUST_UNCONFIRMED_CONVERSIONS=true
+#                                     count clips Sentry Manager re-encoded
+#                                     before anything confirmed the original
+#                                     (converted_unconfirmed) as verified, so
+#                                     auto-delete can clear old snapshots.
+#                                     Relies on Manager's own conversion
+#                                     checks for them (default off)
 #   ARCHIVE_VERIFY_MAX_SECONDS        time budget per cycle (default 1800);
 #                                     the rest stays queued for next cycle
 #   ARCHIVE_VERIFY_RECHECK_SECONDS    minimum gap before the second check
@@ -2149,8 +2205,12 @@ function queue_archive_rechecks () {
 # large as the snapshot's copy. One clip from a folder that isn't archived
 # (e.g. RecentClips with ARCHIVE_RECENTCLIPS off) keeps the snapshot.
 function snapshot_verified_twice () {
-  local toc=$1
-  awk -F'\t' -v ledger="$ARCHIVE_VERIFY_LEDGER" \
+  local toc=$1 trust=false v
+  # Opt-in (Settings): count clips Sentry Manager re-encoded before anything
+  # confirmed the original as verified. Default off.
+  v=$(archive_conf_value ARCHIVE_TRUST_UNCONFIRMED_CONVERSIONS)
+  case "${v,,}" in true|yes|1|on) trust=true ;; esac
+  awk -F'\t' -v ledger="$ARCHIVE_VERIFY_LEDGER" -v trust="$trust" \
       -v saved="${ARCHIVE_SAVEDCLIPS:-true}" -v sentry="${ARCHIVE_SENTRYCLIPS:-true}" \
       -v recent="${ARCHIVE_RECENTCLIPS:-false}" -v track="${ARCHIVE_TRACKMODECLIPS:-true}" '
     function key(p,   n, a) {
@@ -2159,7 +2219,9 @@ function snapshot_verified_twice () {
       return p
     }
     FILENAME == ledger {
-      if (($5 == "ok" || $5 == "converted") && $6 + 0 >= 2) { k = key($1); if (!(k in vs) || $2 + 0 > vs[k]) vs[k] = $2 + 0 }
+      if ((($5 == "ok" || $5 == "converted") && $6 + 0 >= 2) || ($5 == "converted_unconfirmed" && trust == "true")) {
+        k = key($1); if (!(k in vs) || $2 + 0 > vs[k]) vs[k] = $2 + 0
+      }
       next
     }
     {

@@ -292,7 +292,7 @@ test("archive tags show verification state and the delete dialog warns about unv
     assert.match(row("twice"), /Verified on archive ×2/)
     assert.match(row("twice"), /Deleting after next archive/)
     assert.match(row("bad"), /Checksum mismatch · re-sending/)
-    assert.match(row("half"), /2 \/ 4 on archive/)
+    assert.match(row("half"), /2 \/ 4 verified/)
     assert.doesNotMatch(row("off"), /archive/i, "no tag when verification is off")
 
     // Only the verified snapshot selected: no warning.
