@@ -9,7 +9,9 @@
 //! ```
 //!
 //! `status` is `ok`, `ok_quick` (SMB/NFS quick check: size, moov index and
-//! video slices match; counts as verified), `converted`, `converted_unconfirmed`, `mismatch`,
+//! video slices match; counts as verified), `ok_basic` / `converted_basic`
+//! (ARCHIVE_VERIFY_MODE=basic: size and frames match, the latter on Sentry
+//! Manager's re-encode; both count as verified), `converted`, `converted_unconfirmed`, `mismatch`,
 //! `missing` or `nosource`. `converted`: Sentry Manager re-encoded the server
 //! copy in place (H.265/AV1) and the original is confirmed by Manager's
 //! checksum record or an earlier match; it counts as verified.
@@ -61,6 +63,8 @@ pub struct ArchiveSettings {
     /// ARCHIVE_VERIFY_MODE=full: read SMB/NFS copies back whole instead of
     /// the quick check.
     pub full_readback: bool,
+    /// ARCHIVE_VERIFY_MODE=basic: compare size and frames only (SMB/NFS).
+    pub basic: bool,
     pub saved: bool,
     pub sentry: bool,
     pub recent: bool,
@@ -90,6 +94,9 @@ impl ArchiveSettings {
             full_readback: active
                 .get("ARCHIVE_VERIFY_MODE")
                 .is_some_and(|v| v.trim().eq_ignore_ascii_case("full")),
+            basic: active
+                .get("ARCHIVE_VERIFY_MODE")
+                .is_some_and(|v| v.trim().eq_ignore_ascii_case("basic")),
             saved: flag(active, "ARCHIVE_SAVEDCLIPS", true),
             sentry: flag(active, "ARCHIVE_SENTRYCLIPS", true),
             recent: flag(active, "ARCHIVE_RECENTCLIPS", false),
@@ -145,6 +152,10 @@ pub struct Coverage {
     /// Of `verified`, clips matched by the SMB/NFS quick check (size, moov
     /// index and video slices) rather than a full SHA-256 comparison.
     pub quick: usize,
+    /// Of `verified`, clips matched by the basic check (size, codec, frame
+    /// count, duration and frame sizes), including Manager's re-encodes
+    /// whose frame count and duration match.
+    pub basic: usize,
     /// Clips Sentry Manager re-encoded before the Pi or Manager's checksum
     /// record could confirm the original. Not verified; they keep the
     /// snapshot from being auto-deleted.
@@ -228,6 +239,7 @@ fn coverage(
         verified_twice: 0,
         converted: 0,
         quick: 0,
+        basic: 0,
         unconfirmed: 0,
         pending: 0,
         failed: 0,
@@ -252,10 +264,16 @@ fn coverage(
         match ledger.get(&key) {
             // The server copy must be at least as large as this snapshot's:
             // an older snapshot can hold a clip the car was still writing.
-            Some(e) if (e.status == "ok" || e.status == "ok_quick" || e.status == "converted") && e.size >= size => {
+            Some(e)
+                if matches!(e.status.as_str(), "ok" | "ok_quick" | "converted" | "ok_basic" | "converted_basic")
+                    && e.size >= size =>
+            {
                 c.verified += 1;
                 if e.status == "ok_quick" {
                     c.quick += 1;
+                }
+                if e.status == "ok_basic" || e.status == "converted_basic" {
+                    c.basic += 1;
                 }
                 if e.status == "converted" {
                     c.converted += 1;
@@ -375,6 +393,8 @@ struct SettingsBody {
     auto_delete: bool,
     trust_unconfirmed: bool,
     full_readback: bool,
+    /// "basic" (size and frames) or "full" (SHA-256).
+    mode: &'static str,
     archive_system: String,
     /// False when RecentClips aren't archived: snapshots holding them can
     /// never be fully verified, so auto-delete keeps them.
@@ -387,6 +407,7 @@ fn settings_body(s: &ArchiveSettings) -> SettingsBody {
         auto_delete: s.auto_delete,
         trust_unconfirmed: s.trust_unconfirmed,
         full_readback: s.full_readback,
+        mode: if s.basic { "basic" } else { "full" },
         archive_system: s.archive_system.clone(),
         recent_clips_archived: s.recent,
     }
@@ -410,10 +431,13 @@ pub struct SettingsUpdate {
     trust_unconfirmed: Option<bool>,
     #[serde(default)]
     full_readback: Option<bool>,
+    /// "basic" or "full".
+    #[serde(default)]
+    mode: Option<String>,
 }
 
 /// POST /api/archive-verify/settings —
-/// `{"verify"?: bool, "auto_delete"?: bool, "trust_unconfirmed"?: bool, "full_readback"?: bool}`.
+/// `{"verify"?: bool, "auto_delete"?: bool, "trust_unconfirmed"?: bool, "full_readback"?: bool, "mode"?: "basic" | "full"}`.
 ///
 /// Writes `ARCHIVE_VERIFY` / `ARCHIVE_AUTO_DELETE_VERIFIED` to sentryusb.conf.
 /// archiveloop reads both fresh each cycle, so no restart is needed.
@@ -432,10 +456,26 @@ pub async fn set_settings(
                 active.insert("ARCHIVE_AUTO_DELETE_VERIFIED".into(), "false".into());
             }
         }
+        // ARCHIVE_VERIFY_MODE: "basic", "full" (whole read-back), or unset
+        // (full checking with the SMB/NFS quick check as its fallback).
+        let current = active.get("ARCHIVE_VERIFY_MODE").map(|v| v.trim().to_ascii_lowercase());
+        if let Some(mode) = body.mode.as_deref() {
+            match mode {
+                "basic" => {
+                    active.insert("ARCHIVE_VERIFY_MODE".into(), "basic".into());
+                }
+                "full" => {
+                    if current.as_deref() == Some("basic") {
+                        active.remove("ARCHIVE_VERIFY_MODE");
+                    }
+                }
+                other => anyhow::bail!("Unknown verification mode {other:?}"),
+            }
+        }
         if let Some(v) = body.full_readback {
             if v {
                 active.insert("ARCHIVE_VERIFY_MODE".into(), "full".into());
-            } else {
+            } else if active.get("ARCHIVE_VERIFY_MODE").is_some_and(|m| m.trim().eq_ignore_ascii_case("full")) {
                 active.remove("ARCHIVE_VERIFY_MODE");
             }
         }
@@ -470,6 +510,7 @@ mod tests {
             auto_delete,
             trust_unconfirmed: false,
             full_readback: false,
+            basic: false,
             saved: true,
             sentry: true,
             recent,
@@ -603,6 +644,30 @@ mod tests {
         let c = coverage(TOC, &l, &HashSet::new(), &HashSet::new(), &on);
         assert_eq!((c.state, c.verified, c.converted, c.unconfirmed), ("verified", 2, 1, 0));
         assert!(c.ready_to_delete);
+    }
+
+    #[test]
+    fn basic_check_matches_count_as_verified() {
+        let l = ledger(&[
+            "RecentClips/2026-11-07/2026-11-07_10-00-00-front.mp4\t150000\tbasic:mp4:x\t10\tok_basic\t2\tx",
+            "RecentClips/2026-11-07/2026-11-07_10-01-00-front.mp4\t150000\tbasic:mp4:y\t10\tconverted_basic\t1\tx",
+        ]);
+        let toc = "150000 TeslaCam/RecentClips/2026-11-07_10-00-00-front.mp4\n150000 TeslaCam/RecentClips/2026-11-07_10-01-00-front.mp4\n";
+        let c = coverage(toc, &l, &HashSet::new(), &HashSet::new(), &settings(true, true));
+        assert_eq!((c.state, c.verified, c.basic, c.verified_twice), ("verified", 2, 2, 1));
+        assert!(!c.ready_to_delete);
+    }
+
+    #[test]
+    fn verify_mode_is_read_from_the_config() {
+        let mut cfg = sentryusb_config::SetupConfig::new();
+        cfg.insert("ARCHIVE_VERIFY_MODE".into(), "Basic".into());
+        let s = ArchiveSettings::from_config(&cfg);
+        assert!(s.basic && !s.full_readback);
+        cfg.insert("ARCHIVE_VERIFY_MODE".into(), "full".into());
+        let s = ArchiveSettings::from_config(&cfg);
+        assert!(!s.basic && s.full_readback);
+        assert_eq!(settings_body(&s).mode, "full");
     }
 
     #[test]

@@ -20,6 +20,7 @@ for fn in sortfile prunefile archive_conf_value archive_verify_enabled archive_a
   archive_quick_fingerprint archive_remote_quick_fingerprint archive_quick_result archive_verify_quick_mode \
   archive_cached_local_sum precompute_local_hashes archive_local_quick_fingerprint archive_verify_progress \
   archive_work_progress archive_work_done archive_verify_methods archive_verify_gone_through \
+  archive_lowprio_fn archive_verify_basic_mode archive_basic_fingerprints archive_basic_result verify_archive_batch_basic archive_verify_finish_batch \
   archive_stream_is_reencoded archive_local_is_reencoded archive_remote_is_reencoded archive_manager_original_sums archive_manager_record_present \
   queue_unverified_archived queue_archive_rechecks snapshot_verified_twice auto_delete_verified_snapshots verify_archived_clips \
   json_string json_int json_bool build_share_status_json plan_share_transfer record_archive_throughput \
@@ -137,7 +138,7 @@ grep -q 10-01-00 "$workdir/mutable/sentry_files_archived" && fail "damaged clip 
 grep -q 11-00-00 "$workdir/mutable/sentry_files_archived" && fail "missing clip still marked archived (would never be re-sent)"
 grep -q 10-00-00 "$workdir/mutable/sentry_files_archived" || fail "verified clip dropped from the archived list"
 [ ! -e "$ARCHIVE_VERIFY_QUEUE" ] || fail "queue not emptied after a complete pass"
-grep -q "1 matched, 0 matched by quick check, 0 re-encoded on the server by Sentry Manager, 2 to re-send" <<< "$logs" || fail "summary line wrong: $logs"
+grep -q "1 matched, 0 matched by quick check, 0 matched by size and frames, 0 re-encoded on the server by Sentry Manager, 2 to re-send" <<< "$logs" || fail "summary line wrong: $logs"
 
 # --- re-send, then second check; auto-delete off releases nothing ------------
 (cd "$lower" && for f in RecentClips/2026-11-07/2026-11-07_10-01-00-front.mp4 RecentClips/2026-11-07/2026-11-07_11-00-00-front.mp4; do cp -L "$f" "$workdir/share/$f"; done)
@@ -397,6 +398,113 @@ echo 'export ARCHIVE_VERIFY_MODE=full' > "$workdir/sentryusb.conf"
 q4=$(quick_clip 25)
 verify_archived_clips
 [ "$(status_of "$q4")" = ok/1 ] || fail "full mode should read back and be ok/1, got $(status_of "$q4")"
+
+# --- low-priority runs use the real ionice/nice programs --------------------
+# The stubs above are shell functions, which hid that "ionice ... some_shell_function"
+# fails on the Pi (programs can't run shell functions). Run without them.
+if command -v ionice >/dev/null && command -v nice >/dev/null
+then
+  saved_ionice=$(declare -f ionice); saved_nice=$(declare -f nice)
+  unset -f ionice nice
+  make_mp4 "$workdir/lowprio.mp4"
+  fp=$(archive_lowprio_fn low archive_quick_fingerprint "$workdir/lowprio.mp4") || fail "quick fingerprint at low priority failed"
+  [[ "$fp" == mp4:3149848:* ]] || fail "quick fingerprint at low priority wrong: $fp"
+  fp=$(archive_lowprio_fn idle archive_quick_fingerprint "$workdir/lowprio.mp4") || fail "quick fingerprint at idle priority failed"
+  [[ "$fp" == mp4:* ]] || fail "idle-priority fingerprint wrong: $fp"
+  fp=$(archive_local_quick_fingerprint "$workdir/lowprio.mp4") || fail "local quick fingerprint failed with real ionice"
+  [[ "$fp" == mp4:* ]] || fail "local quick fingerprint wrong: $fp"
+  echo "$workdir/lowprio.mp4" > "$workdir/lowprio.list"
+  fp=$(ARCHIVE_LOWPRIO_TIMEOUT=60 archive_lowprio_fn low archive_basic_fingerprints "$workdir/lowprio.list") ||
+    fail "basic fingerprints at low priority failed"
+  [ -n "$fp" ] || fail "basic fingerprints at low priority printed nothing"
+  eval "$saved_ionice"; eval "$saved_nice"
+fi
+
+# --- basic check (ARCHIVE_VERIFY_MODE=basic): size and frames --------------
+# A minimal MP4: ftyp, mdat, and a moov with one video track whose stsd entry
+# is $2, $3 frames, $4 ms long (timescale 1000), frame sizes seeded by $5.
+basic_mp4() {  # file codec frames ms seed
+  python3 - "$@" <<'PYMP4'
+import random, struct, sys
+path, codec, frames, ms, seed = sys.argv[1], sys.argv[2].encode(), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
+def box(t, body): return struct.pack(">I", 8 + len(body)) + t + body
+rnd = random.Random(seed)
+sizes = [rnd.randint(500, 5000) for _ in range(frames)]
+stsz = box(b"stsz", b"\0" * 4 + struct.pack(">II", 0, frames) + b"".join(struct.pack(">I", x) for x in sizes))
+stsd = box(b"stsd", b"\0" * 4 + struct.pack(">I", 1) + box(codec, b"\0" * 78))
+mdhd = box(b"mdhd", b"\0" * 12 + struct.pack(">II", 1000, ms) + b"\0" * 4)
+hdlr = box(b"hdlr", b"\0" * 8 + b"vide" + b"\0" * 13)
+moov = box(b"moov", box(b"trak", box(b"mdia", mdhd + hdlr + box(b"minf", box(b"stbl", stsd + stsz)))))
+mdat = box(b"mdat", bytes(rnd.getrandbits(8) for _ in range(150000)))
+open(path, "wb").write(box(b"ftyp", b"isom\0\0\0\0isom") + mdat + moov)
+PYMP4
+}
+basic_clip() {  # hh -> relpath; Pi copy in a snapshot, identical copy on the share
+  local name="2026-11-06_$1-00-00-front.mp4" rel="RecentClips/2026-11-06/2026-11-06_$1-00-00-front.mp4"
+  mkdir -p "$snaps/snap-0001$1/mnt/TeslaCam/RecentClips" "$lower/RecentClips/2026-11-06"
+  basic_mp4 "$snaps/snap-0001$1/mnt/TeslaCam/RecentClips/$name" avc1 100 3000 "$1"
+  echo "$(stat -c %s "$snaps/snap-0001$1/mnt/TeslaCam/RecentClips/$name") TeslaCam/RecentClips/$name" > "$snaps/snap-0001$1/snap.bin.toc"
+  : > "$snaps/snap-0001$1/snap.bin"
+  ln -s "$snaps/snap-0001$1/mnt/TeslaCam/RecentClips/$name" "$lower/$rel"
+  mkdir -p "$workdir/share/${rel%/*}"
+  cp -L "$lower/$rel" "$workdir/share/$rel"
+  echo "$rel" >> "$workdir/mutable/sentry_files_archived"
+  echo "$rel"
+}
+echo 'export ARCHIVE_VERIFY_MODE=basic ARCHIVE_AUTO_DELETE_VERIFIED=true' > "$workdir/sentryusb.conf"
+archive_verify_basic_mode || fail "basic mode not detected"
+# Even with Manager's record on the share, basic mode doesn't wait for it.
+mkdir -p "$workdir/share/.sentrymanager"; : > "$workdir/share/$ARCHIVE_MANAGER_CHECKSUMS"
+logs=""
+b1=$(basic_clip 01)   # identical
+b2=$(basic_clip 02)   # one frame size changed in the server copy's index
+b3=$(basic_clip 03)   # cut off
+b4=$(basic_clip 04)   # Manager's H.265 re-encode, same frames and duration
+b5=$(basic_clip 05)   # re-encode that dropped frames
+b6=$(basic_clip 06)   # not on the server
+basic_mp4 "$workdir/share/$b2" avc1 100 3000 99
+truncate -s 100000 "$workdir/share/$b3"
+basic_mp4 "$workdir/share/$b4" hvc1 100 3040 7
+basic_mp4 "$workdir/share/$b5" hvc1 90 2700 7
+rm -f "$workdir/share/$b6"
+: > "$ARCHIVE_LOCAL_SUMS"
+verify_archived_clips
+[ "$(status_of "$b1")" = ok_basic/1 ] || fail "identical clip should pass the basic check, got $(status_of "$b1")"
+[ "$(status_of "$b2")" = mismatch/0 ] || fail "changed frame sizes should be a mismatch, got $(status_of "$b2")"
+[ "$(status_of "$b3")" = mismatch/0 ] || fail "cut-off copy should be a mismatch, got $(status_of "$b3")"
+[ "$(status_of "$b4")" = converted_basic/1 ] || fail "re-encode with the same frames should be converted_basic, got $(status_of "$b4")"
+[ "$(status_of "$b5")" = converted_unconfirmed/0 ] || fail "re-encode with fewer frames should be unconfirmed, got $(status_of "$b5")"
+[ "$(status_of "$b6")" = missing/0 ] || fail "absent clip should be missing, got $(status_of "$b6")"
+ls "$workdir/share/${b2}".mismatch-* >/dev/null 2>&1 || fail "mismatched copy not renamed aside"
+ls "$workdir/share/${b4}".mismatch-* >/dev/null 2>&1 && fail "a re-encode must never be renamed aside"
+grep -q "$b2" "$workdir/mutable/sentry_files_archived" && fail "mismatched clip should be re-sent"
+grep -q "$b5" "$workdir/mutable/sentry_files_archived" || fail "unconfirmed re-encode must not be re-sent"
+grep -q "basic:mp4:" "$ARCHIVE_VERIFY_LEDGER" || fail "basic fingerprint not stored in the ledger"
+[ ! -s "$ARCHIVE_LOCAL_SUMS" ] || fail "basic mode should not pre-hash or read clips whole"
+grep -q "matched by size and frames" <<< "$logs" || fail "summary should count basic matches: $logs"
+grep -q "match the Pi's copy (size and frames)" <<< "$logs" || fail "mismatch log should name the basic check: $logs"
+grep -q "against the archive server (size and frames)" <<< "$logs" || fail "start log should name the basic check: $logs"
+# Second check an hour later counts twice; with the Pi copy gone, the stored
+# fingerprint stands in for it.
+CLOCK=$((CLOCK + 10))
+awk -F'\t' -v OFS='\t' -v r="$b1" '$1 == r { $4 = $4 - 7200 } { print }' "$ARCHIVE_VERIFY_LEDGER" > "$ARCHIVE_VERIFY_LEDGER.t" && mv "$ARCHIVE_VERIFY_LEDGER.t" "$ARCHIVE_VERIFY_LEDGER"
+rm -f "$snaps/snap-000101/mnt/TeslaCam/RecentClips/2026-11-06_01-00-00-front.mp4"
+queue_archive_rechecks
+grep -q "$b1" "$ARCHIVE_VERIFY_QUEUE" || fail "basic match not queued for its second check"
+verify_archived_clips
+[ "$(status_of "$b1")" = ok_basic/2 ] || fail "second basic check should count twice, got $(status_of "$b1")"
+# Two basic matches release the snapshot (auto-delete is on).
+grep -qx snap-000101 "$workdir/released" || fail "snapshot verified twice by the basic check wasn't released"
+# Switching to full doesn't treat a stored basic fingerprint as a SHA-256:
+# with the Pi copy gone there's nothing to compare, so nothing is renamed.
+rm -f "$workdir/share/$ARCHIVE_MANAGER_CHECKSUMS"   # (or the clip would wait for Manager)
+echo 'export ARCHIVE_VERIFY_MODE=full' > "$workdir/sentryusb.conf"
+logs=""
+printf '%s\t%s\t1\tbasic:mp4:1:avc1:1:1:x\t%s\n' "$b1" "$snaps/snap-000101/mnt/TeslaCam/RecentClips/2026-11-06_01-00-00-front.mp4" "$(date +%s)" > "$ARCHIVE_VERIFY_QUEUE"
+verify_archived_clips
+grep -q "1 with no Pi copy left to compare" <<< "$logs" || fail "full mode with only a basic fingerprint should be nosource: $logs"
+ls "$workdir/share/${b1}".mismatch-* >/dev/null 2>&1 && fail "full mode renamed a clip aside over a basic fingerprint"
+echo 'export ARCHIVE_AUTO_DELETE_VERIFIED=true' > "$workdir/sentryusb.conf"
 
 # --- pre-hashing: the Pi's half is done after the snapshot, then reused ---
 echo 'export ARCHIVE_AUTO_DELETE_VERIFIED=true' > "$workdir/sentryusb.conf"

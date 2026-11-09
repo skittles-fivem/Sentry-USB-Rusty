@@ -2,13 +2,23 @@ import { useEffect, useState } from "react"
 import { CloudIcon } from "@/components/icons"
 import { PrefCard } from "@/components/settings/PrefCard"
 import { InfoButton } from "@/components/ui/InfoButton"
+import { SegPicker } from "@/components/ui/SegPicker"
 import { Toggle } from "@/components/ui/Toggle"
+
+type VerifyMode = "full" | "basic"
+
+const MODE_OPTIONS: { value: VerifyMode; label: string }[] = [
+  { value: "full", label: "Full (SHA-256)" },
+  { value: "basic", label: "Basic (size and frames)" },
+]
 
 interface ArchiveVerifySettings {
   verify: boolean
   auto_delete: boolean
   trust_unconfirmed?: boolean
   full_readback?: boolean
+  /** "basic": size and frames; "full": SHA-256. */
+  mode?: VerifyMode
   archive_system: string
   recent_clips_archived: boolean
 }
@@ -33,7 +43,7 @@ export function ArchiveVerifySection() {
     return () => { active = false }
   }, [])
 
-  async function save(change: Partial<Pick<ArchiveVerifySettings, "verify" | "auto_delete" | "trust_unconfirmed" | "full_readback">>) {
+  async function save(change: Partial<Pick<ArchiveVerifySettings, "verify" | "auto_delete" | "trust_unconfirmed" | "full_readback" | "mode">>) {
     setSaving(true)
     setError(null)
     try {
@@ -53,6 +63,8 @@ export function ArchiveVerifySection() {
   }
 
   const noArchive = settings?.archive_system === "none"
+  const mountedShare = settings?.archive_system === "cifs" || settings?.archive_system === "nfs"
+  const mode: VerifyMode = settings?.mode === "basic" ? "basic" : "full"
   return (
     <PrefCard
       icon={<CloudIcon className="h-3.5 w-3.5" />}
@@ -111,7 +123,44 @@ export function ArchiveVerifySection() {
           </InfoButton>
         }
       />
-      {(settings?.archive_system === "cifs" || settings?.archive_system === "nfs") && (
+      {mountedShare && (
+        <div className="space-y-1.5">
+          <div className="flex items-center gap-1.5">
+            <p className="text-sm text-slate-200">Verification method</p>
+            <InfoButton title="Full or basic verification">
+              <p>
+                <strong>Full</strong> compares SHA-256 checksums. When Sentry Manager's checksum record is on the share,
+                the Pi uses it and reads nothing back. Clips without a record line yet wait for Sentry Manager, up to
+                24 hours, and are then checked by the quick check, or read back whole if that option is on.
+              </p>
+              <p>
+                <strong>Basic</strong> compares each clip's size and its frame index on the Pi and on the server: the video
+                codec, the number of frames, the duration and the size of every frame. It reads the index only, usually
+                well under 100 KB per clip, so a clip takes well under a second to check. It doesn't wait for Sentry
+                Manager, and the Pi doesn't hash clips ahead of time. A clip Sentry Manager re-encoded passes when its
+                frame count and duration match the original.
+              </p>
+              <p>
+                A cut-off, missing or rewritten copy can't pass the basic check. Damage that leaves every frame's
+                size unchanged (bit rot inside the video) can, so a basic match is weaker than a checksum. Basic
+                matches count toward auto-delete like full ones.
+              </p>
+            </InfoButton>
+          </div>
+          <SegPicker<VerifyMode>
+            options={MODE_OPTIONS}
+            value={mode}
+            onChange={(next) => { if (next !== mode) void save({ mode: next }) }}
+            disabled={!settings || saving || !settings.verify}
+          />
+          <p className="t-xs">
+            {mode === "basic"
+              ? "Fast: compares size and frames. Well under a second per clip."
+              : "Thorough: SHA-256, using Sentry Manager's record when it's there."}
+          </p>
+        </div>
+      )}
+      {mountedShare && mode === "full" && (
         <Toggle
           checked={!!settings?.full_readback}
           disabled={!settings || saving || !settings.verify}

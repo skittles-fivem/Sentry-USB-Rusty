@@ -1787,6 +1787,13 @@ function intersect {
 #                          Counts like ok. converted_unconfirmed: re-encoded
 #                          before anything could confirm the original. Kept,
 #                          never re-sent, never counts toward auto-delete.
+#                          ok_basic / converted_basic: matched by the basic
+#                          check (ARCHIVE_VERIFY_MODE=basic, SMB/NFS): size,
+#                          codec, frame count, duration and every frame's
+#                          size from the MP4 index; for converted_basic the
+#                          server copy is Manager's re-encode and the frame
+#                          count and duration match. The sha256 field then
+#                          holds "basic:<fingerprint>". Both count like ok.
 #                          "times verified" counts consecutive ok checks of
 #                          the same bytes; any failure resets it to 0.
 #
@@ -2113,6 +2120,8 @@ function archive_cached_local_sum () {
 # One run at a time; best effort.
 function precompute_local_hashes () {
   archive_verify_enabled || return 0
+  # The basic check never hashes whole clips, so there's nothing to prepare.
+  ! archive_verify_basic_mode || return 0
   (
     flock -n 8 || exit 0
     local lower=/mutable/TeslaCam work=/tmp/archive-precheck
@@ -2164,7 +2173,7 @@ function precompute_local_hashes () {
       fp=-
       if archive_verify_quick_mode
       then
-        fp=$(ionice -c3 nice -n19 archive_quick_fingerprint "$target" 2>/dev/null) || fp=-
+        fp=$(archive_lowprio_fn idle archive_quick_fingerprint "$target" 2>/dev/null) || fp=-
       fi
       printf '%s\t%s\t%s\t%s\n' "$target" "$size" "${sum%% *}" "$fp" >> "$ARCHIVE_LOCAL_SUMS"
       n=$((n + 1))
@@ -2190,6 +2199,26 @@ function precompute_local_hashes () {
 # check can't. ARCHIVE_VERIFY_MODE=full forces the full read-back (Settings).
 # Files under 2 MiB, or that aren't readable MP4s on the Pi, are hashed whole.
 ARCHIVE_QUICK_WHOLE_BELOW=2097152
+
+# Run shell function $2 (args after it) at low priority: $1 is "low"
+# (ionice best-effort 7) or "idle" (ionice idle class), both at nice 19.
+# ionice, nice and timeout are separate programs and can't see this
+# script's functions, so the function is exported and run by a child bash;
+# calling "ionice ... some_function" directly fails with "No such file".
+# Optional ARCHIVE_LOWPRIO_TIMEOUT (seconds) bounds the run.
+function archive_lowprio_fn () {
+  local class=$1 fn=$2
+  shift 2
+  local -a io=(ionice -c2 -n7)
+  [ "$class" != idle ] || io=(ionice -c3)
+  local -a limit=()
+  [ -z "${ARCHIVE_LOWPRIO_TIMEOUT:-}" ] || limit=(timeout "$ARCHIVE_LOWPRIO_TIMEOUT")
+  # shellcheck disable=SC2163 # exports the function named by $fn
+  export -f "$fn"
+  # shellcheck disable=SC2016 # "$@" is expanded by the child bash
+  ARCHIVE_QUICK_WHOLE_BELOW=${ARCHIVE_QUICK_WHOLE_BELOW:-2097152} \
+    "${limit[@]}" "${io[@]}" nice -n19 bash -c "$fn"' "$@"' _ "$@"
+}
 
 # Print a quick fingerprint of file $1, or fail if it can't be read.
 # $2=mp4-only: don't fall back to hashing the whole file (for the share's
@@ -2253,7 +2282,7 @@ function archive_local_quick_fingerprint () {
     fp=$(cut -f3 <<< "$cached")
     if [ "$fp" != "-" ] && [ -n "$fp" ]; then printf '%s\n' "$fp"; return 0; fi
   fi
-  ionice -c2 -n7 nice -n19 archive_quick_fingerprint "$1"
+  archive_lowprio_fn low archive_quick_fingerprint "$1"
 }
 
 # The share copy's fingerprint, bounded so a hung SMB/NFS mount can't stall
@@ -2284,11 +2313,238 @@ function archive_verify_quick_mode () {
   [ "${v,,}" != full ]
 }
 
+# ARCHIVE_VERIFY_MODE=basic on an SMB/NFS share: compare size and frames
+# (see archive_basic_fingerprints) instead of SHA-256. Rsync and rclone
+# servers compute SHA-256 themselves, so they always use the full check.
+function archive_verify_basic_mode () {
+  case "${ARCHIVE_SYSTEM:-none}" in cifs|nfs) ;; *) return 1 ;; esac
+  local v
+  v=$(archive_conf_value ARCHIVE_VERIFY_MODE)
+  [ "${v,,}" = basic ]
+}
+
+# Basic-check fingerprints for a list of files ($1, one path per line),
+# printed as "<path>\t<fingerprint>". One process for the whole list. For an
+# MP4 it reads only the box headers and the moov box (the frame index, tens
+# of KB), never the video:
+#   mp4:<size>:<codec>:<frames>:<duration ms>:<frame-size table hash>
+# The top-level boxes must cover the file exactly, so a cut-off copy can't
+# parse. Anything else (not an MP4, or an MP4 that doesn't parse) is hashed
+# whole: whole:<size>:<sha256>. A file that isn't there: absent.
+function archive_basic_fingerprints () {
+  python3 - "$1" <<'PYBASIC'
+import hashlib, os, struct, sys
+
+def walk(f, start, end):
+    """(type, body start, box end) for each box in [start, end); None if they don't tile it."""
+    out, pos = [], start
+    while pos < end:
+        if end - pos < 8:
+            return None
+        f.seek(pos)
+        h = f.read(8)
+        if len(h) < 8:
+            return None
+        size, typ = struct.unpack(">I4s", h)
+        hdr = 8
+        if size == 1:
+            ext = f.read(8)
+            if len(ext) < 8:
+                return None
+            size, hdr = struct.unpack(">Q", ext)[0], 16
+        elif size == 0:
+            size = end - pos
+        if size < hdr or pos + size > end:
+            return None
+        out.append((typ, pos + hdr, pos + size))
+        pos += size
+    return out
+
+def child(f, a, b, name):
+    for t, s, e in walk(f, a, b) or []:
+        if t == name:
+            return s, e
+    return None
+
+def u32(f, at):
+    f.seek(at)
+    return struct.unpack(">I", f.read(4))[0]
+
+def mp4(f, size):
+    top = walk(f, 0, size)
+    if not top:
+        return None
+    types = {t for t, _, _ in top}
+    if b"moov" not in types or b"mdat" not in types:
+        return None
+    _, ms, me = next(x for x in top if x[0] == b"moov")
+    for t, ts, te in walk(f, ms, me) or []:
+        if t != b"trak":
+            continue
+        mdia = child(f, ts, te, b"mdia")
+        if not mdia:
+            continue
+        hdlr = child(f, *mdia, b"hdlr")
+        if not hdlr:
+            continue
+        f.seek(hdlr[0] + 8)
+        if f.read(4) != b"vide":
+            continue
+        mdhd = child(f, *mdia, b"mdhd")
+        minf = child(f, *mdia, b"minf")
+        stbl = minf and child(f, *minf, b"stbl")
+        stsd = stbl and child(f, *stbl, b"stsd")
+        stsz = stbl and child(f, *stbl, b"stsz")
+        if not (mdhd and stsd and stsz):
+            return None
+        f.seek(mdhd[0])
+        if f.read(1)[0] == 1:
+            f.seek(mdhd[0] + 20)
+            scale, dur = struct.unpack(">IQ", f.read(12))
+        else:
+            f.seek(mdhd[0] + 12)
+            scale, dur = struct.unpack(">II", f.read(8))
+        f.seek(stsd[0] + 12)
+        codec = f.read(4).decode("latin-1")
+        const, count = u32(f, stsz[0] + 4), u32(f, stsz[0] + 8)
+        f.seek(stsz[0] + 12)
+        table = f.read(4 * count) if const == 0 else struct.pack(">I", const)
+        if const == 0 and len(table) != 4 * count:
+            return None
+        ms_ = dur * 1000 // scale if scale else 0
+        return "%s:%d:%d:%s" % (codec, count, ms_, hashlib.sha256(table).hexdigest()[:16])
+    return None
+
+def fingerprint(path):
+    try:
+        size = os.stat(path).st_size
+    except FileNotFoundError:
+        return "absent"
+    try:
+        with open(path, "rb") as f:
+            if path.lower().endswith(".mp4"):
+                try:
+                    r = mp4(f, size)
+                except (struct.error, IndexError, StopIteration, ZeroDivisionError):
+                    r = None
+                if r:
+                    return "mp4:%d:%s" % (size, r)
+            f.seek(0)
+            h = hashlib.sha256()
+            for block in iter(lambda: f.read(1 << 20), b""):
+                h.update(block)
+            return "whole:%d:%s" % (size, h.hexdigest())
+    except OSError:
+        return "error"
+
+with open(sys.argv[1], encoding="utf-8", errors="surrogateescape") as lst:
+    for line in lst:
+        p = line.rstrip("\n")
+        if p:
+            print("%s\t%s" % (p, fingerprint(p)), flush=True)
+PYBASIC
+}
+
+# Decide one clip from its basic fingerprints: the Pi's ($1) and the
+# server's ($2). Prints ok_basic, converted_basic, converted_unconfirmed or
+# mismatch.
+#  - identical: ok_basic.
+#  - the Pi's copy is H.264 and the server's H.265/AV1 (Sentry Manager's
+#    in-place re-encode): converted_basic when the frame count matches and
+#    the duration is within 100 ms; otherwise converted_unconfirmed (kept and
+#    never re-sent, so a re-encode that changes frame timing can't loop, but
+#    never auto-deleted either).
+#  - anything else: mismatch.
+function archive_basic_result () {
+  awk -v l="$1" -v r="$2" 'BEGIN {
+    if (l == r) { print "ok_basic"; exit }
+    nl = split(l, a, ":"); nr = split(r, b, ":")
+    if (nl == 6 && nr == 6 && a[1] == "mp4" && b[1] == "mp4" && a[3] == "avc1" &&
+        (b[3] == "hvc1" || b[3] == "hev1" || b[3] == "av01")) {
+      d = a[5] - b[5]; if (d < 0) d = -d
+      print (a[4] == b[4] && d <= 100) ? "converted_basic" : "converted_unconfirmed"
+      exit
+    }
+    print "mismatch"
+  }'
+}
+
+# The basic check for one batch of queue lines ($1): fingerprint the Pi's
+# copies in one pass and the server's copies in another, compare, and record
+# results like verify_archive_batch. No SHA-256 of whole clips, no wait for
+# Sentry Manager's record. Returns non-zero if the share couldn't be read.
+function verify_archive_batch_basic () {
+  local batch=$1 rel src ksize ksum lfp rfp status
+  local w="$ARCHIVE_VERIFY_WORK"
+  timeout 10 [ -d "${ARCHIVE_MOUNT:-}" ] || return 1
+  : > "$w/basic-local-list"
+  : > "$w/basic-remote-list"
+  while IFS=$'\t' read -r rel src _
+  do
+    [ -z "$src" ] || printf '%s\n' "$src" >> "$w/basic-local-list"
+    printf '%s\n' "$ARCHIVE_MOUNT/$rel" >> "$w/basic-remote-list"
+  done < "$batch"
+  archive_lowprio_fn low archive_basic_fingerprints "$w/basic-local-list" > "$w/basic-local" 2>/dev/null || true
+  ARCHIVE_LOWPRIO_TIMEOUT=600 archive_lowprio_fn low archive_basic_fingerprints "$w/basic-remote-list" > "$w/basic-remote" 2>/dev/null ||
+    return 1
+  # Briefly absent isn't missing (see verify_archive_batch): ask once more.
+  awk -F'\t' '$2 == "absent" { print $1 }' "$w/basic-remote" > "$w/basic-absent"
+  if [ -s "$w/basic-absent" ]
+  then
+    sleep "${ARCHIVE_VERIFY_ABSENT_RECHECK_SECONDS:-20}"
+    ARCHIVE_LOWPRIO_TIMEOUT=600 archive_lowprio_fn low archive_basic_fingerprints "$w/basic-absent" >> "$w/basic-remote" 2>/dev/null || true
+  fi
+
+  : > "$w/results.raw"
+  local now
+  now=$(date +%s)
+  while IFS=$'\t' read -r rel src ksize ksum _
+  do
+    lfp=""
+    if [ -n "$src" ]
+    then
+      lfp=$(awk -F'\t' -v p="$src" '$1 == p { v = $2 } END { print v }' "$w/basic-local")
+    fi
+    case "$lfp" in
+      mp4:*|whole:*) ksize=$(cut -d: -f2 <<< "$lfp") ;;
+      *)
+        # No Pi copy any more: a re-check uses the fingerprint from the
+        # first check. A SHA-256 from a full check can't be compared.
+        if [[ "${ksum:-}" == basic:* ]]; then lfp=${ksum#basic:}; else lfp=""; fi ;;
+    esac
+    # Newest answer wins (the re-ask after a pause is appended).
+    rfp=$(awk -F'\t' -v p="$ARCHIVE_MOUNT/$rel" '$1 == p { v = $2 } END { print v }' "$w/basic-remote")
+    if [ -z "$lfp" ]; then status=nosource
+    elif [ "$rfp" = absent ] || [ -z "$rfp" ]; then status=missing
+    elif [ "$rfp" = error ]; then return 1
+    else status=$(archive_basic_result "$lfp" "$rfp")
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$rel" "${ksize:--}" "${lfp:+basic:$lfp}" "$now" "$status" "$src" >> "$w/results.raw"
+  done < "$batch"
+  # times verified: consecutive basic matches of the same Pi copy.
+  awk -F'\t' -v OFS='\t' -v prev="$w/prev" '
+    FILENAME == prev { ps[$1] = $5; ph[$1] = $3; pc[$1] = $6 + 0; next }
+    {
+      h = ($3 == "") ? "-" : $3
+      count = 0
+      if ($5 == "ok_basic" || $5 == "converted_basic")
+        count = ((ps[$1] == "ok_basic" || ps[$1] == "converted_basic") && ph[$1] == h) ? pc[$1] + 1 : 1
+      print $1, $2, h, $4, $5, count, $6
+    }' "$w/prev" "$w/results.raw" > "$w/results"
+  rm -f "$w/results.raw"
+  archive_verify_finish_batch "size and frames"
+}
+
 # Check one batch of queue lines ($1) and append the results to the ledger.
 # $ARCHIVE_VERIFY_WORK/prev holds each clip's latest ledger line from before
 # this run, which carries the "times verified" count forward.
 # Returns non-zero if the server couldn't be asked (the batch stays queued).
 function verify_archive_batch () {
+  if archive_verify_basic_mode
+  then
+    verify_archive_batch_basic "$1"
+    return
+  fi
   local batch=$1 rel src ksize ksum sum size
   local localsums="$ARCHIVE_VERIFY_WORK/local" rels="$ARCHIVE_VERIFY_WORK/rels"
   local pre="$ARCHIVE_VERIFY_WORK/manager-pre" todo="$ARCHIVE_VERIFY_WORK/todo"
@@ -2332,6 +2588,8 @@ function verify_archive_batch () {
   while IFS=$'\t' read -r rel src ksize ksum _
   do
     [ "${ksum:-}" != "-" ] || ksum=""
+    # A basic-check fingerprint (from before a switch to full) isn't a SHA-256.
+    [[ "${ksum:-}" != basic:* ]] || ksum=""
     [ "${ksize:-}" != "-" ] || ksize=""
     local cached=""
     if [ -n "$src" ] && size=$(stat -L -c %s -- "$src" 2>/dev/null) &&
@@ -2518,6 +2776,14 @@ function verify_archive_batch () {
       mv "$ARCHIVE_VERIFY_WORK/results.new" "$ARCHIVE_VERIFY_WORK/results"
   fi
 
+  archive_verify_finish_batch "SHA-256"
+}
+
+# Shared end of a batch: rename mismatched server copies aside, send them and
+# missing ones again next cycle, and record $ARCHIVE_VERIFY_WORK/results.
+# $1 names the check in log lines ("SHA-256", "size and frames").
+function archive_verify_finish_batch () {
+  local how=${1:-SHA-256} rel status
   # Send mismatched and missing clips again next cycle.
   local resend="$ARCHIVE_VERIFY_WORK/resend"
   : > "$resend"
@@ -2527,9 +2793,9 @@ function verify_archive_batch () {
       mismatch)
         if archive_set_aside_remote "$rel"
         then
-          log "ERROR: archive verification: $rel on the archive server doesn't match the Pi's copy (SHA-256); renamed it aside and will send it again"
+          log "ERROR: archive verification: $rel on the archive server doesn't match the Pi's copy ($how); renamed it aside and will send it again"
         else
-          log "ERROR: archive verification: $rel on the archive server doesn't match the Pi's copy (SHA-256), and it couldn't be renamed aside; will send it again"
+          log "ERROR: archive verification: $rel on the archive server doesn't match the Pi's copy ($how), and it couldn't be renamed aside; will send it again"
         fi
         echo "$rel" >> "$resend" ;;
       missing)
@@ -2583,7 +2849,7 @@ function queue_archive_rechecks () {
     END {
       for (r in last) {
         split(last[r], f, "\t")
-        if ((f[5] == "ok" || f[5] == "ok_quick" || f[5] == "converted") && f[6] + 0 == 1 && f[4] + 0 <= cutoff)
+        if ((f[5] == "ok" || f[5] == "ok_quick" || f[5] == "converted" || f[5] == "ok_basic" || f[5] == "converted_basic") && f[6] + 0 == 1 && f[4] + 0 <= cutoff)
           print f[1] "\t" f[7] "\t" f[2] "\t" f[3] "\t" now
       }
     }' "$ARCHIVE_VERIFY_LEDGER" >> "$ARCHIVE_VERIFY_QUEUE"
@@ -2611,7 +2877,7 @@ function snapshot_verified_twice () {
       return p
     }
     FILENAME == ledger {
-      if ((($5 == "ok" || $5 == "ok_quick" || $5 == "converted") && $6 + 0 >= 2) || ($5 == "converted_unconfirmed" && trust == "true")) {
+      if ((($5 == "ok" || $5 == "ok_quick" || $5 == "converted" || $5 == "ok_basic" || $5 == "converted_basic") && $6 + 0 >= 2) || ($5 == "converted_unconfirmed" && trust == "true")) {
         k = key($1); if (!(k in vs) || $2 + 0 > vs[k]) vs[k] = $2 + 0
       }
       next
@@ -2686,7 +2952,7 @@ function auto_delete_verified_snapshots () {
       verdict=$(snapshot_verified_twice "$dir/snap.bin.toc")
       case "$verdict" in
         yes\ *)
-          log "Auto-delete: releasing ${dir##*/}; all ${verdict#yes } clip(s) in it are verified twice on the archive server (SHA-256)"
+          log "Auto-delete: releasing ${dir##*/}; all ${verdict#yes } clip(s) in it are verified twice on the archive server"
           if /root/bin/release_snapshot.sh "$dir"
           then
             released=$((released + 1))
@@ -2802,11 +3068,13 @@ function archive_verify_methods () {
   [ -z "${2:-}" ] || [ ! -s "$2" ] || waiting=$(wc -l < "$2")
   awk -F'\t' -v w="$waiting" '
     $5 == "converted" { m++ } $5 == "ok_quick" { q++ } $5 == "ok" { r++ }
+    $5 == "ok_basic" || $5 == "converted_basic" { k++ }
     $5 == "mismatch" || $5 == "missing" { b++ } $5 == "converted_unconfirmed" { u++ }
     END {
       s = ""
       if (m) s = s sprintf("%s%d via Sentry Manager'"'"'s record", (s ? " · " : ""), m)
       if (q) s = s sprintf("%s%d by quick check", (s ? " · " : ""), q)
+      if (k) s = s sprintf("%s%d by size and frames", (s ? " · " : ""), k)
       if (r) s = s sprintf("%s%d read back", (s ? " · " : ""), r)
       if (u) s = s sprintf("%s%d unconfirmed", (s ? " · " : ""), u)
       if (b) s = s sprintf("%s%d to re-send", (s ? " · " : ""), b)
@@ -2845,7 +3113,7 @@ function verify_archived_clips () {
   : > "$ARCHIVE_VERIFY_WORK/results-all"
   : > "$ARCHIVE_VERIFY_WORK/deferred"
   ARCHIVE_MANAGER_RECORD=0
-  if archive_manager_record_present
+  if ! archive_verify_basic_mode && archive_manager_record_present
   then
     ARCHIVE_MANAGER_RECORD=1
   fi
@@ -2864,7 +3132,9 @@ function verify_archived_clips () {
     sort -n | cut -f2- > "$ARCHIVE_VERIFY_WORK/queue"
   local total
   total=$(wc -l < "$ARCHIVE_VERIFY_WORK/queue")
-  log "Verifying $total archived file(s) against the archive server (SHA-256)"
+  local method="SHA-256"
+  ! archive_verify_basic_mode || method="size and frames"
+  log "Verifying $total archived file(s) against the archive server ($method)"
   archive_verify_progress true 0 "$total" ""
   archive_work_progress verifying "Verifying archived clips" 0 "$total"
 
@@ -2904,20 +3174,21 @@ function verify_archived_clips () {
   fi
   prune_archive_verify_ledger || log "WARNING: could not prune the archive verification ledger"
 
-  local ok quickok bad nosource converted left=0 waiting
+  local ok quickok basicok bad nosource converted left=0 waiting
   waiting=$(wc -l < "$ARCHIVE_VERIFY_WORK/deferred")
   ok=$(awk -F'\t' '$5 == "ok"' "$ARCHIVE_VERIFY_WORK/results-all" | wc -l)
   quickok=$(awk -F'\t' '$5 == "ok_quick"' "$ARCHIVE_VERIFY_WORK/results-all" | wc -l)
+  basicok=$(awk -F'\t' '$5 == "ok_basic" || $5 == "converted_basic"' "$ARCHIVE_VERIFY_WORK/results-all" | wc -l)
   converted=$(awk -F'\t' '$5 == "converted" || $5 == "converted_unconfirmed"' "$ARCHIVE_VERIFY_WORK/results-all" | wc -l)
   bad=$(awk -F'\t' '$5 == "mismatch" || $5 == "missing"' "$ARCHIVE_VERIFY_WORK/results-all" | wc -l)
   nosource=$(awk -F'\t' '$5 == "nosource"' "$ARCHIVE_VERIFY_WORK/results-all" | wc -l)
   [ ! -s "$ARCHIVE_VERIFY_QUEUE" ] || left=$(wc -l < "$ARCHIVE_VERIFY_QUEUE")
-  log "Archive verification: $ok matched, $quickok matched by quick check, $converted re-encoded on the server by Sentry Manager, $bad to re-send, $nosource with no Pi copy left to compare, $left still queued ($waiting waiting for Sentry Manager's checksum)${stopped:+ ($stopped)}"
+  log "Archive verification: $ok matched, $quickok matched by quick check, $basicok matched by size and frames, $converted re-encoded on the server by Sentry Manager, $bad to re-send, $nosource with no Pi copy left to compare, $left still queued ($waiting waiting for Sentry Manager's checksum)${stopped:+ ($stopped)}"
   ARCHIVE_VERIFY_WAITING=$waiting
   archive_verify_progress false "$(archive_verify_gone_through)" "$total" "$stopped"
   archive_work_done verifying
   ARCHIVE_VERIFY_RAN=1
-  ARCHIVE_VERIFY_MATCHED=$((ok + quickok))
+  ARCHIVE_VERIFY_MATCHED=$((ok + quickok + basicok))
   ARCHIVE_VERIFY_CONVERTED=$converted
   ARCHIVE_VERIFY_RESEND=$bad
   ARCHIVE_VERIFY_NOSOURCE=$nosource

@@ -121,6 +121,27 @@ Pi looks there first:
 | re-encoded | none, and it never matched before conversion | `converted_unconfirmed`: kept and never re-sent, but that Pi snapshot is never auto-deleted |
 | differs, not a re-encode | (not read) | `mismatch`: renamed aside, re-uploaded |
 
+### Basic mode (`ARCHIVE_VERIFY_MODE=basic`, SMB/NFS only)
+
+The user can choose a basic check instead of SHA-256 in Settings. Then the
+Pi neither reads Manager's record nor waits for it. For each clip it reads
+only the MP4 index of both copies (box headers and the `moov` box) and
+compares the size, the video codec, the number of frames, the duration and
+every frame's size (`stsz`).
+
+| Share copy | Result on the Pi |
+|---|---|
+| same size, codec and frames | `ok_basic`: verified |
+| Manager's `hvc1`/`hev1`/`av01` re-encode of the Pi's H.264, same frame count, duration within 100 ms | `converted_basic`: verified |
+| Manager's re-encode with a different frame count or duration | `converted_unconfirmed`: kept and never re-sent, but that snapshot is never auto-deleted |
+| anything else (cut off, different frames, not on the share) | `mismatch` or `missing`: renamed aside / re-sent as usual |
+
+What this asks of Manager: keep each video frame of the original in a
+re-encode (same frame count and frame rate, no dropped or duplicated
+frames), and keep `moov` within the file's top-level boxes, which
+Manager already does. Writing the checksum record does no harm; basic mode
+just doesn't use it.
+
 ## 4. Status file: `.sentryusb/archive-status.json`
 
 The Pi replaces this file atomically twice per archive cycle: when a
