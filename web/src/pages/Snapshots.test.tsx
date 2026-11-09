@@ -323,3 +323,39 @@ test("archive tags show verification state and the delete dialog warns about unv
     win.close()
   }
 })
+
+test("the list refreshes itself when the page becomes visible, but not with the delete dialog open", async () => {
+  const win = new Window({ url: "http://localhost/snapshots" })
+  const values = { window: win, document: win.document, navigator: win.navigator, IS_REACT_ACT_ENVIRONMENT: true }
+  const originals = Object.keys(values).map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)] as const)
+  for (const [key, value] of Object.entries(values)) Object.defineProperty(globalThis, key, { configurable: true, value })
+  const oldFetch = globalThis.fetch
+  let lists = 0
+  globalThis.fetch = async input => {
+    if (String(input).includes("free-space")) return Response.json({ mounted: false })
+    lists++
+    const snaps = [{ id: "snap-1", created_unix: 100, older_count: 0, cumulative_reclaim_bytes: 1024 }]
+    if (lists > 1) snaps.push({ id: "snap-2", created_unix: 200, older_count: 1, cumulative_reclaim_bytes: 2048 })
+    return Response.json({ snapshots: snaps })
+  }
+  const { createRoot } = await import("react-dom/client")
+  const container = win.document.createElement("div"); win.document.body.append(container)
+  const root = createRoot(container)
+  try {
+    await act(async () => root.render(createElement(Snapshots)))
+    assert.equal(lists, 1)
+    assert.equal(container.querySelector('[data-snapshot-id="snap-2"]'), null)
+    // Coming back to the tab reloads the list; the new snapshot shows up.
+    await act(async () => { win.document.dispatchEvent(new win.Event("visibilitychange")) })
+    assert.equal(lists, 2)
+    assert.ok(container.querySelector('[data-snapshot-id="snap-2"]'), "new snapshot not shown after refresh")
+    // With the delete dialog open, the list is left alone.
+    await act(async () => container.querySelector<HTMLElement>('[aria-label="Delete only snap-1"]')!.click())
+    await act(async () => { win.document.dispatchEvent(new win.Event("visibilitychange")) })
+    assert.equal(lists, 2, "refreshed under the open delete dialog")
+  } finally {
+    await act(async () => root.unmount()); globalThis.fetch = oldFetch
+    for (const [key, descriptor] of originals) { if (descriptor) Object.defineProperty(globalThis, key, descriptor); else Reflect.deleteProperty(globalThis, key) }
+    win.close()
+  }
+})

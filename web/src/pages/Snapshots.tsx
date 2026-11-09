@@ -58,6 +58,9 @@ function formatDate(unix: number) {
 const tagClass = "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium"
 
 /** "Verified on archive" and related tags for one snapshot row. */
+/** How often the Snapshots page reloads itself while visible. */
+export const AUTO_REFRESH_MS = 60_000
+
 /** Word typed to confirm deleting snapshots that aren't fully verified. */
 export const UNVERIFIED_DELETE_WORD = "DELETE"
 
@@ -180,6 +183,26 @@ export default function Snapshots() {
     }, 4000)
     return () => clearInterval(timer)
   }, [pending, deleting, refresh])
+  // Keep the list current: new snapshots (every 58 minutes, at boot, before
+  // each archive) and verification progress appear without a manual Refresh.
+  // Every minute while the page is visible, and at once when it becomes
+  // visible again. Never during a deletion or while its dialog is open; a
+  // request already in flight is left alone (refresh() skips while one runs).
+  const deletionOpen = deletion !== null
+  useEffect(() => {
+    if (deleting || deletionOpen) return
+    const timer = setInterval(() => {
+      if (!document.hidden) void refresh()
+    }, AUTO_REFRESH_MS)
+    const onVisible = () => {
+      if (!document.hidden) void refresh()
+    }
+    document.addEventListener("visibilitychange", onVisible)
+    return () => {
+      clearInterval(timer)
+      document.removeEventListener("visibilitychange", onVisible)
+    }
+  }, [deleting, deletionOpen, refresh])
   const oldest = useMemo(
     () =>
       // Equal timestamps retain API order: its cumulative estimates use that prefix.
