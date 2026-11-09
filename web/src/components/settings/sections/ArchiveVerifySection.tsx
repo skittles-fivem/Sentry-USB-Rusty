@@ -12,6 +12,9 @@ const MODE_OPTIONS: { value: VerifyMode; label: string }[] = [
   { value: "basic", label: "Basic (size and frames)" },
 ]
 
+const PARALLEL_OPTIONS = ["4", "8", "16", "32"] as const
+type ParallelOption = (typeof PARALLEL_OPTIONS)[number]
+
 interface ArchiveVerifySettings {
   verify: boolean
   auto_delete: boolean
@@ -19,6 +22,8 @@ interface ArchiveVerifySettings {
   full_readback?: boolean
   /** "basic": size and frames; "full": SHA-256. */
   mode?: VerifyMode
+  /** Clips checked at once, 1-32. */
+  parallel?: number
   archive_system: string
   recent_clips_archived: boolean
 }
@@ -43,7 +48,7 @@ export function ArchiveVerifySection() {
     return () => { active = false }
   }, [])
 
-  async function save(change: Partial<Pick<ArchiveVerifySettings, "verify" | "auto_delete" | "trust_unconfirmed" | "full_readback" | "mode">>) {
+  async function save(change: Partial<Pick<ArchiveVerifySettings, "verify" | "auto_delete" | "trust_unconfirmed" | "full_readback" | "mode" | "parallel">>) {
     setSaving(true)
     setError(null)
     try {
@@ -159,6 +164,30 @@ export function ArchiveVerifySection() {
               ? "Fast: compares size and frames. Well under a second per clip."
               : "Thorough: SHA-256, using Sentry Manager's record when it's there."}
           </p>
+        </div>
+      )}
+      {mountedShare && (
+        <div className="space-y-1.5">
+          <div className="flex items-center gap-1.5">
+            <p className="text-sm text-slate-200">Clips checked at once</p>
+            <InfoButton title="Clips checked at once">
+              <p>
+                Checking a clip is mostly waiting for the archive server to answer, so the Pi checks several clips at
+                the same time. More at once finishes sooner and uses more of the network and the server.
+              </p>
+              <p>
+                Lower it if the Pi or the archive server is sluggish while verification runs. Reading whole clips back
+                (Full mode with read-back on) uses at most 4 at once, one per CPU core, whatever this says.
+              </p>
+              <p>Saved as ARCHIVE_VERIFY_PARALLEL in sentryusb.conf (1 to 32, default 32).</p>
+            </InfoButton>
+          </div>
+          <SegPicker<ParallelOption>
+            options={PARALLEL_OPTIONS.map((v) => ({ value: v, label: v }))}
+            value={String(settings?.parallel ?? 32) as ParallelOption}
+            onChange={(next) => { if (Number(next) !== settings?.parallel) void save({ parallel: Number(next) }) }}
+            disabled={!settings || saving || !settings.verify}
+          />
         </div>
       )}
       {mountedShare && mode === "full" && (

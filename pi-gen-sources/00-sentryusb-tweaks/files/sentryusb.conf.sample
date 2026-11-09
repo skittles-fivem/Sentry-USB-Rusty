@@ -104,6 +104,25 @@ export SHARE_PASSWORD='password'
 #export ARCHIVE_VERIFY_MAX_SECONDS=1800
 #export ARCHIVE_VERIFY_RECHECK_SECONDS=3600
 
+# How verification checks clips on an SMB/NFS share. Unset (the default) is
+# "Full": SHA-256, using Sentry Manager's checksum record when it's on the
+# share and a quick spot check otherwise. "basic" compares each clip's size
+# and frames (codec, frame count, duration, every frame's size) and reads
+# only the MP4 index: well under a second per clip. "full" reads every clip
+# back whole. Also in Settings > Archive verification.
+#export ARCHIVE_VERIFY_MODE=basic
+
+# How many clips verification checks at the same time (1 to 32, default 32).
+# The checks mostly wait on the archive server, so more at once is faster.
+# Lower it (e.g. 8) if the Pi or the archive server is sluggish while
+# verification runs. Reading whole clips back uses at most 4 at once (one
+# per CPU core) whatever this says. Also in Settings > Archive verification.
+#export ARCHIVE_VERIFY_PARALLEL=32
+
+# In Full mode, how long a clip waits for Sentry Manager's checksum line
+# before it's checked another way (hours; 0 = don't wait).
+#export ARCHIVE_VERIFY_MANAGER_WAIT_HOURS=24
+
 # Enable post-archive drive auto-processing. When set to true, after each
 # archive_clips run completes, /root/bin/post-archive-process.sh fires
 # `POST /api/drives/process?post_archive=1` so newly archived clips get

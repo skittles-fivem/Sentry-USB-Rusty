@@ -47,6 +47,9 @@ pub const QUEUE: &str = "/mutable/archive_verify_pending";
 /// this list with no ledger line was sent before verification existed (or
 /// while it was off) and is queued for its first check at the next cycle.
 pub const ARCHIVED: &str = "/mutable/sentry_files_archived";
+/// archiveloop's default and maximum for ARCHIVE_VERIFY_PARALLEL.
+const DEFAULT_PARALLEL: u32 = 32;
+const MAX_PARALLEL: u32 = 32;
 /// The archive skips `.mp4` files below this size as short recordings.
 const SHORT_RECORDING_BYTES: u64 = 100_000;
 
@@ -65,6 +68,9 @@ pub struct ArchiveSettings {
     pub full_readback: bool,
     /// ARCHIVE_VERIFY_MODE=basic: compare size and frames only (SMB/NFS).
     pub basic: bool,
+    /// ARCHIVE_VERIFY_PARALLEL: clips checked at once (1-32, default 32),
+    /// clamped like archiveloop's archive_verify_parallel.
+    pub parallel: u32,
     pub saved: bool,
     pub sentry: bool,
     pub recent: bool,
@@ -97,6 +103,10 @@ impl ArchiveSettings {
             basic: active
                 .get("ARCHIVE_VERIFY_MODE")
                 .is_some_and(|v| v.trim().eq_ignore_ascii_case("basic")),
+            parallel: active
+                .get("ARCHIVE_VERIFY_PARALLEL")
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map_or(DEFAULT_PARALLEL, |n| n.clamp(1, MAX_PARALLEL as u64) as u32),
             saved: flag(active, "ARCHIVE_SAVEDCLIPS", true),
             sentry: flag(active, "ARCHIVE_SENTRYCLIPS", true),
             recent: flag(active, "ARCHIVE_RECENTCLIPS", false),
@@ -395,6 +405,8 @@ struct SettingsBody {
     full_readback: bool,
     /// "basic" (size and frames) or "full" (SHA-256).
     mode: &'static str,
+    /// Clips checked at once (1-32).
+    parallel: u32,
     archive_system: String,
     /// False when RecentClips aren't archived: snapshots holding them can
     /// never be fully verified, so auto-delete keeps them.
@@ -408,6 +420,7 @@ fn settings_body(s: &ArchiveSettings) -> SettingsBody {
         trust_unconfirmed: s.trust_unconfirmed,
         full_readback: s.full_readback,
         mode: if s.basic { "basic" } else { "full" },
+        parallel: s.parallel,
         archive_system: s.archive_system.clone(),
         recent_clips_archived: s.recent,
     }
@@ -434,10 +447,13 @@ pub struct SettingsUpdate {
     /// "basic" or "full".
     #[serde(default)]
     mode: Option<String>,
+    /// Clips checked at once, 1-32.
+    #[serde(default)]
+    parallel: Option<u32>,
 }
 
 /// POST /api/archive-verify/settings —
-/// `{"verify"?: bool, "auto_delete"?: bool, "trust_unconfirmed"?: bool, "full_readback"?: bool, "mode"?: "basic" | "full"}`.
+/// `{"verify"?: bool, "auto_delete"?: bool, "trust_unconfirmed"?: bool, "full_readback"?: bool, "mode"?: "basic" | "full", "parallel"?: 1-32}`.
 ///
 /// Writes `ARCHIVE_VERIFY` / `ARCHIVE_AUTO_DELETE_VERIFIED` to sentryusb.conf.
 /// archiveloop reads both fresh each cycle, so no restart is needed.
@@ -479,6 +495,10 @@ pub async fn set_settings(
                 active.remove("ARCHIVE_VERIFY_MODE");
             }
         }
+        if let Some(n) = body.parallel {
+            anyhow::ensure!((1..=MAX_PARALLEL).contains(&n), "Clips checked at once must be 1 to {MAX_PARALLEL}");
+            active.insert("ARCHIVE_VERIFY_PARALLEL".into(), n.to_string());
+        }
         if let Some(v) = body.trust_unconfirmed {
             active.insert("ARCHIVE_TRUST_UNCONFIRMED_CONVERSIONS".into(), v.to_string());
         }
@@ -511,6 +531,7 @@ mod tests {
             trust_unconfirmed: false,
             full_readback: false,
             basic: false,
+            parallel: 32,
             saved: true,
             sentry: true,
             recent,
@@ -656,6 +677,16 @@ mod tests {
         let c = coverage(toc, &l, &HashSet::new(), &HashSet::new(), &settings(true, true));
         assert_eq!((c.state, c.verified, c.basic, c.verified_twice), ("verified", 2, 2, 1));
         assert!(!c.ready_to_delete);
+    }
+
+    #[test]
+    fn parallel_is_read_and_clamped_like_archiveloop() {
+        let mut cfg = sentryusb_config::SetupConfig::new();
+        assert_eq!(ArchiveSettings::from_config(&cfg).parallel, 32);
+        for (v, want) in [("8", 8), ("0", 1), ("500", 32), ("x", 32), (" 16 ", 16)] {
+            cfg.insert("ARCHIVE_VERIFY_PARALLEL".into(), v.into());
+            assert_eq!(ArchiveSettings::from_config(&cfg).parallel, want, "value {v:?}");
+        }
     }
 
     #[test]
