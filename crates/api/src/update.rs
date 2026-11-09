@@ -1138,10 +1138,16 @@ async fn fetch_releases() -> Result<Vec<ReleaseInfo>, String> {
         .collect())
 }
 
-/// Selects the first non-draft stable and prerelease from GitHub's
-/// newest-first list. Releases whose tag isn't semver (a fork's old `1.22`)
-/// are skipped: they can't be ordered against installed versions.
+/// Selects the highest non-draft stable release and the highest prerelease
+/// by version. GitHub's list isn't in version order (a fork's releases came
+/// back as test.8, test.7, test.6, test.10, test.5), so taking the first of
+/// each kind left a device on test.8 "up to date" while test.10 existed.
+/// Releases whose tag isn't semver (a fork's old `1.22`) are skipped: they
+/// can't be ordered against installed versions.
 fn find_latest_releases(releases: &[ReleaseInfo]) -> (Option<&ReleaseInfo>, Option<&ReleaseInfo>) {
+    let higher = |best: Option<&ReleaseInfo>, r: &'_ ReleaseInfo| -> bool {
+        best.is_none_or(|b| compare_versions(&r.tag_name, &b.tag_name) == Some(std::cmp::Ordering::Greater))
+    };
     let mut stable: Option<&ReleaseInfo> = None;
     let mut prerelease: Option<&ReleaseInfo> = None;
     for r in releases {
@@ -1149,14 +1155,11 @@ fn find_latest_releases(releases: &[ReleaseInfo]) -> (Option<&ReleaseInfo>, Opti
             continue;
         }
         if r.prerelease {
-            if prerelease.is_none() {
+            if higher(prerelease, r) {
                 prerelease = Some(r);
             }
-        } else if stable.is_none() {
+        } else if higher(stable, r) {
             stable = Some(r);
-        }
-        if stable.is_some() && prerelease.is_some() {
-            break;
         }
     }
     (stable, prerelease)
@@ -1257,6 +1260,24 @@ mod prerelease_install_tests {
         let mut list = releases();
         list.push(ReleaseInfo { draft: true, ..release("v3.29.0", true) });
         assert!(!is_prerelease_install("v3.29.0", &list));
+    }
+
+    #[test]
+    fn the_highest_version_wins_whatever_order_github_lists() {
+        // The order GitHub really returned for the owner's fork.
+        let list = vec![
+            release("v3.28.10-test.8", true), release("v3.28.10-test.7", true), release("v3.28.10-test.6", true),
+            release("v3.28.10-test.10", true), release("v3.28.10-test.5", true),
+            release("v3.28.8", false), release("v3.28.9", false),
+        ];
+        let (stable, pre) = find_latest_releases(&list);
+        assert_eq!(pre.map(|r| r.tag_name.as_str()), Some("v3.28.10-test.10"));
+        assert_eq!(stable.map(|r| r.tag_name.as_str()), Some("v3.28.9"));
+        assert!(is_version_newer("v3.28.10-test.10", "v3.28.10-test.8"));
+        // Drafts still never count, even when they'd be highest.
+        let mut with_draft = list.clone();
+        with_draft.push(ReleaseInfo { draft: true, ..release("v3.28.10-test.99", true) });
+        assert_eq!(find_latest_releases(&with_draft).1.map(|r| r.tag_name.as_str()), Some("v3.28.10-test.10"));
     }
 
     #[test]
