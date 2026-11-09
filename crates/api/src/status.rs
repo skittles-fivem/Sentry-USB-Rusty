@@ -13,6 +13,7 @@ use crate::router::AppState;
 
 mod supply_voltage;
 mod cpu_usage;
+mod disk_io;
 
 // Shared status snapshots keep UI polling independent of archive I/O.
 
@@ -305,6 +306,10 @@ struct PiStatus {
     /// in percent (I/O wait counts as idle). Omitted when unreadable.
     #[serde(skip_serializing_if = "Option::is_none")]
     cpu_percent: Option<f64>,
+    /// Throughput of the device holding /backingfiles since the previous
+    /// status request. Omitted when it isn't mounted or can't be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disk_io: Option<disk_io::DiskIo>,
     num_snapshots: String,
     snapshot_oldest: String,
     snapshot_newest: String,
@@ -407,7 +412,8 @@ pub async fn get_status(
     // keep an old voltage reading alive, and status requests never wait for PMIC I/O.
     s.supply_voltage = supply_voltage::get();
     // Measured per request, not cached with the filesystem snapshot above.
-    s.cpu_percent = cpu_usage::get().await;
+    // Concurrent, so a first request's two 250 ms sampling windows overlap.
+    (s.cpu_percent, s.disk_io) = tokio::join!(cpu_usage::get(), disk_io::get());
 
     (StatusCode::OK, Json(serde_json::to_value(s).unwrap_or_default()))
 }
@@ -417,6 +423,7 @@ fn status_fs_snapshot() -> PiStatus {
     let mut s = PiStatus {
         cpu_temp: String::new(),
         cpu_percent: None,
+        disk_io: None,
         num_snapshots: "0".into(),
         snapshot_oldest: String::new(),
         snapshot_newest: String::new(),

@@ -16,7 +16,7 @@ test('dashboard keeps its last data on failure, reads server ETA, and never load
   const requested: string[] = []
   let rejectStatus = false
   const fixtures: Record<string, unknown> = {
-    '/api/status': { cpu_temp: '55000', cpu_percent: 37.4, num_snapshots: '86', snapshot_oldest: '', snapshot_newest: '', total_space: '1000000', free_space: '45000', uptime: '60', drives_active: 'yes', udc_state: 'configured', wifi_ssid: 'Test network', wifi_strength: '60/70', wifi_ip: '192.0.2.1', ether_ip: '', ether_speed: '', fan_speed: '2000', supply_voltage: 5.09602, wifi_rx_bps: 0, wifi_tx_bps: 0, wifi_rate_state: 'live', storage_health: { state: 'healthy', message: 'Storage managed automatically' } },
+    '/api/status': { cpu_temp: '55000', cpu_percent: 37.4, disk_io: { device: 'mmcblk0p3', read_bps: 12_300_000, write_bps: 4_500_000, busy_percent: 93.6, read_total_bytes: 5 * 1024 ** 3, write_total_bytes: 40 * 1024 ** 3 }, num_snapshots: '86', snapshot_oldest: '', snapshot_newest: '', total_space: '1000000', free_space: '45000', uptime: '60', drives_active: 'yes', udc_state: 'configured', wifi_ssid: 'Test network', wifi_strength: '60/70', wifi_ip: '192.0.2.1', ether_ip: '', ether_speed: '', fan_speed: '2000', supply_voltage: 5.09602, wifi_rx_bps: 0, wifi_tx_bps: 0, wifi_rate_state: 'live', storage_health: { state: 'healthy', message: 'Storage managed automatically' } },
     '/api/drives/stats': { processed_count: 100000, drives_count: 985, total_distance_km: 20000, total_distance_mi: 12000, fsd_percent: 65, latest_drive_end: null },
     '/api/drives/status': { running: false, phase: 'archiving', current: 300, total: 3200, eta_seconds: 6200, eta_state: 'ready', sampled_at: Date.now() / 1000, archive_cycle: { id: 'fixture-cycle', cancelling: false } },
     '/api/telemetry/tire-history?days=30': { points: [] },
@@ -41,6 +41,14 @@ test('dashboard keeps its last data on failure, reads server ETA, and never load
     assert.match(container.textContent, /985/)
     assert.match(container.textContent, /5V supply5\.10 V/)
     assert.match(container.textContent, /CPU usage37%/)
+    const storage = container.querySelector('[aria-label="Storage activity"]')!
+    assert.ok(storage, 'Storage activity row renders when disk_io is present')
+    assert.match(storage.textContent, /Storage94% busy/)
+    assert.match(storage.textContent, /↓ 12\.3 MB\/s read/)
+    assert.match(storage.textContent, /↑ 4\.5 MB\/s write/)
+    assert.match(storage.textContent, /mmcblk0p3/)
+    assert.equal(storage.getAttribute('title'), 'mmcblk0p3 · Since boot: 5 GB read, 40 GB written')
+    assert.equal((storage.querySelector('.val') as HTMLElement).style.color, '#f87171', 'High busy share is red')
     assert.ok(container.querySelector('[role="progressbar"]'))
     assert.equal(requested.includes('/api/drives'), false)
     fixtures['/api/status'] = { ...fixtures['/api/status'] as object, supply_voltage: null, wifi_tx_bps: 10000000, ether_tx_bps: 3000000, ether_rate_state: 'live', wifi_adapters: [
@@ -128,6 +136,7 @@ test('optional keep-awake menu is keyboard operable and automatic Away Mode has 
     await act(async () => root.render(createElement(StrictMode, {}, createElement(MemoryRouter, {}, createElement(AwayModeProvider, { children: createElement(KeepAwakeProvider, { children: createElement(Dashboard) }) })))))
     assert.match(container.textContent, /Automatic/)
     assert.doesNotMatch(container.textContent, /5V supply/, 'Older APIs and unsupported boards do not show a voltage row')
+    assert.equal(container.querySelector('[aria-label="Storage activity"]'), null, 'No storage row without disk_io')
     assert.match(container.textContent, /Active while away/)
     assert.doesNotMatch(container.textContent, /0h\s*0m\s*remaining/)
     assert.equal(container.querySelector('[aria-label="Away mode duration"]'), null)
