@@ -19,7 +19,7 @@ for fn in sortfile prunefile archive_conf_value archive_verify_enabled archive_a
   archive_remote_sha256 archive_set_aside_remote verify_archive_batch prune_archive_verify_ledger \
   archive_quick_fingerprint archive_remote_quick_fingerprint archive_quick_result archive_verify_quick_mode \
   archive_cached_local_sum precompute_local_hashes archive_local_quick_fingerprint archive_verify_progress \
-  archive_work_progress archive_work_done archive_verify_methods \
+  archive_work_progress archive_work_done archive_verify_methods archive_verify_gone_through \
   archive_stream_is_reencoded archive_local_is_reencoded archive_remote_is_reencoded archive_manager_original_sums archive_manager_record_present \
   queue_unverified_archived queue_archive_rechecks snapshot_verified_twice auto_delete_verified_snapshots verify_archived_clips \
   json_string json_int json_bool build_share_status_json plan_share_transfer record_archive_throughput \
@@ -468,6 +468,22 @@ archive_work_done verifying
 printf 'a\t1\th\t1\tconverted\t1\tx\nb\t1\th\t1\tok_quick\t1\tx\nc\t1\th\t1\tok_quick\t1\tx\nd\t1\th\t1\tmismatch\t0\tx\n' > "$workdir/methods"
 [ "$(archive_verify_methods "$workdir/methods")" = "1 via Sentry Manager's record · 2 by quick check · 1 to re-send" ] ||
   fail "methods summary wrong: $(archive_verify_methods "$workdir/methods")"
+# Clips waiting for Manager's line are named in the summary and count as gone through.
+printf 'e\tsrc\t1\th\t1\nf\tsrc\t1\th\t1\n' > "$workdir/waiting"
+[ "$(archive_verify_methods "$workdir/methods" "$workdir/waiting")" = "1 via Sentry Manager's record · 2 by quick check · 1 to re-send · 2 waiting for Sentry Manager's checksum" ] ||
+  fail "summary with waiting clips wrong: $(archive_verify_methods "$workdir/methods" "$workdir/waiting")"
+[ "$(archive_verify_methods /dev/null "$workdir/waiting")" = "2 waiting for Sentry Manager's checksum" ] ||
+  fail "summary with only waiting clips wrong"
+[ "$(archive_verify_methods "$workdir/methods" "$workdir/no-such-file")" = "1 via Sentry Manager's record · 2 by quick check · 1 to re-send" ] ||
+  fail "a missing waiting list should add nothing"
+saved_work=$ARCHIVE_VERIFY_WORK
+ARCHIVE_VERIFY_WORK="$workdir/gone-through"
+mkdir -p "$ARCHIVE_VERIFY_WORK"
+[ "$(archive_verify_gone_through)" = 0 ] || fail "empty pass should count 0"
+cp "$workdir/methods" "$ARCHIVE_VERIFY_WORK/results-all"
+cp "$workdir/waiting" "$ARCHIVE_VERIFY_WORK/deferred"
+[ "$(archive_verify_gone_through)" = 6 ] || fail "checked + waiting should be 6, got $(archive_verify_gone_through)"
+ARCHIVE_VERIFY_WORK=$saved_work
 
 # --- verification off: queue is dropped, nothing runs ----------------------
 echo 'export ARCHIVE_VERIFY=false' > "$workdir/sentryusb.conf"

@@ -2795,8 +2795,12 @@ function archive_work_done () {
 }
 
 # How this pass's clips were checked so far, for the progress detail.
+# Optional second argument: the list of clips set aside to wait for
+# Sentry Manager's checksum line; their count is added at the end.
 function archive_verify_methods () {
-  awk -F'\t' '
+  local waiting=0
+  [ -z "${2:-}" ] || [ ! -s "$2" ] || waiting=$(wc -l < "$2")
+  awk -F'\t' -v w="$waiting" '
     $5 == "converted" { m++ } $5 == "ok_quick" { q++ } $5 == "ok" { r++ }
     $5 == "mismatch" || $5 == "missing" { b++ } $5 == "converted_unconfirmed" { u++ }
     END {
@@ -2806,8 +2810,18 @@ function archive_verify_methods () {
       if (r) s = s sprintf("%s%d read back", (s ? " · " : ""), r)
       if (u) s = s sprintf("%s%d unconfirmed", (s ? " · " : ""), u)
       if (b) s = s sprintf("%s%d to re-send", (s ? " · " : ""), b)
+      if (w + 0) s = s sprintf("%s%d waiting for Sentry Manager'"'"'s checksum", (s ? " · " : ""), w)
       print s
     }' "$1" 2>/dev/null
+}
+
+# Clips this pass has gone through: checked (results-all) plus set aside to
+# wait for Sentry Manager's checksum line (deferred).
+function archive_verify_gone_through () {
+  local checked=0 waiting=0
+  [ ! -s "$ARCHIVE_VERIFY_WORK/results-all" ] || checked=$(wc -l < "$ARCHIVE_VERIFY_WORK/results-all")
+  [ ! -s "$ARCHIVE_VERIFY_WORK/deferred" ] || waiting=$(wc -l < "$ARCHIVE_VERIFY_WORK/deferred")
+  echo $(( checked + waiting ))
 }
 
 # Verify queued archived clips against the archive server, then (if turned
@@ -2872,9 +2886,12 @@ function verify_archived_clips () {
       break
     fi
     rm -f "$batch"
-    archive_verify_progress true "$(wc -l < "$ARCHIVE_VERIFY_WORK/results-all")" "$total" ""
-    archive_work_progress verifying "Verifying archived clips" "$(wc -l < "$ARCHIVE_VERIFY_WORK/results-all")" "$total" \
-      "$(archive_verify_methods "$ARCHIVE_VERIFY_WORK/results-all")"
+    # Clips set aside to wait for Manager's line have been gone through
+    # too, so they count toward "N of M"; otherwise a pass that is mostly
+    # waiting reads "1 of 6,742" right to the end.
+    archive_verify_progress true "$(archive_verify_gone_through)" "$total" ""
+    archive_work_progress verifying "Verifying archived clips" "$(archive_verify_gone_through)" "$total" \
+      "$(archive_verify_methods "$ARCHIVE_VERIFY_WORK/results-all" "$ARCHIVE_VERIFY_WORK/deferred")"
   done
 
   # Whatever wasn't checked, or is waiting for Manager's line, stays queued.
@@ -2897,7 +2914,7 @@ function verify_archived_clips () {
   [ ! -s "$ARCHIVE_VERIFY_QUEUE" ] || left=$(wc -l < "$ARCHIVE_VERIFY_QUEUE")
   log "Archive verification: $ok matched, $quickok matched by quick check, $converted re-encoded on the server by Sentry Manager, $bad to re-send, $nosource with no Pi copy left to compare, $left still queued ($waiting waiting for Sentry Manager's checksum)${stopped:+ ($stopped)}"
   ARCHIVE_VERIFY_WAITING=$waiting
-  archive_verify_progress false "$(wc -l < "$ARCHIVE_VERIFY_WORK/results-all")" "$total" "$stopped"
+  archive_verify_progress false "$(archive_verify_gone_through)" "$total" "$stopped"
   archive_work_done verifying
   ARCHIVE_VERIFY_RAN=1
   ARCHIVE_VERIFY_MATCHED=$((ok + quickok))
