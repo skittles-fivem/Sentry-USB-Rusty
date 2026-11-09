@@ -2529,6 +2529,16 @@ function archive_basic_result () {
   }'
 }
 
+# A basic fingerprint ($1) for a log line: "H.264 avc1, 2160 frames,
+# 60.000 s, 41234567 bytes", or the fingerprint itself when it isn't an MP4.
+function archive_basic_describe () {
+  awk -v f="$1" 'BEGIN {
+    n = split(f, a, ":")
+    if (n == 6 && a[1] == "mp4") printf "%s, %d frames, %.3f s, %d bytes\n", a[3], a[4], a[5] / 1000, a[2]
+    else print f
+  }'
+}
+
 # The basic check for one batch of queue lines ($1): fingerprint the Pi's
 # copies in one pass and the server's copies in another, compare, and record
 # results like verify_archive_batch. No SHA-256 of whole clips, no wait for
@@ -2581,6 +2591,11 @@ function verify_archive_batch_basic () {
     elif [ "$rfp" = error ]; then return 1
     else status=$(archive_basic_result "$lfp" "$rfp")
     fi
+    if [ "$status" = converted_unconfirmed ]
+    then
+      # Say what differed, so a re-encode that keeps failing can be explained.
+      log "Archive verification: $rel was re-encoded on the server but its frames don't match the Pi's copy (Pi: $(archive_basic_describe "$lfp"); server: $(archive_basic_describe "$rfp")); kept, not auto-deleted"
+    fi
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$rel" "${ksize:--}" "${lfp:+basic:$lfp}" "$now" "$status" "$src" >> "$w/results.raw"
   done < "$batch"
   # times verified: consecutive basic matches of the same Pi copy.
@@ -2602,6 +2617,9 @@ function verify_archive_batch_basic () {
 # this run, which carries the "times verified" count forward.
 # Returns non-zero if the server couldn't be asked (the batch stays queued).
 function verify_archive_batch () {
+  # A clip sent from a snapshot that's since been released is checked
+  # against its copy in a newer snapshot.
+  archive_resolve_batch_sources "$1" || true
   if archive_verify_basic_mode
   then
     verify_archive_batch_basic "$1"
@@ -3040,6 +3058,71 @@ function auto_delete_verified_snapshots () {
   ) 9< "$SNAPSHOT_LOCK_DIR"
 }
 
+# Where the Pi holds a clip now: the file the link farm's link for $1
+# (archive relpath) points to, if that file exists. Every snapshot is a full
+# copy of the car's drive, so a clip first sent from a snapshot that has
+# since been released is usually still in a newer one.
+function archive_current_source () {
+  local link="/mutable/TeslaCam/$1" target
+  target=$(readlink -- "$link" 2>/dev/null) || return 1
+  [ "${target:0:1}" = / ] || target="$(dirname -- "$link")/$target"
+  [ -f "$target" ] || return 1
+  printf '%s\n' "$target"
+}
+
+# Rewrite a batch of queue lines ($1) in place so each clip's Pi source is
+# a file that exists: a source in a released snapshot is replaced by the
+# clip's current copy (archive_current_source), when there is one.
+function archive_resolve_batch_sources () {
+  local batch=$1 line rel rest src tail alt
+  while IFS= read -r line || [ -n "$line" ]
+  do
+    rel=${line%%$'\t'*}
+    if [ "$rel" = "$line" ]; then printf '%s\n' "$line"; continue; fi
+    rest=${line#*$'\t'}
+    src=${rest%%$'\t'*}
+    if [ "$src" = "$rest" ]; then tail=""; else tail=$'\t'${rest#*$'\t'}; fi
+    if [ -n "$src" ] && [ ! -e "$src" ] && alt=$(archive_current_source "$rel")
+    then
+      src=$alt
+    fi
+    printf '%s\t%s%s\n' "$rel" "$src" "$tail"
+  done < "$batch" > "$batch.resolved" && mv "$batch.resolved" "$batch"
+}
+
+# Clips whose latest check found no Pi copy ("nosource"), because the
+# snapshot they were sent from was released, are checked again when the Pi
+# still holds them in another snapshot. Only when that copy is a different
+# file from the one recorded, so a clip really gone isn't queued forever.
+function requeue_nosource_with_copy () {
+  [ -s "$ARCHIVE_VERIFY_LEDGER" ] || return 0
+  local work=/tmp/archive-verify-nosource rel src alt n=0
+  rm -rf "$work"
+  mkdir -p "$work" || return 1
+  { cut -f1 "$ARCHIVE_VERIFY_QUEUE" 2>/dev/null || true; } > "$work/queued"
+  awk -F'\t' -v queued="$work/queued" '
+    FILENAME == queued { q[$0] = 1; next }
+    { last[$1] = $0 }
+    END {
+      for (r in last) {
+        split(last[r], f, "\t")
+        if (f[5] == "nosource" && !(r in q)) print f[1] "\t" f[7]
+      }
+    }' "$work/queued" "$ARCHIVE_VERIFY_LEDGER" > "$work/nosource"
+  local now
+  now=$(date +%s)
+  while IFS=$'\t' read -r rel src
+  do
+    [ -n "$rel" ] || continue
+    alt=$(archive_current_source "$rel") || continue
+    [ "$alt" != "$src" ] || continue
+    printf '%s\t%s\t-\t-\t%s\n' "$rel" "$alt" "$now" >> "$ARCHIVE_VERIFY_QUEUE"
+    n=$((n + 1))
+  done < "$work/nosource"
+  [ "$n" = 0 ] || log "Queueing $n file(s) checked earlier without a Pi copy: the Pi still has them in a newer snapshot"
+  rm -rf "$work"
+}
+
 # Clips archived before verification existed (or while it was turned off)
 # are on the archived-files list but have no ledger line, so nothing would
 # ever check them, their snapshots would never show as verified, and
@@ -3176,6 +3259,7 @@ function verify_archived_clips () {
     return 0
   fi
   queue_unverified_archived || log "WARNING: could not queue previously archived files for verification"
+  requeue_nosource_with_copy || log "WARNING: could not re-queue files checked without a Pi copy"
   queue_archive_rechecks || log "WARNING: could not queue archive re-checks"
   if [ ! -s "$ARCHIVE_VERIFY_QUEUE" ]
   then

@@ -20,7 +20,7 @@ for fn in sortfile prunefile archive_conf_value archive_verify_enabled archive_a
   archive_quick_fingerprint archive_remote_quick_fingerprint archive_quick_result archive_verify_quick_mode \
   archive_cached_local_sum precompute_local_hashes archive_local_quick_fingerprint archive_verify_progress \
   archive_work_progress archive_work_done archive_verify_methods archive_verify_gone_through \
-  archive_verify_parallel archive_remote_quick_fingerprints archive_lowprio_fn archive_verify_basic_mode archive_basic_fingerprints archive_basic_result verify_archive_batch_basic archive_verify_finish_batch \
+  archive_basic_describe archive_current_source archive_resolve_batch_sources requeue_nosource_with_copy archive_verify_parallel archive_remote_quick_fingerprints archive_lowprio_fn archive_verify_basic_mode archive_basic_fingerprints archive_basic_result verify_archive_batch_basic archive_verify_finish_batch \
   archive_stream_is_reencoded archive_local_is_reencoded archive_remote_is_reencoded archive_manager_original_sums archive_manager_record_present \
   queue_unverified_archived queue_archive_rechecks snapshot_verified_twice auto_delete_verified_snapshots verify_archived_clips \
   json_string json_int json_bool build_share_status_json plan_share_transfer record_archive_throughput \
@@ -520,6 +520,8 @@ grep -q "$b5" "$workdir/mutable/sentry_files_archived" || fail "unconfirmed re-e
 grep -q "basic:mp4:" "$ARCHIVE_VERIFY_LEDGER" || fail "basic fingerprint not stored in the ledger"
 [ ! -s "$ARCHIVE_LOCAL_SUMS" ] || fail "basic mode should not pre-hash or read clips whole"
 grep -q "matched by size and frames" <<< "$logs" || fail "summary should count basic matches: $logs"
+grep -q "frames don't match the Pi's copy (Pi: avc1, 100 frames, 3.000 s, [0-9]* bytes; server: hvc1, 90 frames, 2.700 s, [0-9]* bytes)" <<< "$logs" ||
+  fail "unconfirmed re-encode should log both sides' frames: $logs"
 grep -q "match the Pi's copy (size and frames)" <<< "$logs" || fail "mismatch log should name the basic check: $logs"
 grep -q "against the archive server (size and frames)" <<< "$logs" || fail "start log should name the basic check: $logs"
 # Second check an hour later counts twice; with the Pi copy gone, the stored
@@ -531,6 +533,32 @@ queue_archive_rechecks
 grep -q "$b1" "$ARCHIVE_VERIFY_QUEUE" || fail "basic match not queued for its second check"
 verify_archived_clips
 [ "$(status_of "$b1")" = ok_basic/2 ] || fail "second basic check should count twice, got $(status_of "$b1")"
+# A clip first checked when the snapshot it was sent from was already gone
+# ("nosource") is checked again from its copy in a newer snapshot.
+b7=$(basic_clip 07)
+b7_new="$snaps/snap-000107/mnt/TeslaCam/RecentClips/2026-11-06_07-00-00-front.mp4"
+printf '%s\t-\t-\t%s\tnosource\t0\t%s\n' "$b7" "$(date +%s)" "$snaps/snap-000099/gone/2026-11-06_07-00-00-front.mp4" >> "$ARCHIVE_VERIFY_LEDGER"
+# One that really has no copy left anywhere stays as it is.
+printf '%s\t-\t-\t%s\tnosource\t0\t%s\n' "RecentClips/2026-11-06/2026-11-06_08-00-00-front.mp4" "$(date +%s)" "$snaps/snap-000099/gone/x.mp4" >> "$ARCHIVE_VERIFY_LEDGER"
+[ "$(archive_current_source "$b7")" = "$b7_new" ] || fail "current source not found through the link farm: $(archive_current_source "$b7" || true)"
+archive_current_source RecentClips/2026-11-06/2026-11-06_08-00-00-front.mp4 >/dev/null && fail "a clip with no link has no current source"
+grep -v "^$b7"$'\t' "$workdir/mutable/sentry_files_archived" > "$workdir/sfa" && mv "$workdir/sfa" "$workdir/mutable/sentry_files_archived"
+echo "$b7" >> "$workdir/mutable/sentry_files_archived"
+rm -f "$ARCHIVE_VERIFY_QUEUE"
+logs=""
+requeue_nosource_with_copy
+grep -q "^$b7"$'\t'"$b7_new"$'\t' "$ARCHIVE_VERIFY_QUEUE" || fail "nosource clip with a newer copy not re-queued"
+grep -q "08-00-00" "$ARCHIVE_VERIFY_QUEUE" && fail "nosource clip with no copy re-queued"
+grep -q "still has them in a newer snapshot" <<< "$logs" || fail "re-queue not logged: $logs"
+verify_archived_clips
+[ "$(status_of "$b7")" = ok_basic/1 ] || fail "re-queued clip should verify from its newer copy, got $(status_of "$b7")"
+[ "$(awk -F'\t' -v r="$b7" '$1 == r { s = $7 } END { print s }' "$ARCHIVE_VERIFY_LEDGER")" = "$b7_new" ] || fail "ledger should record the newer copy as the source"
+# A queue line whose source snapshot is gone is pointed at the current copy.
+printf '%s\t%s\t-\t-\t1\nRecentClips/x/none.mp4\t/nowhere/none.mp4\t-\t-\t1\nbare-rel-only\n' "$b7" "$snaps/snap-000099/gone/y.mp4" > "$workdir/rb-batch"
+archive_resolve_batch_sources "$workdir/rb-batch"
+[ "$(sed -n 1p "$workdir/rb-batch")" = "$b7"$'\t'"$b7_new"$'\t-\t-\t1' ] || fail "batch source not resolved: $(sed -n 1p "$workdir/rb-batch")"
+[ "$(sed -n 2p "$workdir/rb-batch")" = $'RecentClips/x/none.mp4\t/nowhere/none.mp4\t-\t-\t1' ] || fail "unresolvable source should stay as it was"
+[ "$(sed -n 3p "$workdir/rb-batch")" = "bare-rel-only" ] || fail "a line without a source should stay as it was"
 # Two basic matches release the snapshot (auto-delete is on).
 grep -qx snap-000101 "$workdir/released" || fail "snapshot verified twice by the basic check wasn't released"
 # Switching to full doesn't treat a stored basic fingerprint as a SHA-256:
