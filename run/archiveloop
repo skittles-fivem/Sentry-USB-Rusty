@@ -2451,9 +2451,15 @@ PYBASIC
 #  - identical: ok_basic.
 #  - the Pi's copy is H.264 and the server's H.265/AV1 (Sentry Manager's
 #    in-place re-encode): converted_basic when the frame count matches and
-#    the duration is within 100 ms; otherwise converted_unconfirmed (kept and
-#    never re-sent, so a re-encode that changes frame timing can't loop, but
-#    never auto-deleted either).
+#    the duration is within 100 ms, or when the frame count differs by one
+#    and the duration is within half a frame. That covers Manager's two
+#    known one-frame cases, where total duration is kept: Tesla's encoder
+#    skipping a frame_num across the wrap before an IDR (FFmpeg drops the
+#    picture after the gap and the previous frame absorbs its duration), and
+#    variable-frame-rate clips. A re-encode that lost its last frame is short
+#    by a whole frame, so it doesn't pass. Otherwise converted_unconfirmed
+#    (kept and never re-sent, so a re-encode that changes frame timing can't
+#    loop, but never auto-deleted either).
 #  - anything else: mismatch.
 function archive_basic_result () {
   awk -v l="$1" -v r="$2" 'BEGIN {
@@ -2462,7 +2468,12 @@ function archive_basic_result () {
     if (nl == 6 && nr == 6 && a[1] == "mp4" && b[1] == "mp4" && a[3] == "avc1" &&
         (b[3] == "hvc1" || b[3] == "hev1" || b[3] == "av01")) {
       d = a[5] - b[5]; if (d < 0) d = -d
-      print (a[4] == b[4] && d <= 100) ? "converted_basic" : "converted_unconfirmed"
+      f = a[4] - b[4]; if (f < 0) f = -f
+      if (a[4] == b[4] && d <= 100) ok = 1
+      # One frame apart: duration within half of one frame (average length).
+      else if (f == 1 && a[4] > 0 && d * 2 * a[4] <= a[5]) ok = 1
+      else ok = 0
+      print ok ? "converted_basic" : "converted_unconfirmed"
       exit
     }
     print "mismatch"

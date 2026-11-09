@@ -467,6 +467,14 @@ truncate -s 100000 "$workdir/share/$b3"
 basic_mp4 "$workdir/share/$b4" hvc1 100 3040 7
 basic_mp4 "$workdir/share/$b5" hvc1 90 2700 7
 rm -f "$workdir/share/$b6"
+# Manager's one-frame cases (100 frames, 30 ms each): one frame fewer with the
+# total duration kept passes; one frame fewer and a frame's length short (a
+# lost last frame) doesn't; two frames fewer doesn't.
+[ "$(archive_basic_result mp4:1:avc1:100:3000:a mp4:2:hvc1:99:3000:b)" = converted_basic ] || fail "one frame fewer, same duration, should pass"
+[ "$(archive_basic_result mp4:1:avc1:100:3000:a mp4:2:hvc1:101:3010:b)" = converted_basic ] || fail "one frame more within half a frame should pass"
+[ "$(archive_basic_result mp4:1:avc1:100:3000:a mp4:2:hvc1:99:2970:b)" = converted_unconfirmed ] || fail "lost last frame should not pass"
+[ "$(archive_basic_result mp4:1:avc1:100:3000:a mp4:2:hvc1:98:3000:b)" = converted_unconfirmed ] || fail "two frames apart should not pass"
+[ "$(archive_basic_result mp4:1:avc1:100:3000:a mp4:2:avc1:99:3000:b)" = mismatch ] || fail "same codec with a frame missing is damage, not a re-encode"
 : > "$ARCHIVE_LOCAL_SUMS"
 verify_archived_clips
 [ "$(status_of "$b1")" = ok_basic/1 ] || fail "identical clip should pass the basic check, got $(status_of "$b1")"

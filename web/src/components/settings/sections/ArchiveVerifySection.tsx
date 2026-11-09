@@ -138,7 +138,8 @@ export function ArchiveVerifySection() {
                 codec, the number of frames, the duration and the size of every frame. It reads the index only, usually
                 well under 100 KB per clip, so a clip takes well under a second to check. It doesn't wait for Sentry
                 Manager, and the Pi doesn't hash clips ahead of time. A clip Sentry Manager re-encoded passes when its
-                frame count and duration match the original.
+                frame count and duration match the original, or when it has one frame more or fewer and the same
+                duration (Sentry Manager keeps the timing when the car's encoder skipped a frame).
               </p>
               <p>
                 A cut-off, missing or rewritten copy can't pass the basic check. Damage that leaves every frame's
