@@ -20,7 +20,7 @@ for fn in sortfile prunefile archive_conf_value archive_verify_enabled archive_a
   archive_quick_fingerprint archive_remote_quick_fingerprint archive_quick_result archive_verify_quick_mode \
   archive_cached_local_sum precompute_local_hashes archive_local_quick_fingerprint archive_verify_progress \
   archive_work_progress archive_work_done archive_verify_methods archive_verify_gone_through \
-  archive_lowprio_fn archive_verify_basic_mode archive_basic_fingerprints archive_basic_result verify_archive_batch_basic archive_verify_finish_batch \
+  archive_verify_parallel archive_remote_quick_fingerprints archive_lowprio_fn archive_verify_basic_mode archive_basic_fingerprints archive_basic_result verify_archive_batch_basic archive_verify_finish_batch \
   archive_stream_is_reencoded archive_local_is_reencoded archive_remote_is_reencoded archive_manager_original_sums archive_manager_record_present \
   queue_unverified_archived queue_archive_rechecks snapshot_verified_twice auto_delete_verified_snapshots verify_archived_clips \
   json_string json_int json_bool build_share_status_json plan_share_transfer record_archive_throughput \
@@ -419,6 +419,36 @@ then
   [ -n "$fp" ] || fail "basic fingerprints at low priority printed nothing"
   eval "$saved_ionice"; eval "$saved_nice"
 fi
+
+# --- parallel checks ------------------------------------------------------------
+echo 'export ARCHIVE_VERIFY_PARALLEL=3' > "$workdir/sentryusb.conf"
+[ "$(archive_verify_parallel)" = 3 ] || fail "parallel setting not read"
+echo 'export ARCHIVE_VERIFY_PARALLEL=500' > "$workdir/sentryusb.conf"
+[ "$(archive_verify_parallel)" = 32 ] || fail "parallel setting not capped at 32"
+echo 'export ARCHIVE_VERIFY_PARALLEL=0' > "$workdir/sentryusb.conf"
+[ "$(archive_verify_parallel)" = 1 ] || fail "parallel setting below 1 not raised to 1"
+: > "$workdir/sentryusb.conf"
+[ "$(archive_verify_parallel)" = 8 ] || fail "parallel default should be 8"
+# Full read-back of many clips at once: every present clip hashed once, an
+# absent one left out (the caller treats it as absent).
+mkdir -p "$workdir/share/par"
+: > "$workdir/par-list"
+for n in $(seq 1 20); do
+  head -c 5000 /dev/urandom > "$workdir/share/par/c$n.mp4"
+  echo "par/c$n.mp4" >> "$workdir/par-list"
+done
+echo "par/not-there.mp4" >> "$workdir/par-list"
+got=$(archive_remote_sha256 "$workdir/par-list" | sort -k2)
+want=$(cd "$workdir/share" && for n in $(seq 1 20); do s=$(sha256sum < "par/c$n.mp4"); printf '%s\t%s\n' "${s%% *}" "par/c$n.mp4"; done | sort -k2)
+[ "$got" = "$want" ] || fail "parallel read-back hashes wrong"
+# Quick-check fingerprints of the share, several at once, in any order.
+: > "$workdir/qpar"
+for n in 1 2 3; do printf 'par/c%s.mp4\tL%s\t-\n' "$n" "$n" >> "$workdir/qpar"; done
+printf 'par/not-there.mp4\tL9\t-\n' >> "$workdir/qpar"
+out=$(archive_remote_quick_fingerprints "$workdir/qpar" | sort)
+[ "$(grep -c $'\twhole:5000:' <<< "$out")" = 3 ] || fail "parallel quick fingerprints wrong: $out"
+grep -q $'^par/not-there.mp4\tL9\t-\tABSENT$' <<< "$out" || fail "absent clip should be ABSENT: $out"
+rm -rf "$workdir/share/par"
 
 # --- basic check (ARCHIVE_VERIFY_MODE=basic): size and frames --------------
 # A minimal MP4: ftyp, mdat, and a moov with one video track whose stsd entry

@@ -1912,13 +1912,22 @@ function archive_remote_sha256 () {
     cifs|nfs)
       # The share is mounted here, so the Pi reads the server's copy back.
       timeout 10 [ -d "${ARCHIVE_MOUNT:-}" ] || return 1
-      local rel sum
-      while IFS= read -r rel
-      do
-        [ -f "$ARCHIVE_MOUNT/$rel" ] || continue
-        sum=$(timeout 900 ionice -c2 -n7 nice -n19 sha256sum < "$ARCHIVE_MOUNT/$rel") || return 1
-        printf '%s\t%s\n' "${sum%% *}" "$rel"
-      done < "$rels"
+      # Several clips at once, at most one per core: hashing whole clips
+      # is CPU work on the Pi. A clip that isn't there is skipped (the
+      # caller treats it as absent); a read error fails the batch.
+      local par out="$ARCHIVE_VERIFY_WORK/readback-sums"
+      par=$(archive_verify_parallel)
+      [ "$par" -le 4 ] || par=4
+      # shellcheck disable=SC2016 # expanded by the child bash
+      xargs -d '\n' -P "$par" -n 1 bash -c '
+        f="$0/$1"
+        [ -f "$f" ] || exit 0
+        if s=$(timeout 900 ionice -c2 -n7 nice -n19 sha256sum < "$f")
+        then printf "%s\t%s\n" "${s%% *}" "$1"
+        else printf "ERROR\t%s\n" "$1"
+        fi' "$ARCHIVE_MOUNT" < "$rels" > "$out" || true
+      ! grep -q '^ERROR' "$out" || return 1
+      cat "$out"
       ;;
     rsync)
       # The server hashes its own copies; only the hashes cross the network.
@@ -2200,6 +2209,20 @@ function precompute_local_hashes () {
 # Files under 2 MiB, or that aren't readable MP4s on the Pi, are hashed whole.
 ARCHIVE_QUICK_WHOLE_BELOW=2097152
 
+# How many clips verification checks at once (ARCHIVE_VERIFY_PARALLEL,
+# default 8, 1-32). The basic and quick checks read little per clip, so
+# they wait on the network more than they use it; checking several clips
+# at once keeps the link and the SD card busy. Full read-back, which
+# hashes whole clips on the Pi's CPU, uses at most 4 (one per core).
+function archive_verify_parallel () {
+  local n
+  n=$(archive_conf_value ARCHIVE_VERIFY_PARALLEL)
+  [[ "$n" =~ ^[0-9]+$ ]] || n=8
+  [ "$n" -ge 1 ] || n=1
+  [ "$n" -le 32 ] || n=32
+  echo "$n"
+}
+
 # Run shell function $2 (args after it) at low priority: $1 is "low"
 # (ionice best-effort 7) or "idle" (ionice idle class), both at nice 19.
 # ionice, nice and timeout are separate programs and can't see this
@@ -2217,6 +2240,7 @@ function archive_lowprio_fn () {
   export -f "$fn"
   # shellcheck disable=SC2016 # "$@" is expanded by the child bash
   ARCHIVE_QUICK_WHOLE_BELOW=${ARCHIVE_QUICK_WHOLE_BELOW:-2097152} \
+  ARCHIVE_VERIFY_THREADS=${ARCHIVE_VERIFY_THREADS:-1} \
     "${limit[@]}" "${io[@]}" nice -n19 bash -c "$fn"' "$@"' _ "$@"
 }
 
@@ -2293,6 +2317,24 @@ function archive_remote_quick_fingerprint () {
   # shellcheck disable=SC2016 # $1/$2 are expanded by the inner bash
   ARCHIVE_QUICK_WHOLE_BELOW=$ARCHIVE_QUICK_WHOLE_BELOW timeout 300 \
     bash -c 'archive_quick_fingerprint "$1" "$2"' _ "$ARCHIVE_MOUNT/$1" "$2"
+}
+
+# Quick-check fingerprints of the share's copies for a list ($1) of
+# "<relpath>\t<Pi fingerprint>\t<mode or ->" lines, ARCHIVE_VERIFY_PARALLEL at a
+# time. Prints each line with the share's fingerprint appended, or ABSENT
+# when it couldn't be read (asked again after a pause by the caller).
+function archive_remote_quick_fingerprints () {
+  [ -s "$1" ] || return 0
+  export -f archive_quick_fingerprint
+  # shellcheck disable=SC2016 # expanded by the child bash
+  ARCHIVE_MOUNT=$ARCHIVE_MOUNT ARCHIVE_QUICK_WHOLE_BELOW=$ARCHIVE_QUICK_WHOLE_BELOW \
+    xargs -d '\n' -P "$(archive_verify_parallel)" -n 1 bash -c '
+      IFS=$'"'"'\t'"'"' read -r rel lfp mode <<< "$1"
+      m=$mode; [ "$m" != - ] || m=""
+      if rfp=$(timeout 300 bash -c '"'"'archive_quick_fingerprint "$1" "$2"'"'"' _ "$ARCHIVE_MOUNT/$rel" "$m")
+      then printf "%s\t%s\t%s\t%s\n" "$rel" "$lfp" "$mode" "$rfp"
+      else printf "%s\t%s\t%s\tABSENT\n" "$rel" "$lfp" "$mode"
+      fi' _ < "$1"
 }
 
 # "<relpath>\t<status>" from two fingerprints. A whole-file fingerprint
@@ -2437,11 +2479,18 @@ def fingerprint(path):
     except OSError:
         return "error"
 
+# Several files at once (ARCHIVE_VERIFY_THREADS): each one is a few small
+# reads, so over a network share the time is mostly waiting for replies.
+from concurrent.futures import ThreadPoolExecutor
 with open(sys.argv[1], encoding="utf-8", errors="surrogateescape") as lst:
-    for line in lst:
-        p = line.rstrip("\n")
-        if p:
-            print("%s\t%s" % (p, fingerprint(p)), flush=True)
+    paths = [l.rstrip("\n") for l in lst if l.rstrip("\n")]
+try:
+    threads = max(1, min(32, int(os.environ.get("ARCHIVE_VERIFY_THREADS", "1"))))
+except ValueError:
+    threads = 1
+with ThreadPoolExecutor(max_workers=threads) as pool:
+    for p, fp in zip(paths, pool.map(fingerprint, paths)):
+        print("%s\t%s" % (p, fp), flush=True)
 PYBASIC
 }
 
@@ -2495,6 +2544,8 @@ function verify_archive_batch_basic () {
     [ -z "$src" ] || printf '%s\n' "$src" >> "$w/basic-local-list"
     printf '%s\n' "$ARCHIVE_MOUNT/$rel" >> "$w/basic-remote-list"
   done < "$batch"
+  local ARCHIVE_VERIFY_THREADS
+  ARCHIVE_VERIFY_THREADS=$(archive_verify_parallel)
   archive_lowprio_fn low archive_basic_fingerprints "$w/basic-local-list" > "$w/basic-local" 2>/dev/null || true
   ARCHIVE_LOWPRIO_TIMEOUT=600 archive_lowprio_fn low archive_basic_fingerprints "$w/basic-remote-list" > "$w/basic-remote" 2>/dev/null ||
     return 1
@@ -2648,8 +2699,11 @@ function verify_archive_batch () {
   if [ -s "$readback" ] && archive_verify_quick_mode
   then
     timeout 10 [ -d "${ARCHIVE_MOUNT:-}" ] || return 1
-    local still="$ARCHIVE_VERIFY_WORK/readback-still" lfp rfp qrel qsum qsrc qabsent=""
+    local still="$ARCHIVE_VERIFY_WORK/readback-still" lfp rfp qrel qsum qsrc qabsent="" rmode
+    local qtodo="$ARCHIVE_VERIFY_WORK/quick-todo"
     : > "$still"
+    : > "$qtodo"
+    # The Pi's halves first (usually stored by pre-hashing)...
     while IFS=$'\t' read -r qrel _ qsum qsrc
     do
       grep -qxF -- "$qrel" "$readback" || continue
@@ -2662,15 +2716,24 @@ function verify_archive_batch () {
         echo "$qrel" >> "$still"
         continue
       fi
-      local rmode=""
+      # "-" for no mode: read with IFS=tab merges an empty field away.
+      rmode=-
       [ "${lfp%%:*}" != mp4 ] || rmode=mp4-only
-      if ! rfp=$(archive_remote_quick_fingerprint "$qrel" "$rmode")
+      printf '%s\t%s\t%s\n' "$qrel" "$lfp" "$rmode" >> "$qtodo"
+    done < "$localsums"
+    # ...then the share's, several clips at once.
+    archive_remote_quick_fingerprints "$qtodo" > "$qtodo.out"
+    while IFS=$'\t' read -r qrel lfp rmode rfp
+    do
+      [ -n "$qrel" ] || continue
+      [ "$rmode" != - ] || rmode=""
+      if [ "$rfp" = ABSENT ]
       then
         qabsent+="$qrel"$'\t'"$lfp"$'\t'"$rmode"$'\n'
         continue
       fi
       archive_quick_result "$qrel" "$lfp" "$rfp" >> "$quick"
-    done < "$localsums"
+    done < "$qtodo.out"
     # Briefly absent isn't missing (see the read-back case below).
     if [ -n "$qabsent" ]
     then
@@ -3154,7 +3217,11 @@ function verify_archived_clips () {
   [[ "$max" =~ ^[0-9]+$ ]] || max=1800
   local deadline batch stopped=""
   deadline=$(( $(uptime_seconds) + max ))
-  split -l 50 -d -a 6 "$ARCHIVE_VERIFY_WORK/queue" "$ARCHIVE_VERIFY_WORK/batch-"
+  # Basic checks are quick, so larger batches (fewer passes over the queue
+  # files); 50 otherwise, so a full read-back batch stays bounded.
+  local batch_size=50
+  ! archive_verify_basic_mode || batch_size=200
+  split -l "$batch_size" -d -a 6 "$ARCHIVE_VERIFY_WORK/queue" "$ARCHIVE_VERIFY_WORK/batch-"
   for batch in "$ARCHIVE_VERIFY_WORK"/batch-*
   do
     [ -e "$batch" ] || continue
