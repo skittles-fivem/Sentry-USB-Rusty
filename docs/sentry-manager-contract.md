@@ -27,6 +27,10 @@ or clips without updating this document.
 Rule for Manager: skip anything dot-prefixed and anything not ending in
 `.mp4`. Don't index, count, convert or flag those as gaps.
 
+The Pi in turn ignores everything it didn't upload. Manager's
+`TEMP-H265-<name>.mp4` working copies and `.sentrymanager/` are never read
+or touched, except the checksum record (section 3).
+
 Sentry USB never deletes anything on the share.
 
 ## 3. Checksum verification and Manager's re-encodes
@@ -39,17 +43,21 @@ twice.
 Manager may re-encode a clip **in place** ("replace" output mode). The result
 can't match the Pi's hash, so Sentry USB recognises re-encodes:
 
-- **Detected as a re-encode:** the share copy's video sample entry is `hvc1`,
-  `hev1` (H.265) or `av01` (AV1), while the Pi's copy is the car's H.264. Only
-  the first and last MiB of the file are read.
+- **Detected as a re-encode:** the share copy's video sample entry is `hvc1`
+  (or `hev1`) for H.265, or `av01` for AV1, while the Pi's copy is the car's
+  H.264. Only the first and last MiB of the file are read; Manager's output
+  keeps `moov` in the last MiB.
 - **Never treated as damage:** a re-encode is never renamed aside or
   re-uploaded.
 
 ### What Manager must do (required for in-place conversion)
 
 1. **Write a checksum record of the original before replacing it.**
-   - File: `.sentrymanager/original-checksums.sha256` at the share root (the
-     folder that holds `RecentClips/`).
+   - File: `.sentrymanager/original-checksums.sha256` in the folder that holds
+     `RecentClips/`. That folder is the Pi's share root: the Pi uploads to
+     `<share root>/RecentClips/…`. If the NAS share has a `TeslaCam/` level,
+     the record is `TeslaCam/.sentrymanager/original-checksums.sha256`, and
+     the Pi's archive path points at that `TeslaCam/` folder.
    - Format: `sha256sum` style, one line per clip:
      `<64 lowercase hex>  <relpath>` (two spaces). The relpath is from the
      share root with no leading `./`, e.g.
@@ -59,12 +67,16 @@ can't match the Pi's hash, so Sentry USB recognises re-encodes:
      harmless.
    - Append only; a later line for the same path wins. Keep at least 30 days.
      Pruning older lines is fine if you rewrite to a temp file and rename.
-2. **Replace atomically.** Write the output to a temporary (dot-prefixed or
-   non-`.mp4`) name, then rename it over the original. A half-written `.mp4`
-   under the real name looks like damage.
+2. **Replace atomically.** Write the output under any name other than the
+   clip's final name, then rename it over the original. A half-written file
+   under the real name looks like damage. Manager uses
+   `TEMP-H265-<name>.mp4` in the same folder, which is fine: the Pi only ever
+   opens the exact paths it uploaded.
 3. **Keep the output recognisable.** Same relpath and name, an MP4 whose video
-   sample entry is `hvc1`/`hev1`/`av01`, with the `moov` box in the first or
-   last MiB (faststart or at the end).
+   sample entry is `hvc1` (H.265) or `av01` (AV1), with the `moov` box in the
+   first or last MiB. Manager writes `hvc1`, never `hev1`, with `moov` at the
+   end. The Pi also accepts `hev1`, but nothing on the Manager side relies on
+   that.
 4. **Don't convert clips that are still arriving.** See section 4.
 
 "Separate" output mode (converted copies in another folder) leaves originals
