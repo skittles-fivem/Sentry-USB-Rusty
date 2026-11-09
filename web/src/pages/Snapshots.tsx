@@ -58,6 +58,16 @@ function formatDate(unix: number) {
 const tagClass = "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium"
 
 /** "Verified on archive" and related tags for one snapshot row. */
+/** Word typed to confirm deleting snapshots that aren't fully verified. */
+export const UNVERIFIED_DELETE_WORD = "DELETE"
+
+/** Selected snapshots whose footage isn't fully verified on the archive
+ *  server. Without verification data (verification off, no archive) there's
+ *  nothing to warn about, so they don't count. */
+function unverifiedCount(entries: SnapshotEntry[]): number {
+  return entries.filter((e) => e.archive && e.archive.state !== "verified" && e.archive.state !== "nothing").length
+}
+
 export function ArchiveTag({ archive }: { archive?: ArchiveCoverage | null }) {
   if (!archive || archive.state === "nothing") return null
   const checked = archive.last_checked_unix ? ` Last checked ${formatDate(archive.last_checked_unix)}.` : ""
@@ -120,6 +130,7 @@ export default function Snapshots() {
   const [focusPreview, setFocusPreview] = useState<{ id: string; through: boolean } | null>(null)
   const [deletion, setDeletion] = useState<Deletion | null>(null)
   const [deleting, setDeleting] = useState(false)
+  const [confirmWord, setConfirmWord] = useState("")
   const [completed, setCompleted] = useState(0)
   const inFlight = useRef(false)
   const requestId = useRef(0)
@@ -195,10 +206,14 @@ export default function Snapshots() {
     setCompleted(0)
     setHoverPreview(null)
     setFocusPreview(null)
+    setConfirmWord("")
     setDeletion(selectionFor(snapshot, through))
   }
+  // Deleting footage that may exist nowhere else needs the word typed.
+  const unverifiedSelected = deletion ? unverifiedCount(deletion.entries) : 0
+  const confirmBlocked = unverifiedSelected > 0 && confirmWord.trim().toUpperCase() !== UNVERIFIED_DELETE_WORD
   async function confirmDelete() {
-    if (!deletion || deleting) return
+    if (!deletion || deleting || confirmBlocked) return
     abort.current?.abort()
     requestId.current++
     inFlight.current = false
@@ -401,7 +416,7 @@ export default function Snapshots() {
               </button>
               <button
                 className="rounded-xl bg-red-600 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
-                disabled={deleting}
+                disabled={deleting || confirmBlocked}
                 onClick={() => void confirmDelete()}
               >
                 {deleting
@@ -426,17 +441,25 @@ export default function Snapshots() {
               ? "Reclaimed space depends on blocks shared with remaining snapshots."
               : `Estimated space freed: ${formatBytes(deletion.estimate)}.`}
           </p>
-          {(() => {
-            const unverified = deletion.entries.filter(
-              (e) => e.archive && e.archive.state !== "verified" && e.archive.state !== "nothing",
-            ).length
-            return unverified > 0 ? (
-              <p className="mt-3 text-sm text-amber-300">
-                {unverified} of the selected {deletion.entries.length === 1 ? "snapshot is" : "snapshots are"} not
+          {unverifiedSelected > 0 && (
+            <div className="mt-3 space-y-2 rounded-xl border border-amber-400/30 bg-amber-400/10 p-3">
+              <p className="text-sm text-amber-300">
+                {unverifiedSelected} of the selected {deletion.entries.length === 1 ? "snapshot is" : "snapshots are"} not
                 fully verified on the archive server. Their footage may not be anywhere else.
               </p>
-            ) : null
-          })()}
+              <label className="block text-xs text-amber-200">
+                Type {UNVERIFIED_DELETE_WORD} to delete them anyway
+                <input
+                  aria-label="Confirm deleting unverified snapshots"
+                  className="mt-1 block w-full rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-sm text-slate-100"
+                  value={confirmWord}
+                  disabled={deleting}
+                  autoComplete="off"
+                  onChange={(event) => setConfirmWord(event.target.value)}
+                />
+              </label>
+            </div>
+          )}
           <p className="mt-3 text-sm text-red-300">
             Footage stored only in these snapshots will be lost. This cannot be undone. Live dashcam
             files are unaffected.

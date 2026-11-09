@@ -298,11 +298,25 @@ test("archive tags show verification state and the delete dialog warns about unv
     // Only the verified snapshot selected: no warning.
     await act(async () => container.querySelector<HTMLElement>('[aria-label="Delete only twice"]')!.click())
     assert.doesNotMatch(win.document.body.textContent, /not\s+fully verified/)
+    assert.equal(win.document.querySelector('[aria-label="Confirm deleting unverified snapshots"]'), null, "asked to type for a verified snapshot")
+    assert.equal([...win.document.querySelectorAll("button")].find(b => b.textContent === "Delete permanently")!.disabled, false)
     await act(async () => [...win.document.querySelectorAll("button")].find(b => b.textContent === "Cancel")!.click())
 
     // Through "half": two of the three aren't fully verified.
     await act(async () => container.querySelector<HTMLElement>('[aria-label="Delete through half"]')!.click())
     assert.match(win.document.body.textContent, /2 of the selected snapshots are not\s+fully verified/)
+    // Deleting unverified snapshots needs DELETE typed first.
+    const button = () => [...win.document.querySelectorAll("button")].find(b => b.textContent === "Delete permanently")!
+    assert.equal(button().disabled, true, "delete enabled before typing the word")
+    const input = win.document.querySelector<HTMLInputElement>('[aria-label="Confirm deleting unverified snapshots"]')!
+    const type = async (value: string) => act(async () => {
+      Object.getOwnPropertyDescriptor(win.HTMLInputElement.prototype, "value")!.set!.call(input, value)
+      input.dispatchEvent(new win.Event("input", { bubbles: true }))
+    })
+    await type("delet")
+    assert.equal(button().disabled, true, "a partial word enabled delete")
+    await type("delete")
+    assert.equal(button().disabled, false, "typing the word (any case) should enable delete")
   } finally {
     await act(async () => root.unmount()); globalThis.fetch = oldFetch
     for (const [key, descriptor] of originals) { if (descriptor) Object.defineProperty(globalThis, key, descriptor); else Reflect.deleteProperty(globalThis, key) }
