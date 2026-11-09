@@ -2210,14 +2210,14 @@ function precompute_local_hashes () {
 ARCHIVE_QUICK_WHOLE_BELOW=2097152
 
 # How many clips verification checks at once (ARCHIVE_VERIFY_PARALLEL,
-# default 8, 1-32). The basic and quick checks read little per clip, so
+# default 32, the most allowed; 1-32). The basic and quick checks read little per clip, so
 # they wait on the network more than they use it; checking several clips
 # at once keeps the link and the SD card busy. Full read-back, which
 # hashes whole clips on the Pi's CPU, uses at most 4 (one per core).
 function archive_verify_parallel () {
   local n
   n=$(archive_conf_value ARCHIVE_VERIFY_PARALLEL)
-  [[ "$n" =~ ^[0-9]+$ ]] || n=8
+  [[ "$n" =~ ^[0-9]+$ ]] || n=32
   [ "$n" -ge 1 ] || n=1
   [ "$n" -le 32 ] || n=32
   echo "$n"

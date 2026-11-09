@@ -428,7 +428,7 @@ echo 'export ARCHIVE_VERIFY_PARALLEL=500' > "$workdir/sentryusb.conf"
 echo 'export ARCHIVE_VERIFY_PARALLEL=0' > "$workdir/sentryusb.conf"
 [ "$(archive_verify_parallel)" = 1 ] || fail "parallel setting below 1 not raised to 1"
 : > "$workdir/sentryusb.conf"
-[ "$(archive_verify_parallel)" = 8 ] || fail "parallel default should be 8"
+[ "$(archive_verify_parallel)" = 32 ] || fail "parallel default should be 32"
 # Full read-back of many clips at once: every present clip hashed once, an
 # absent one left out (the caller treats it as absent).
 mkdir -p "$workdir/share/par"
