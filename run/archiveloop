@@ -1991,6 +1991,21 @@ function verify_archive_batch () {
 
   archive_remote_sha256 "$rels" > "$ARCHIVE_VERIFY_WORK/remote" || return 1
 
+  # A clip that's briefly absent isn't missing. Sentry Manager replaces a
+  # clip in place when it converts it; on a share without hard links, its
+  # fallback removes the original a moment before renaming the converted
+  # copy in. Calling that "missing" would re-send the original over
+  # Manager's work. Ask once more after a pause before deciding.
+  local absent="$ARCHIVE_VERIFY_WORK/absent"
+  awk -F'\t' -v remote="$ARCHIVE_VERIFY_WORK/remote" '
+    FILENAME == remote { seen[$2] = 1; next }
+    $3 != "-" && !($1 in seen) { print $1 }' "$ARCHIVE_VERIFY_WORK/remote" "$localsums" > "$absent"
+  if [ -s "$absent" ]
+  then
+    sleep "${ARCHIVE_VERIFY_ABSENT_RECHECK_SECONDS:-20}"
+    archive_remote_sha256 "$absent" >> "$ARCHIVE_VERIFY_WORK/remote" || true
+  fi
+
   awk -F'\t' -v now="$(date +%s)" -v remote="$ARCHIVE_VERIFY_WORK/remote" -v prev="$ARCHIVE_VERIFY_WORK/prev" '
     FILENAME == prev   { ps[$1] = $5; ph[$1] = $3; pc[$1] = $6 + 0; next }
     FILENAME == remote { r[$2] = $1; next }

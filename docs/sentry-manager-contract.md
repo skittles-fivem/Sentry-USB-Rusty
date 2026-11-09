@@ -72,6 +72,14 @@ can't match the Pi's hash, so Sentry USB recognises re-encodes:
    under the real name looks like damage. Manager uses
    `TEMP-H265-<name>.mp4` in the same folder, which is fine: the Pi only ever
    opens the exact paths it uploaded.
+   Manager's replace is gap-free on shares with hard links. Without them it
+   falls back to removing the original a moment before renaming the
+   converted copy in. The Pi tolerates that: a clip absent at its first
+   look is asked for again after 20 s (ARCHIVE_VERIFY_ABSENT_RECHECK_SECONDS)
+   and only counts as missing if it's still absent. A longer gap would make
+   the Pi re-send the original, so on the first test, watch the share for
+   `*.mismatch-*` files and the Pi's log for "isn't on the archive server"
+   lines.
 3. **Keep the output recognisable.** Same relpath and name, an MP4 whose video
    sample entry is `hvc1` (H.265) or `av01` (AV1), with the `moov` box in the
    first or last MiB. Manager writes `hvc1`, never `hev1`, with `moov` at the

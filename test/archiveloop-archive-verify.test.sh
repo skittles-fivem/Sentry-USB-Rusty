@@ -57,6 +57,11 @@ ARCHIVE_VERIFY_LEDGER="$workdir/mutable/archive_verified.tsv"
 ARCHIVE_VERIFY_WORK="$workdir/work"
 ARCHIVE_REENCODED_TAGS='hvc1|hev1|av01'
 ARCHIVE_MANAGER_CHECKSUMS=.sentrymanager/original-checksums.sha256
+export ARCHIVE_VERIFY_ABSENT_RECHECK_SECONDS=0
+# The "missing" re-check pauses with sleep; a test can hook that pause to
+# simulate the share changing in between.
+on_pause=""
+sleep() { if [ -n "$on_pause" ]; then eval "$on_pause"; on_pause=""; fi; }
 SNAPSHOT_LOCK_DIR="$workdir/backingfiles/snapshots"
 : > "$workdir/sentryusb.conf"
 
@@ -247,6 +252,20 @@ verify_archived_clips
 grep -q "re-encoded $r17 from a copy that doesn't match" "$workdir/log" || fail "bad-source re-encode not explained: $(cat "$workdir/log")"
 ls "$workdir/share/RecentClips/2026-11-07/" | grep -q '17-00-00-front.mp4.mismatch' || fail "bad-source re-encode not renamed aside"
 grep -q 17-00-00 "$workdir/mutable/sentry_files_archived" && fail "bad-source re-encode not queued for re-send"
+
+# --- briefly absent (Manager's no-hard-link replace) is not missing ---------
+# The clip is gone at the first look and back by the re-check: verified,
+# not re-sent.
+gap_rel=RecentClips/2026-11-07/2026-11-07_18-00-00-front.mp4
+make_snap snap-000018 2026-11-07_18-00-00-front.mp4
+ln -s "$snaps/snap-000018/mnt/TeslaCam/RecentClips/2026-11-07_18-00-00-front.mp4" "$lower/$gap_rel"
+echo "$gap_rel" >> "$workdir/mutable/sentry_files_archived"
+on_pause='cp -L "$lower/$gap_rel" "$workdir/share/$gap_rel"'
+: > "$workdir/log"
+verify_archived_clips
+[ "$(status_of $gap_rel)" = ok/1 ] || fail "clip back after a brief gap should be ok/1, got $(status_of $gap_rel)"
+grep -q 18-00-00 "$workdir/mutable/sentry_files_archived" || fail "briefly absent clip was queued for re-send"
+grep -q "isn't on the archive server" "$workdir/log" && fail "briefly absent clip was reported missing"
 
 # A Pi copy that is itself H.265 proves nothing about a differing server copy.
 printf 'hvc1' >> "$snaps/snap-000004/mnt/TeslaCam/RecentClips/2026-11-07_14-00-00-front.mp4"
