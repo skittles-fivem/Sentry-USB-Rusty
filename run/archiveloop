@@ -4042,6 +4042,9 @@ function uptime_seconds {
 # Schedule each snapshot from when the previous one STARTED, and skip the idle
 # wait: a mid-write copy is safe (make_snapshot fscks the copy), as the
 # boot-time snapshot already relies on.
+# When the next scheduled snapshot is due (unix time), for the web UI.
+NEXT_SNAPSHOT_FILE=/tmp/sentryusb-next-snapshot
+
 function snapshotloop {
   echo -n snapshotloop > /proc/self/comm
   local interval="${SNAPSHOT_INTERVAL:-3480}"
@@ -4059,6 +4062,10 @@ function snapshotloop {
       [ "$late" -lt 60 ] || log "snapshot is ${late}s behind schedule (previous snapshot ran long)"
     fi
     next=$(( $(uptime_seconds) + interval ))
+    # Tell the web UI when the next scheduled snapshot is due (wall-clock
+    # unix time, for the Snapshots page's Live row). Best effort.
+    echo $(( $(date +%s) + interval )) > "$NEXT_SNAPSHOT_FILE.new" 2>/dev/null &&
+      mv -f "$NEXT_SNAPSHOT_FILE.new" "$NEXT_SNAPSHOT_FILE" 2>/dev/null || true
     # A failed snapshot is already logged and keeps its image for recovery;
     # under errexit it must not take down this worker and its siblings.
     /root/bin/make_snapshot.sh || log "ERROR: make_snapshot.sh failed (exit $?)"

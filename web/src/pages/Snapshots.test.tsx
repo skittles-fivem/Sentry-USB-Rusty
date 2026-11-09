@@ -4,6 +4,35 @@ import { act, createElement } from "react"
 import { Window } from "happy-dom"
 import Snapshots from "./Snapshots.tsx"
 
+// The Live row polls its own two endpoints. Answer those here, so each
+// test's fake fetch only sees the list/free-space requests it counts.
+// Implemented as an accessor on globalThis.fetch: tests keep assigning and
+// restoring fetch as before; the getter wraps whatever was assigned last.
+const LIVE_STUB = Symbol("liveStub")
+type Fetch = typeof fetch
+let assignedFetch: Fetch = globalThis.fetch
+let liveAnswer = { car_last_write_ts: null as number | null, next_scheduled_ts: null as number | null, server_ts: 1000 }
+let freshAnswer = { snapshot_ts: null as number | null, refreshing: false, next_refresh_ts: null as number | null, checked_ts: null as number | null, server_ts: 1000 }
+let refreshPosts = 0
+Object.defineProperty(globalThis, "fetch", {
+  configurable: true,
+  get() {
+    const target = assignedFetch
+    const wrapped = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input)
+      if (path.includes("/api/snapshots/live")) return Response.json(liveAnswer)
+      if (path.includes("/api/clips/refresh")) { refreshPosts++; return Response.json(freshAnswer) }
+      if (path.includes("/api/clips/freshness")) return Response.json(freshAnswer)
+      return target(input, init)
+    }) as Fetch & { [LIVE_STUB]?: Fetch }
+    wrapped[LIVE_STUB] = target
+    return wrapped
+  },
+  set(fn: Fetch & { [LIVE_STUB]?: Fetch }) {
+    assignedFetch = fn[LIVE_STUB] ?? fn
+  },
+})
+
 test("a delayed pre-delete list cannot resurrect a removed snapshot", async () => {
   const win = new Window({ url: "http://localhost/snapshots" })
   const values = {
@@ -355,6 +384,58 @@ test("the list refreshes itself when the page becomes visible, but not with the 
     assert.equal(lists, 2, "refreshed under the open delete dialog")
   } finally {
     await act(async () => root.unmount()); globalThis.fetch = oldFetch
+    for (const [key, descriptor] of originals) { if (descriptor) Object.defineProperty(globalThis, key, descriptor); else Reflect.deleteProperty(globalThis, key) }
+    win.close()
+  }
+})
+
+test("the Live row shows whether the car is recording, the schedule, and takes a snapshot on demand", async () => {
+  const win = new Window({ url: "http://localhost/snapshots" })
+  const values = { window: win, document: win.document, navigator: win.navigator, IS_REACT_ACT_ENVIRONMENT: true }
+  const originals = Object.keys(values).map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)] as const)
+  for (const [key, value] of Object.entries(values)) Object.defineProperty(globalThis, key, { configurable: true, value })
+  const oldFetch = globalThis.fetch
+  globalThis.fetch = async input => String(input).includes("free-space")
+    ? Response.json({ mounted: false })
+    : Response.json({ snapshots: [{ id: "snap-1", created_unix: 100, older_count: 0, cumulative_reclaim_bytes: 1024 }] })
+  liveAnswer = { car_last_write_ts: 1000 - 12, next_scheduled_ts: 1000 + 35 * 60, server_ts: 1000 }
+  freshAnswer = { snapshot_ts: 1000 - 23 * 60, refreshing: false, next_refresh_ts: null, checked_ts: null, server_ts: 1000 }
+  refreshPosts = 0
+  const { createRoot } = await import("react-dom/client")
+  const container = win.document.createElement("div"); win.document.body.append(container)
+  const root = createRoot(container)
+  const liveText = () => container.querySelector('[aria-label="Live"]')!.textContent
+  const button = () => [...container.querySelectorAll<HTMLButtonElement>('[aria-label="Live"] button')][0]
+  try {
+    await act(async () => root.render(createElement(Snapshots)))
+    await act(async () => { await new Promise(r => setTimeout(r, 0)) })
+    assert.match(liveText(), /Live · recording/)
+    assert.match(liveText(), /Car last wrote 12 s ago · newest snapshot 23 min ago · next scheduled in 35 min/)
+    assert.equal(button().disabled, false)
+    // Snapshot now: starts an on-demand snapshot and shows progress.
+    freshAnswer = { ...freshAnswer, refreshing: true }
+    await act(async () => button().click())
+    assert.equal(refreshPosts, 1)
+    assert.match(button().textContent, /Taking snapshot/)
+    assert.equal(button().disabled, true)
+    // Rate-limited: says when it's available again.
+    freshAnswer = { snapshot_ts: 1000 - 60, refreshing: false, next_refresh_ts: 1000 + 120, checked_ts: 1000, server_ts: 1000 }
+    liveAnswer = { car_last_write_ts: 1000 - 4000, next_scheduled_ts: null, server_ts: 1000 }
+    // A parked car reads as not recording; the button says when it's next allowed.
+    await act(async () => root.unmount())
+    const container2 = win.document.createElement("div"); win.document.body.append(container2)
+    const root2 = createRoot(container2)
+    await act(async () => root2.render(createElement(Snapshots)))
+    await act(async () => { await new Promise(r => setTimeout(r, 0)) })
+    const text2 = container2.querySelector('[aria-label="Live"]')!.textContent
+    assert.match(text2, /Live · not recording/)
+    assert.match(text2, /Car last wrote 1 h 7 min ago/)
+    assert.match(text2, /Snapshot now \(in 2 min\)/)
+    await act(async () => root2.unmount())
+  } finally {
+    globalThis.fetch = oldFetch
+    liveAnswer = { car_last_write_ts: null, next_scheduled_ts: null, server_ts: 1000 }
+    freshAnswer = { snapshot_ts: null, refreshing: false, next_refresh_ts: null, checked_ts: null, server_ts: 1000 }
     for (const [key, descriptor] of originals) { if (descriptor) Object.defineProperty(globalThis, key, descriptor); else Reflect.deleteProperty(globalThis, key) }
     win.close()
   }

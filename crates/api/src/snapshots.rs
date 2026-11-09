@@ -6,6 +6,8 @@
 //!   * `GET    /api/snapshots`               — list with size/timestamp
 //!   * `DELETE /api/snapshots/:id`           — delete one snapshot
 //!   * `GET    /api/backingfiles/free-space` — total/used/avail in KB
+//!   * `GET    /api/snapshots/live`          — the Live row: when the car
+//!     last wrote to its drive and when the next scheduled snapshot is due
 //!
 //! Deletion uses `/root/bin/release_snapshot.sh` when available so it shares
 //! the runtime's unmount and symlink-cleanup behavior.
@@ -347,6 +349,48 @@ pub async fn delete_snapshot(
     }
 }
 
+/// Written by archiveloop's snapshotloop: unix time the next scheduled
+/// snapshot is due.
+const NEXT_SNAPSHOT_FILE: &str = "/tmp/sentryusb-next-snapshot";
+
+#[derive(serde::Serialize, Debug, PartialEq, Eq)]
+pub struct LiveStatus {
+    /// When the car last wrote to its drive (`cam_disk.bin` mtime), unix
+    /// seconds; null if unknown. Recent means the car is recording now.
+    car_last_write_ts: Option<i64>,
+    /// When the next scheduled snapshot is due; null if unknown or stale
+    /// (the snapshot loop isn't running, or its time is long past).
+    next_scheduled_ts: Option<i64>,
+    /// The Pi's clock, so ages don't depend on the browser's clock.
+    server_ts: i64,
+}
+
+fn live_status(cam_disk: &std::path::Path, next_file: &std::path::Path, now: i64) -> LiveStatus {
+    let car_last_write_ts = std::fs::metadata(cam_disk)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64);
+    // A due time more than 10 minutes past means the loop isn't keeping it
+    // current (stopped, or the clock was stepped); don't show it.
+    let next_scheduled_ts = std::fs::read_to_string(next_file)
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|&ts| ts > now - 600);
+    LiveStatus { car_last_write_ts, next_scheduled_ts, server_ts: now }
+}
+
+/// GET /api/snapshots/live
+pub async fn get_live() -> (StatusCode, Json<LiveStatus>) {
+    let now = now_secs() as i64;
+    let status = tokio::task::spawn_blocking(move || {
+        live_status(std::path::Path::new(CAM_DISK), std::path::Path::new(NEXT_SNAPSHOT_FILE), now)
+    })
+    .await
+    .unwrap_or(LiveStatus { car_last_write_ts: None, next_scheduled_ts: None, server_ts: now });
+    (StatusCode::OK, Json(status))
+}
+
 /// GET /api/backingfiles/free-space
 ///
 /// Returns total/used/available bytes for the backingfiles partition.
@@ -365,5 +409,36 @@ pub async fn get_free_space(
             "storage_health": health,
         }))),
         Err(_) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, "Storage status unavailable"),
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+
+    #[test]
+    fn live_status_reads_the_car_write_time_and_a_current_schedule() {
+        let d = tempfile::tempdir().unwrap();
+        let cam = d.path().join("cam_disk.bin");
+        let next = d.path().join("next");
+        std::fs::write(&cam, b"x").unwrap();
+        let written = std::fs::metadata(&cam).unwrap().modified().unwrap()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        let now = written + 30;
+        std::fs::write(&next, format!("{}\n", now + 1200)).unwrap();
+        assert_eq!(live_status(&cam, &next, now), LiveStatus {
+            car_last_write_ts: Some(written), next_scheduled_ts: Some(now + 1200), server_ts: now,
+        });
+        // Long past: the loop isn't keeping it current, so it's hidden.
+        std::fs::write(&next, format!("{}", now - 3600)).unwrap();
+        assert_eq!(live_status(&cam, &next, now).next_scheduled_ts, None);
+        // A little past (snapshot running now) still shows.
+        std::fs::write(&next, format!("{}", now - 60)).unwrap();
+        assert_eq!(live_status(&cam, &next, now).next_scheduled_ts, Some(now - 60));
+        // Missing files: nulls, never an error.
+        let gone = d.path().join("missing");
+        assert_eq!(live_status(&gone, &gone, now), LiveStatus {
+            car_last_write_ts: None, next_scheduled_ts: None, server_ts: now,
+        });
     }
 }

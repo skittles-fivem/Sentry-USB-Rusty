@@ -58,6 +58,125 @@ function formatDate(unix: number) {
 const tagClass = "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium"
 
 /** "Verified on archive" and related tags for one snapshot row. */
+/** GET /api/snapshots/live */
+interface LiveStatus {
+  car_last_write_ts: number | null
+  next_scheduled_ts: number | null
+  server_ts: number
+}
+/** GET /api/clips/freshness, POST /api/clips/refresh (the app's contract). */
+interface Freshness {
+  snapshot_ts: number | null
+  refreshing: boolean
+  next_refresh_ts: number | null
+  checked_ts: number | null
+  server_ts: number
+}
+/** The car counts as recording if it wrote to its drive this recently. */
+const RECORDING_WITHIN_SECS = 120
+
+function formatAgo(secs: number): string {
+  if (secs < 60) return `${Math.max(0, Math.round(secs))} s`
+  if (secs < 3600) return `${Math.round(secs / 60)} min`
+  const h = Math.floor(secs / 3600)
+  const m = Math.round((secs % 3600) / 60)
+  return m ? `${h} h ${m} min` : `${h} h`
+}
+
+/** The top row: footage the car has recorded that isn't in a snapshot yet.
+ *  The car's drive is never read directly while the car writes to it (that
+ *  could see half-updated folders); "Snapshot now" takes a real snapshot the
+ *  same safe way the scheduled ones are taken, and the new clips then show
+ *  up as a new snapshot row. */
+export function LiveRow({ onSnapshotTaken }: { onSnapshotTaken: () => void }) {
+  const [live, setLive] = useState<LiveStatus | null>(null)
+  const [fresh, setFresh] = useState<Freshness | null>(null)
+  const [note, setNote] = useState<string | null>(null)
+  const wasRefreshing = useRef(false)
+  const load = useCallback(async () => {
+    try {
+      const [l, f] = await Promise.all([fetch("/api/snapshots/live"), fetch("/api/clips/freshness")])
+      if (l.ok) setLive(await l.json())
+      if (f.ok) {
+        const next: Freshness = await f.json()
+        setFresh(next)
+        // A snapshot started here (or by the app) just finished.
+        if (wasRefreshing.current && !next.refreshing) onSnapshotTaken()
+        wasRefreshing.current = next.refreshing
+      }
+    } catch {
+      // Offline for a moment: keep the last values.
+    }
+  }, [onSnapshotTaken])
+  // Poll every 30 s, every 5 s while a snapshot is being taken; the first
+  // load is scheduled like the others rather than run inside the effect.
+  useEffect(() => {
+    const refreshing = fresh?.refreshing === true
+    const first = setTimeout(() => void load(), 0)
+    const timer = setInterval(() => {
+      if (!document.hidden) void load()
+    }, refreshing ? 5000 : 30000)
+    return () => {
+      clearTimeout(first)
+      clearInterval(timer)
+    }
+  }, [load, fresh?.refreshing])
+  async function snapshotNow() {
+    setNote(null)
+    try {
+      const response = await fetch("/api/clips/refresh", { method: "POST" })
+      const next: Freshness = await response.json()
+      setFresh(next)
+      wasRefreshing.current = next.refreshing
+      if (!next.refreshing)
+        setNote(next.next_refresh_ts && next.next_refresh_ts > next.server_ts
+          ? `A snapshot was taken recently; try again in ${formatAgo(next.next_refresh_ts - next.server_ts)}.`
+          : "Can't take a snapshot right now (an archive is running, a snapshot is already in progress, or space is low).")
+    } catch {
+      setNote("Couldn't reach the Pi. Try again.")
+    }
+  }
+  const now = live?.server_ts ?? fresh?.server_ts ?? 0
+  const carAge = live?.car_last_write_ts != null ? now - live.car_last_write_ts : null
+  const recording = carAge !== null && carAge <= RECORDING_WITHIN_SECS
+  const snapAge = fresh?.snapshot_ts != null ? now - fresh.snapshot_ts : null
+  const nextIn = live?.next_scheduled_ts != null ? live.next_scheduled_ts - now : null
+  const waitFor = fresh?.next_refresh_ts != null && fresh.next_refresh_ts > now ? fresh.next_refresh_ts - now : null
+  return (
+    <section aria-label="Live" className="glass-card flex flex-wrap items-center justify-between gap-3 border-l-2 border-l-red-400 px-4 py-3">
+      <div className="min-w-48 flex-1">
+        <p className="flex flex-wrap items-center gap-2 text-sm font-medium text-slate-200">
+          <span className={`${tagClass} ${recording ? "border-red-400/40 bg-red-500/15 text-red-300" : "border-white/10 bg-white/5 text-slate-400"}`}>
+            <span className={`h-1.5 w-1.5 rounded-full ${recording ? "animate-pulse bg-red-400" : "bg-slate-500"}`} />
+            {recording ? "Live · recording" : "Live · not recording"}
+          </span>
+          Footage not in a snapshot yet
+        </p>
+        <p className="mt-1 text-xs text-slate-400">
+          {carAge === null ? "Car's last write unknown" : `Car last wrote ${formatAgo(carAge)} ago`}
+          {snapAge !== null && ` · newest snapshot ${formatAgo(snapAge)} ago`}
+          {nextIn !== null && (nextIn > 0 ? ` · next scheduled in ${formatAgo(nextIn)}` : " · scheduled snapshot due now")}
+        </p>
+        {note && <p role="status" className="mt-1 text-xs text-amber-300">{note}</p>}
+      </div>
+      <button
+        className={buttonClass}
+        disabled={!fresh || fresh.refreshing || waitFor !== null}
+        onClick={() => void snapshotNow()}
+        title="Takes a snapshot now, the same way the scheduled ones are taken, so the clips recorded since the last one show up."
+      >
+        {fresh?.refreshing ? (
+          <><ProgressActivityIcon className="h-4 w-4 animate-spin" /> Taking snapshot…</>
+        ) : waitFor !== null ? (
+          `Snapshot now (in ${formatAgo(waitFor)})`
+        ) : (
+          "Snapshot now"
+        )}
+      </button>
+    </section>
+  )
+}
+
 /** How often the Snapshots page reloads itself while visible. */
 export const AUTO_REFRESH_MS = 60_000
 
@@ -189,6 +308,7 @@ export default function Snapshots() {
   // visible again. Never during a deletion or while its dialog is open; a
   // request already in flight is left alone (refresh() skips while one runs).
   const deletionOpen = deletion !== null
+  const onSnapshotTaken = useCallback(() => { void refresh(true) }, [refresh])
   useEffect(() => {
     if (deleting || deletionOpen) return
     const timer = setInterval(() => {
@@ -361,6 +481,7 @@ export default function Snapshots() {
         </p>
         <SelectMenu label="Sort snapshots" value={sort} onChange={value => { setHoverPreview(null); setFocusPreview(null); setSort(value) }} align="end" options={[{ value: "oldest", label: "Oldest first" }, { value: "newest", label: "Newest first" }]} />
       </div>
+      <LiveRow onSnapshotTaken={onSnapshotTaken} />
       {loading ? (
         <p role="status" className="p-8 text-slate-400">
           Loading snapshots…

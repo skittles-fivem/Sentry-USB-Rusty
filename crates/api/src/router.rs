@@ -63,6 +63,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/setup/preflight", post(crate::setup::preflight))
         // Snapshots
         .route("/api/snapshots", get(crate::snapshots::list_snapshots))
+        .route("/api/snapshots/live", get(crate::snapshots::get_live))
         .route("/api/snapshots/{id}", delete(crate::snapshots::delete_snapshot))
         // SHA-256 verification of archived clips, and auto-delete of
         // snapshots verified twice (both read by archiveloop each cycle).
