@@ -1962,16 +1962,30 @@ function archive_set_aside_remote () {
 # its video track is H.265/AV1 and the Pi's copy isn't. The codec is read from
 # the MP4 sample-entry tag (hvc1/hev1 for H.265, av01 for AV1) in the first and
 # last MiB of the file, where the moov box lives (Tesla writes it last,
-# re-encoders usually first), so a check never reads a whole clip. grep -c
-# (not -q) reads all of that input: -q would stop at the first match and
-# break the pipe under head/tail, which pipefail would report as failure.
-ARCHIVE_REENCODED_TAGS='hvc1|hev1|av01'
+# re-encoders usually first), so a check never reads a whole clip.
+#
+# The tag is matched where the MP4 structure puts it: an `stsd` box name,
+# then 12 bytes (version/flags, entry count, the entry's size), then the
+# entry's format. Matching the four letters anywhere was not enough: in 2 MiB
+# of ordinary H.264 data "hvc1"/"hev1"/"av01" turn up by chance about once
+# in 700 clips, which would have marked a good upload as re-encoded. The
+# bytes are compared as an od hex dump (one space-separated pair per byte,
+# so a match can't straddle two bytes), since grep can't safely match raw
+# binary across NUL and newline bytes. grep -c (not -q) reads all of its
+# input: -q would stop at the first match and break the pipe, which
+# pipefail would report as failure.
+ARCHIVE_REENCODED_SAMPLE_ENTRY=' 73 74 73 64( [0-9a-f]{2}){12} (68 76 63 31|68 65 76 31|61 76 30 31)'
+
+# True if the MP4 bytes on stdin hold an H.265/AV1 video sample entry.
+function archive_stream_is_reencoded () {
+  od -An -v -tx1 | tr -d '\n' | grep -c -E "$ARCHIVE_REENCODED_SAMPLE_ENTRY" >/dev/null
+}
 
 # True if the local file $1 is already H.265/AV1.
 function archive_local_is_reencoded () {
   [ -f "$1" ] || return 1
   { head -c 1048576 -- "$1"; tail -c 1048576 -- "$1"; } 2>/dev/null |
-    grep -a -c -E "$ARCHIVE_REENCODED_TAGS" >/dev/null
+    archive_stream_is_reencoded
 }
 
 # True if the archive server's copy of relpath $1 is H.265/AV1.
@@ -1981,19 +1995,19 @@ function archive_remote_is_reencoded () {
     cifs|nfs)
       # shellcheck disable=SC2016 # $1 is expanded by the inner bash
       timeout 120 bash -c '{ head -c 1048576 -- "$1"; tail -c 1048576 -- "$1"; } 2>/dev/null' _ "$ARCHIVE_MOUNT/$rel" |
-        grep -a -c -E "$ARCHIVE_REENCODED_TAGS" >/dev/null ;;
+        archive_stream_is_reencoded ;;
     rsync)
       local -a ssh_cmd
       archive_ssh_command
       local remote
       remote="cd $(printf %q "$RSYNC_PATH") && { head -c 1048576 -- $(printf %q "$rel"); tail -c 1048576 -- $(printf %q "$rel"); } 2>/dev/null"
       timeout 120 "${ssh_cmd[@]}" "$RSYNC_USER@$RSYNC_SERVER" "$remote" |
-        grep -a -c -E "$ARCHIVE_REENCODED_TAGS" >/dev/null ;;
+        archive_stream_is_reencoded ;;
     rclone)
       local -a rc_cmd=(rclone --config /root/.config/rclone/rclone.conf cat)
       { timeout 120 "${rc_cmd[@]}" --head 1048576 "$RCLONE_DRIVE:$RCLONE_PATH/$rel"
         timeout 120 "${rc_cmd[@]}" --tail 1048576 "$RCLONE_DRIVE:$RCLONE_PATH/$rel"; } 2>/dev/null |
-        grep -a -c -E "$ARCHIVE_REENCODED_TAGS" >/dev/null ;;
+        archive_stream_is_reencoded ;;
     *) return 1 ;;
   esac
 }

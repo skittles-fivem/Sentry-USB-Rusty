@@ -17,7 +17,7 @@ extract() {
 for fn in sortfile prunefile archive_conf_value archive_verify_enabled archive_auto_delete_enabled \
   record_archive_link_targets queue_archived_for_verification archive_ssh_command \
   archive_remote_sha256 archive_set_aside_remote verify_archive_batch prune_archive_verify_ledger \
-  archive_local_is_reencoded archive_remote_is_reencoded archive_manager_original_sums archive_manager_record_present \
+  archive_stream_is_reencoded archive_local_is_reencoded archive_remote_is_reencoded archive_manager_original_sums archive_manager_record_present \
   queue_unverified_archived queue_archive_rechecks snapshot_verified_twice auto_delete_verified_snapshots verify_archived_clips \
   json_string json_int json_bool build_share_status_json plan_share_transfer record_archive_throughput \
   write_share_status
@@ -55,7 +55,9 @@ export ARCHIVE_RECENTCLIPS=true
 ARCHIVE_VERIFY_QUEUE="$workdir/mutable/archive_verify_pending"
 ARCHIVE_VERIFY_LEDGER="$workdir/mutable/archive_verified.tsv"
 ARCHIVE_VERIFY_WORK="$workdir/work"
-ARCHIVE_REENCODED_TAGS='hvc1|hev1|av01'
+ARCHIVE_REENCODED_SAMPLE_ENTRY=' 73 74 73 64( [0-9a-f]{2}){12} (68 76 63 31|68 65 76 31|61 76 30 31)'
+# An MP4 stsd box whose one sample entry is $1 (hvc1, avc1, ...).
+stsd_entry() { printf 'stsd\000\000\000\000\000\000\000\001\000\000\000\126%s' "$1"; }
 ARCHIVE_MANAGER_CHECKSUMS=.sentrymanager/original-checksums.sha256
 export ARCHIVE_VERIFY_ABSENT_RECHECK_SECONDS=0
 # The "missing" re-check pauses with sleep; a test can hook that pause to
@@ -97,6 +99,15 @@ cp "$list" "$workdir/mutable/sentry_files_archived"
 # "Archive" them: copy through the links into the share, like rsync -RL.
 (cd "$lower" && while IFS= read -r f; do mkdir -p "$workdir/share/${f%/*}"; cp -L "$f" "$workdir/share/$f"; done < "$list")
 
+# Damage a file: change byte 10 to a different value. (Writing a fixed byte
+# left the file unchanged whenever the random data already had it there,
+# about 1 run in 256.)
+corrupt_byte() {
+  local b
+  b=$(od -An -tu1 -j10 -N1 "$1" | tr -d ' ')
+  printf "\\$(printf %03o $(( (b + 1) % 256 )))" | dd of="$1" bs=1 seek=10 conv=notrunc status=none
+}
+
 # --- link targets are recorded and queued -------------------------------------
 record_archive_link_targets "$lower" "$list" "$workdir/targets"
 [ "$(wc -l < "$workdir/targets")" = 3 ] || fail "expected 3 link targets, got: $(cat "$workdir/targets")"
@@ -105,7 +116,7 @@ grep -q $'\t'"$snaps/snap-000001/mnt/TeslaCam/RecentClips/2026-11-07_10-00-00-fr
   fail "queue does not point at the snapshot copy"
 
 # --- a damaged and a missing server copy --------------------------------------
-printf 'X' | dd of="$workdir/share/RecentClips/2026-11-07/2026-11-07_10-01-00-front.mp4" bs=1 seek=10 conv=notrunc status=none
+corrupt_byte "$workdir/share/RecentClips/2026-11-07/2026-11-07_10-01-00-front.mp4"
 rm "$workdir/share/RecentClips/2026-11-07/2026-11-07_11-00-00-front.mp4"
 
 verify_archived_clips || fail "first verification pass reported failure: $logs"
@@ -140,7 +151,7 @@ echo 'export ARCHIVE_AUTO_DELETE_VERIFIED=true ARCHIVE_VERIFY_RECHECK_SECONDS=0'
 # The newest snapshot is never released, even fully verified. Damage the
 # server copy of snap-000002's clip AFTER its first check: the second check
 # must catch it.
-printf 'X' | dd of="$workdir/share/RecentClips/2026-11-07/2026-11-07_11-00-00-front.mp4" bs=1 seek=10 conv=notrunc status=none
+corrupt_byte "$workdir/share/RecentClips/2026-11-07/2026-11-07_11-00-00-front.mp4"
 logs=""
 : > "$workdir/log"
 verify_archived_clips
@@ -189,7 +200,7 @@ grep -q "previously archived" "$workdir/log" && fail "backlog clip queued twice:
 # toward auto-delete.
 conv_rel=RecentClips/2026-11-07/2026-11-07_13-00-00-front.mp4
 echo 'export ARCHIVE_AUTO_DELETE_VERIFIED=true ARCHIVE_VERIFY_RECHECK_SECONDS=0' > "$workdir/sentryusb.conf"
-{ head -c 4000 /dev/urandom; printf 'stsd....hvc1....'; head -c 4000 /dev/urandom; } > "$workdir/share/$conv_rel"
+{ head -c 4000 /dev/urandom; stsd_entry hvc1; head -c 4000 /dev/urandom; } > "$workdir/share/$conv_rel"
 : > "$workdir/log"
 verify_archived_clips
 [ "$(status_of "$conv_rel")" = converted/2 ] || fail "re-encoded copy should be converted/2, got $(status_of "$conv_rel"): $(cat "$workdir/log")"
@@ -216,7 +227,7 @@ new_reencoded() {
   local name="2026-11-07_$1-00-00-front.mp4" rel="RecentClips/2026-11-07/2026-11-07_$1-00-00-front.mp4"
   make_snap "snap-0000$1" "$name"
   ln -s "$snaps/snap-0000$1/mnt/TeslaCam/RecentClips/$name" "$lower/$rel"
-  { head -c 4000 /dev/urandom; printf 'stsd....hvc1....'; } > "$workdir/share/$rel"
+  { head -c 4000 /dev/urandom; stsd_entry hvc1; } > "$workdir/share/$rel"
   echo "$rel" >> "$workdir/mutable/sentry_files_archived"
 }
 pi_sum() { sha256sum < "$snaps/snap-0000$1/mnt/TeslaCam/RecentClips/2026-11-07_$1-00-00-front.mp4" | cut -c1-64; }
@@ -296,7 +307,7 @@ verify_archived_clips
 mc=RecentClips/2026-11-07/2026-11-07_21-00-00-front.mp4
 make_snap snap-000021 2026-11-07_21-00-00-front.mp4
 ln -s "$snaps/snap-000021/mnt/TeslaCam/RecentClips/2026-11-07_21-00-00-front.mp4" "$lower/$mc"
-{ head -c 4000 /dev/urandom; printf 'stsd....hvc1....'; } > "$workdir/share/$mc"
+{ head -c 4000 /dev/urandom; stsd_entry hvc1; } > "$workdir/share/$mc"
 echo "$mc" >> "$workdir/mutable/sentry_files_archived"
 # The Pi hashes a share copy with `timeout … sha256sum < file`, so watch
 # timeout: a sha256sum whose stdin is this clip's share copy is a download.
@@ -330,8 +341,15 @@ grep -q 18-00-00 "$workdir/mutable/sentry_files_archived" || fail "briefly absen
 grep -q "isn't on the archive server" "$workdir/log" && fail "briefly absent clip was reported missing"
 
 # A Pi copy that is itself H.265 proves nothing about a differing server copy.
-printf 'hvc1' >> "$snaps/snap-000004/mnt/TeslaCam/RecentClips/2026-11-07_14-00-00-front.mp4"
+stsd_entry hvc1 >> "$snaps/snap-000004/mnt/TeslaCam/RecentClips/2026-11-07_14-00-00-front.mp4"
 archive_local_is_reencoded "$snaps/snap-000004/mnt/TeslaCam/RecentClips/2026-11-07_14-00-00-front.mp4" || fail "local hvc1 not detected"
+# The four letters on their own, or an H.264 (avc1) entry, are not a re-encode.
+printf 'xxhvc1xxav01xxhev1xx' > "$workdir/loose.mp4"
+archive_local_is_reencoded "$workdir/loose.mp4" && fail "loose hvc1/av01 bytes taken for a re-encode"
+stsd_entry avc1 > "$workdir/h264.mp4"
+archive_local_is_reencoded "$workdir/h264.mp4" && fail "an avc1 (H.264) sample entry taken for a re-encode"
+stsd_entry av01 > "$workdir/av1.mp4"
+archive_local_is_reencoded "$workdir/av1.mp4" || fail "an av01 sample entry not detected"
 
 # --- verification off: queue is dropped, nothing runs ----------------------
 echo 'export ARCHIVE_VERIFY=false' > "$workdir/sentryusb.conf"
