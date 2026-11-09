@@ -24,10 +24,24 @@ export interface ManagedStorageHealth {
   cleanup_sampled_at?: number | null
 }
 
+export interface DiskIo {
+  /** Kernel block device name, e.g. "mmcblk0p3". */
+  device: string
+  /** Bytes per second (not bits). */
+  read_bps: number
+  write_bps: number
+  /** Share of wall time with I/O in flight, 0–100. */
+  busy_percent: number
+  read_total_bytes: number
+  write_total_bytes: number
+}
+
 export interface PiStatus {
   cpu_temp: string
   /** CPU busy share across all cores since the previous status poll, 0–100; absent when unreadable. */
   cpu_percent?: number | null
+  /** Throughput of the device holding /backingfiles since the previous status poll; absent when unavailable. */
+  disk_io?: DiskIo | null
   num_snapshots: string
   snapshot_oldest: string
   snapshot_newest: string

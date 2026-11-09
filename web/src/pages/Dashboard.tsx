@@ -586,6 +586,41 @@ function getCpuUsageColor(percent: number): string | undefined {
   return undefined
 }
 
+/** Amber from 70% busy, red from 90%; plain below. */
+function getDiskBusyColor(percent: number): string | undefined {
+  if (percent >= 90) return "#f87171"
+  if (percent >= 70) return "#fbbf24"
+  return undefined
+}
+
+/** Disk rates are bytes/s (decimal units), unlike network rates in bits/s. */
+function formatDiskRate(bytesPerSec: number): string {
+  if (bytesPerSec >= 1_000_000_000) return `${(bytesPerSec / 1_000_000_000).toFixed(1)} GB/s`
+  if (bytesPerSec >= 1_000_000) return `${(bytesPerSec / 1_000_000).toFixed(1)} MB/s`
+  if (bytesPerSec >= 1_000) return `${Math.round(bytesPerSec / 1_000)} KB/s`
+  return bytesPerSec > 0 ? "< 1 KB/s" : "0 MB/s"
+}
+
+function StorageActivity({ io }: { io: NonNullable<PiStatus["disk_io"]> }) {
+  const busy = Number.isFinite(io.busy_percent) ? io.busy_percent : 0
+  const totals = `Since boot: ${formatBytes(io.read_total_bytes)} read, ${formatBytes(io.write_total_bytes)} written`
+  return (
+    <div title={`${io.device} · ${totals}`} aria-label="Storage activity">
+      <Row
+        icon={<HardDriveIcon className="h-3.5 w-3.5" />}
+        label="Storage"
+        value={`${Math.round(busy)}% busy`}
+        valueColor={getDiskBusyColor(busy)}
+      />
+      <div className="flex flex-wrap gap-x-4 gap-y-1 py-1 text-xs tabular-nums">
+        <span className="text-emerald-400">↓ {formatDiskRate(io.read_bps)} read</span>
+        <span className="text-sky-400">↑ {formatDiskRate(io.write_bps)} write</span>
+        <span className="text-slate-500">{io.device}</span>
+      </div>
+    </div>
+  )
+}
+
 function SystemTile({
   status,
   uptime,
@@ -625,6 +660,7 @@ function SystemTile({
           valueColor={getCpuUsageColor(cpuPercent)}
         />
       )}
+      {status.disk_io && <StorageActivity io={status.disk_io} />}
       {status.fan_speed && (
         <Row
           icon={<AirIcon className="h-3.5 w-3.5" />}
