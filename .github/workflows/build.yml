@@ -9,7 +9,19 @@ on:
   workflow_dispatch:
     inputs:
       release_version:
-        description: 'Version embedded in unpublished release artifacts (for example v3.24.8)'
+        description: 'Version embedded in the release artifacts (for example v3.24.8)'
+        required: false
+        type: string
+      # A manual run can also publish: it creates the tag (at the commit the
+      # run built) and the GitHub release, as a tag push would. For sessions
+      # that can push branches but not tags.
+      publish:
+        description: 'Publish: create the tag release_version at this commit and the GitHub release'
+        required: false
+        type: boolean
+        default: false
+      release_notes:
+        description: 'Release notes for a published run (Markdown, optional)'
         required: false
         type: string
 
@@ -439,6 +451,10 @@ jobs:
     runs-on: ubuntu-22.04
     permissions:
       contents: write
+    env:
+      # Publish on a v* tag push, or on a manual run with publish on.
+      PUBLISH: ${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
+      RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || inputs.release_version }}
     steps:
       - uses: actions/checkout@v7
 
@@ -456,14 +472,34 @@ jobs:
       - name: List release files
         run: ls -lh release/
 
+      # A manual publish names its tag in release_version. It must look like a
+      # version, and if the tag already exists it must be at this commit: a
+      # manual run never moves a tag or adds files to another commit's release.
+      - name: Check the tag for a manual publish
+        if: env.PUBLISH == 'true' && github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::release_version '$RELEASE_TAG' isn't a version like v3.28.10 or v3.28.10-test.12"
+            exit 1
+          fi
+          if at=$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$RELEASE_TAG" --jq .sha 2>/dev/null); then
+            if [ "$at" != "$GITHUB_SHA" ]; then
+              echo "::error::tag $RELEASE_TAG already exists at $at, not at this run's commit $GITHUB_SHA"
+              exit 1
+            fi
+          fi
+          echo "Publishing $RELEASE_TAG at $GITHUB_SHA"
+
       # Preserve an existing manual pre-release flag; abort unexpected gh errors.
       - name: Read existing pre-release flag
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: env.PUBLISH == 'true'
         id: relmeta
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if pre=$(gh release view "$GITHUB_REF_NAME" --json isPrerelease --jq .isPrerelease 2>err.txt); then
+          if pre=$(gh release view "$RELEASE_TAG" --json isPrerelease --jq .isPrerelease 2>err.txt); then
             echo "prerelease=$pre" >> "$GITHUB_OUTPUT"
           elif grep -qi "not found" err.txt; then
             echo "prerelease=" >> "$GITHUB_OUTPUT"
@@ -473,11 +509,15 @@ jobs:
           fi
 
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: env.PUBLISH == 'true'
         uses: softprops/action-gh-release@v3
         with:
+          # On a manual publish the action creates the tag at this commit.
+          tag_name: ${{ env.RELEASE_TAG }}
+          target_commitish: ${{ github.sha }}
+          body: ${{ github.event_name == 'workflow_dispatch' && inputs.release_notes || '' }}
           files: release/*
           # Release notes are written by hand for end users; generated notes would be appended to them.
           generate_release_notes: false
           # Respect tag convention, the nominated tag, or an existing manual flag.
-          prerelease: ${{ contains(github.ref_name, '-') || vars.SENTRYUSB_PRERELEASE_TAG == github.ref_name || steps.relmeta.outputs.prerelease == 'true' }}
+          prerelease: ${{ contains(env.RELEASE_TAG, '-') || vars.SENTRYUSB_PRERELEASE_TAG == env.RELEASE_TAG || steps.relmeta.outputs.prerelease == 'true' }}
