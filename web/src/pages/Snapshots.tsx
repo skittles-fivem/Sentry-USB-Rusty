@@ -93,10 +93,25 @@ export function LiveRow({ onSnapshotTaken, reloadKey = 0 }: { onSnapshotTaken: (
   const [fresh, setFresh] = useState<Freshness | null>(null)
   const [note, setNote] = useState<string | null>(null)
   const wasRefreshing = useRef(false)
+  // Ages tick every second: the Pi's clock = this browser's clock + offset,
+  // measured at each fetch, so "Car last wrote 12 s ago" counts up live
+  // between polls without trusting the browser's clock to be set right.
+  const [clockOffset, setClockOffset] = useState(0)
+  const [localNow, setLocalNow] = useState(() => Date.now() / 1000)
+  useEffect(() => {
+    const ticker = setInterval(() => setLocalNow(Date.now() / 1000), 1000)
+    return () => clearInterval(ticker)
+  }, [])
   const load = useCallback(async () => {
     try {
       const [l, f] = await Promise.all([fetch("/api/snapshots/live"), fetch("/api/clips/freshness")])
-      if (l.ok) setLive(await l.json())
+      if (l.ok) {
+        const next: LiveStatus = await l.json()
+        setLive(next)
+        const at = Date.now() / 1000
+        setClockOffset(next.server_ts - at)
+        setLocalNow(at)
+      }
       if (f.ok) {
         const next: Freshness = await f.json()
         setFresh(next)
@@ -114,14 +129,14 @@ export function LiveRow({ onSnapshotTaken, reloadKey = 0 }: { onSnapshotTaken: (
     const now = setTimeout(() => void load(), 0)
     return () => clearTimeout(now)
   }, [reloadKey, load])
-  // Poll every 30 s, every 5 s while a snapshot is being taken; the first
+  // Poll every 10 s, every 5 s while a snapshot is being taken; the first
   // load is scheduled like the others rather than run inside the effect.
   useEffect(() => {
     const refreshing = fresh?.refreshing === true
     const first = setTimeout(() => void load(), 0)
     const timer = setInterval(() => {
       if (!document.hidden) void load()
-    }, refreshing ? 5000 : 30000)
+    }, refreshing ? 5000 : 10000)
     return () => {
       clearTimeout(first)
       clearInterval(timer)
@@ -142,7 +157,7 @@ export function LiveRow({ onSnapshotTaken, reloadKey = 0 }: { onSnapshotTaken: (
       setNote("Couldn't reach the Pi. Try again.")
     }
   }
-  const now = live?.server_ts ?? fresh?.server_ts ?? 0
+  const now = live ? localNow + clockOffset : fresh?.server_ts ?? 0
   const carAge = live?.car_last_write_ts != null ? now - live.car_last_write_ts : null
   const recording = carAge !== null && carAge <= RECORDING_WITHIN_SECS
   const snapAge = fresh?.snapshot_ts != null ? now - fresh.snapshot_ts : null
@@ -183,6 +198,47 @@ export function LiveRow({ onSnapshotTaken, reloadKey = 0 }: { onSnapshotTaken: (
   )
 }
 
+/** The archive check's progress (GET /api/snapshots → verification). */
+export interface VerifyProgress {
+  running: boolean
+  checked: number
+  total: number
+  stopped: string | null
+  queued: number
+}
+
+/** One line under the Live row: is the archive check running now, and if
+ *  not, what's waiting and when it happens. */
+export function VerifyBanner({ progress }: { progress: VerifyProgress | null }) {
+  if (!progress || (!progress.running && progress.queued === 0)) return null
+  const pct = progress.total ? Math.round((progress.checked / progress.total) * 100) : 0
+  return (
+    <div aria-label="Archive check" className="glass-card space-y-2 px-4 py-3 text-xs text-slate-300">
+      {progress.running ? (
+        <>
+          <p className="flex items-center gap-2">
+            <ProgressActivityIcon className="h-3.5 w-3.5 animate-spin text-sky-300" />
+            Checking the archive now: {progress.checked.toLocaleString()} of {progress.total.toLocaleString()} clips in
+            this pass
+          </p>
+          <div className="h-1.5 overflow-hidden rounded-full bg-white/10" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={pct}>
+            <div className="h-full bg-sky-400" style={{ width: `${pct}%` }} />
+          </div>
+        </>
+      ) : (
+        <p>
+          {progress.queued.toLocaleString()} clip{progress.queued === 1 ? "" : "s"} waiting to be checked. Checking runs at
+          home, after each archive and while the car stays parked.
+          {progress.stopped ? ` The last pass stopped early: ${progress.stopped}.` : ""}
+        </p>
+      )}
+      <p className="text-slate-500">
+        Snapshots share most of their clips, so several snapshots move forward together as clips are checked.
+      </p>
+    </div>
+  )
+}
+
 /** How often the Snapshots page reloads itself while visible. */
 export const AUTO_REFRESH_MS = 60_000
 
@@ -214,9 +270,12 @@ export function ArchiveTag({ archive }: { archive?: ArchiveCoverage | null }) {
     case "pending":
       return (
         <span className={`${tagClass} border-sky-400/30 bg-sky-400/10 text-sky-300`}
-          title={`Sent to the archive server; ${archive.pending} clip(s) waiting for their checksum check.${checked}`}>
+          title={`On the archive server; ${archive.verified} of ${archive.clips} clips checked so far, ${archive.pending} waiting. Consecutive snapshots share most of their clips (each one is a full copy of the car's drive), so checking a clip moves every snapshot that holds it forward together.${checked}`}>
           <ScheduleIcon className="h-3 w-3" />
-          Sent · verifying
+          Verifying {archive.verified} / {archive.clips}
+          <span className="ml-1 inline-block h-1 w-10 overflow-hidden rounded-full bg-sky-400/20" aria-hidden="true">
+            <span className="block h-full bg-sky-300" style={{ width: `${archive.clips ? Math.round((archive.verified / archive.clips) * 100) : 0}%` }} />
+          </span>
         </span>
       )
     case "failed":
@@ -261,6 +320,7 @@ export default function Snapshots() {
   const [confirmWord, setConfirmWord] = useState("")
   // Bumped by the Refresh button so the Live row reloads too.
   const [liveReload, setLiveReload] = useState(0)
+  const [verification, setVerification] = useState<VerifyProgress | null>(null)
   const [completed, setCompleted] = useState(0)
   const inFlight = useRef(false)
   const requestId = useRef(0)
@@ -284,6 +344,7 @@ export default function Snapshots() {
       setSnapshots(data.snapshots ?? [])
       setAllocated(data.total_allocated_bytes ?? 0)
       setPending(data.sizes_pending === true)
+      setVerification(data.verification ?? null)
       if (spaceResponse.ok) {
         const space = await spaceResponse.json()
         if (!controller.signal.aborted && id === requestId.current) setFree(space)
@@ -316,12 +377,14 @@ export default function Snapshots() {
   // visible again. Never during a deletion or while its dialog is open; a
   // request already in flight is left alone (refresh() skips while one runs).
   const deletionOpen = deletion !== null
+  // While an archive check runs, refresh every 10 s so the tags move with it.
+  const checking = verification?.running === true
   const onSnapshotTaken = useCallback(() => { void refresh(true) }, [refresh])
   useEffect(() => {
     if (deleting || deletionOpen) return
     const timer = setInterval(() => {
       if (!document.hidden) void refresh()
-    }, AUTO_REFRESH_MS)
+    }, checking ? 10_000 : AUTO_REFRESH_MS)
     const onVisible = () => {
       if (!document.hidden) void refresh()
     }
@@ -330,7 +393,7 @@ export default function Snapshots() {
       clearInterval(timer)
       document.removeEventListener("visibilitychange", onVisible)
     }
-  }, [deleting, deletionOpen, refresh])
+  }, [deleting, deletionOpen, refresh, checking])
   const oldest = useMemo(
     () =>
       // Equal timestamps retain API order: its cumulative estimates use that prefix.
@@ -491,6 +554,7 @@ export default function Snapshots() {
         <SelectMenu label="Sort snapshots" value={sort} onChange={value => { setHoverPreview(null); setFocusPreview(null); setSort(value) }} align="end" options={[{ value: "oldest", label: "Oldest first" }, { value: "newest", label: "Newest first" }]} />
       </div>
       <LiveRow onSnapshotTaken={onSnapshotTaken} reloadKey={liveReload} />
+      <VerifyBanner progress={verification} />
       {loading ? (
         <p role="status" className="p-8 text-slate-400">
           Loading snapshots…

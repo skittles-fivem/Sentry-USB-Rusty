@@ -2720,6 +2720,22 @@ function queue_unverified_archived () {
   rm -rf "$work"
 }
 
+# Live progress of the current verification pass, for the Snapshots page:
+# {"running": bool, "checked": N, "total": N, "stopped": "<reason>"|null,
+#  "updated_unix": N}. Written atomically after each batch of 50 and at the
+# end of a pass. Best effort.
+ARCHIVE_VERIFY_PROGRESS=/tmp/archive-verify-progress.json
+
+function archive_verify_progress () {
+  local running=$1 checked=$2 total=$3 stopped=$4 reason=null
+  [ -z "$stopped" ] || reason=$(json_string "$stopped")
+  printf '{"running": %s, "checked": %s, "total": %s, "stopped": %s, "updated_unix": %s}\n' \
+    "$running" "$(json_int "$checked")" "$(json_int "$total")" "$reason" "$(date +%s)" \
+    > "$ARCHIVE_VERIFY_PROGRESS.new" 2>/dev/null &&
+    mv -f "$ARCHIVE_VERIFY_PROGRESS.new" "$ARCHIVE_VERIFY_PROGRESS" 2>/dev/null
+  return 0
+}
+
 # Verify queued archived clips against the archive server, then (if turned
 # on) release snapshots verified twice. Runs with the archive connected and
 # the car's USB drive already back online.
@@ -2761,6 +2777,7 @@ function verify_archived_clips () {
   local total
   total=$(wc -l < "$ARCHIVE_VERIFY_WORK/queue")
   log "Verifying $total archived file(s) against the archive server (SHA-256)"
+  archive_verify_progress true 0 "$total" ""
 
   local max
   max=$(archive_conf_value ARCHIVE_VERIFY_MAX_SECONDS)
@@ -2780,6 +2797,7 @@ function verify_archived_clips () {
       break
     fi
     rm -f "$batch"
+    archive_verify_progress true "$(wc -l < "$ARCHIVE_VERIFY_WORK/results-all")" "$total" ""
   done
 
   # Whatever wasn't checked, or is waiting for Manager's line, stays queued.
@@ -2802,6 +2820,7 @@ function verify_archived_clips () {
   [ ! -s "$ARCHIVE_VERIFY_QUEUE" ] || left=$(wc -l < "$ARCHIVE_VERIFY_QUEUE")
   log "Archive verification: $ok matched, $quickok matched by quick check, $converted re-encoded on the server by Sentry Manager, $bad to re-send, $nosource with no Pi copy left to compare, $left still queued ($waiting waiting for Sentry Manager's checksum)${stopped:+ ($stopped)}"
   ARCHIVE_VERIFY_WAITING=$waiting
+  archive_verify_progress false "$(wc -l < "$ARCHIVE_VERIFY_WORK/results-all")" "$total" "$stopped"
   ARCHIVE_VERIFY_RAN=1
   ARCHIVE_VERIFY_MATCHED=$((ok + quickok))
   ARCHIVE_VERIFY_CONVERTED=$converted

@@ -293,8 +293,19 @@ pub async fn list_snapshots(
         }
     }
 
+    let verification = tokio::task::spawn_blocking(|| {
+        verify_progress(
+            std::path::Path::new(VERIFY_PROGRESS_FILE),
+            std::path::Path::new(crate::archive_verify::QUEUE),
+            now_secs() as i64,
+        )
+    })
+    .await
+    .ok();
+
     (StatusCode::OK, Json(serde_json::json!({
         "snapshots": entries,
+        "verification": verification,
         "total_allocated_bytes": total_allocated_bytes,
         // Distinguish an active measurement from unavailable data.
         "sizes_computed_at": computed_at,
@@ -346,6 +357,45 @@ pub async fn delete_snapshot(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("Failed to delete snapshot: {}", e),
         ),
+    }
+}
+
+/// Written by archiveloop during a verification pass.
+const VERIFY_PROGRESS_FILE: &str = "/tmp/archive-verify-progress.json";
+
+/// The archive check's progress, for the Snapshots page.
+#[derive(serde::Serialize, Debug, PartialEq, Eq)]
+pub struct VerifyProgress {
+    /// A pass is running now (its progress was updated in the last 15 min).
+    running: bool,
+    /// Clips checked so far in the current (or last) pass, of `total`.
+    checked: u64,
+    total: u64,
+    /// Why the last pass stopped early, if it did.
+    stopped: Option<String>,
+    /// Clips waiting in the queue overall (including ones waiting for Sentry
+    /// Manager's checksum), not just this pass.
+    queued: u64,
+}
+
+fn verify_progress(progress_file: &std::path::Path, queue_file: &std::path::Path, now: i64) -> VerifyProgress {
+    let v: serde_json::Value = std::fs::read_to_string(progress_file)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let updated = v.get("updated_unix").and_then(|x| x.as_i64()).unwrap_or(0);
+    // A "running" pass that hasn't reported for 15 minutes died with the
+    // loop (or the Pi restarted): don't claim it's still running.
+    let running = v.get("running").and_then(|x| x.as_bool()).unwrap_or(false) && now - updated < 900;
+    let queued = std::fs::read_to_string(queue_file)
+        .map(|t| t.lines().filter(|l| !l.trim().is_empty()).count() as u64)
+        .unwrap_or(0);
+    VerifyProgress {
+        running,
+        checked: v.get("checked").and_then(|x| x.as_u64()).unwrap_or(0),
+        total: v.get("total").and_then(|x| x.as_u64()).unwrap_or(0),
+        stopped: v.get("stopped").and_then(|x| x.as_str()).map(String::from),
+        queued,
     }
 }
 
@@ -439,6 +489,28 @@ mod live_tests {
         let gone = d.path().join("missing");
         assert_eq!(live_status(&gone, &gone, now), LiveStatus {
             car_last_write_ts: None, next_scheduled_ts: None, server_ts: now,
+        });
+    }
+
+    #[test]
+    fn verify_progress_reports_a_running_pass_and_the_queue() {
+        let d = tempfile::tempdir().unwrap();
+        let prog = d.path().join("p.json");
+        let queue = d.path().join("q");
+        std::fs::write(&queue, "a\tx\nb\tx\n\nc\tx\n").unwrap();
+        std::fs::write(&prog, r#"{"running": true, "checked": 150, "total": 400, "stopped": null, "updated_unix": 1000}"#).unwrap();
+        assert_eq!(verify_progress(&prog, &queue, 1060), VerifyProgress {
+            running: true, checked: 150, total: 400, stopped: None, queued: 3,
+        });
+        // No update for 15 minutes: not running any more.
+        assert!(!verify_progress(&prog, &queue, 1000 + 900).running);
+        std::fs::write(&prog, r#"{"running": false, "checked": 50, "total": 400, "stopped": "archive server unreachable", "updated_unix": 1000}"#).unwrap();
+        let p = verify_progress(&prog, &queue, 1010);
+        assert_eq!((p.running, p.stopped.as_deref()), (false, Some("archive server unreachable")));
+        // Nothing written yet: idle, empty.
+        let gone = d.path().join("missing");
+        assert_eq!(verify_progress(&gone, &gone, 1000), VerifyProgress {
+            running: false, checked: 0, total: 0, stopped: None, queued: 0,
         });
     }
 }

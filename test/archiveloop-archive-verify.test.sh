@@ -18,7 +18,7 @@ for fn in sortfile prunefile archive_conf_value archive_verify_enabled archive_a
   record_archive_link_targets queue_archived_for_verification archive_ssh_command \
   archive_remote_sha256 archive_set_aside_remote verify_archive_batch prune_archive_verify_ledger \
   archive_quick_fingerprint archive_remote_quick_fingerprint archive_quick_result archive_verify_quick_mode \
-  archive_cached_local_sum precompute_local_hashes archive_local_quick_fingerprint \
+  archive_cached_local_sum precompute_local_hashes archive_local_quick_fingerprint archive_verify_progress \
   archive_stream_is_reencoded archive_local_is_reencoded archive_remote_is_reencoded archive_manager_original_sums archive_manager_record_present \
   queue_unverified_archived queue_archive_rechecks snapshot_verified_twice auto_delete_verified_snapshots verify_archived_clips \
   json_string json_int json_bool build_share_status_json plan_share_transfer record_archive_throughput \
@@ -64,6 +64,7 @@ ARCHIVE_MANAGER_CHECKSUMS=.sentrymanager/original-checksums.sha256
 export ARCHIVE_VERIFY_ABSENT_RECHECK_SECONDS=0
 ARCHIVE_QUICK_WHOLE_BELOW=2097152
 ARCHIVE_LOCAL_SUMS="$workdir/mutable/archive_local_sums.tsv"
+ARCHIVE_VERIFY_PROGRESS="$workdir/progress.json"
 ARCHIVE_CONTROL_DIR="$workdir/ctl"; mkdir -p "$ARCHIVE_CONTROL_DIR"
 # The "missing" re-check pauses with sleep; a test can hook that pause to
 # simulate the share changing in between.
@@ -440,6 +441,11 @@ rm -rf "$snaps/snap-000030"
 precompute_local_hashes
 grep -q "snap-000030" "$ARCHIVE_LOCAL_SUMS" && fail "lines for a released snapshot kept"
 echo 'export ARCHIVE_AUTO_DELETE_VERIFIED=true' > "$workdir/sentryusb.conf"
+
+# --- progress file: written during and after a pass -------------------------
+prog=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["running"], d["checked"], d["total"], d["stopped"])' "$ARCHIVE_VERIFY_PROGRESS") ||
+  fail "progress file missing or not JSON"
+[ "${prog%% *}" = False ] || fail "progress should say not running after a pass: $prog"
 
 # --- verification off: queue is dropped, nothing runs ----------------------
 echo 'export ARCHIVE_VERIFY=false' > "$workdir/sentryusb.conf"

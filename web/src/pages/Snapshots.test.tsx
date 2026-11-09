@@ -353,6 +353,44 @@ test("archive tags show verification state and the delete dialog warns about unv
   }
 })
 
+test("verification progress: tags count up and the banner says whether a check is running", async () => {
+  const win = new Window({ url: "http://localhost/snapshots" })
+  const values = { window: win, document: win.document, navigator: win.navigator, IS_REACT_ACT_ENVIRONMENT: true }
+  const originals = Object.keys(values).map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)] as const)
+  for (const [key, value] of Object.entries(values)) Object.defineProperty(globalThis, key, { configurable: true, value })
+  const oldFetch = globalThis.fetch
+  let verification: object = { running: true, checked: 150, total: 400, stopped: null, queued: 250 }
+  globalThis.fetch = async input => String(input).includes("free-space") ? Response.json({ mounted: false }) : Response.json({
+    verification,
+    snapshots: [{ id: "snap-1", created_unix: 100, older_count: 0, cumulative_reclaim_bytes: 1024, archive: {
+      state: "pending", clips: 794, verified: 412, verified_twice: 0, pending: 382, failed: 0, not_archived: 0,
+      ready_to_delete: false, last_checked_unix: null } }],
+  })
+  const { createRoot } = await import("react-dom/client")
+  const container = win.document.createElement("div"); win.document.body.append(container)
+  const root = createRoot(container)
+  try {
+    await act(async () => root.render(createElement(Snapshots)))
+    assert.match(container.querySelector('[data-snapshot-id="snap-1"]')!.textContent, /Verifying 412 \/ 794/)
+    assert.doesNotMatch(container.textContent, /Sent · verifying/)
+    const banner = () => container.querySelector('[aria-label="Archive check"]')?.textContent ?? ""
+    assert.match(banner(), /Checking the archive now: 150 of 400 clips in\s+this pass/)
+    // Not running, but clips queued: says what's waiting and when it happens.
+    verification = { running: false, checked: 400, total: 400, stopped: "archive server unreachable", queued: 30 }
+    await act(async () => [...container.querySelectorAll("button")].find(b => b.textContent === "Refresh")!.click())
+    assert.match(banner(), /30 clips waiting to be checked/)
+    assert.match(banner(), /stopped early: archive server unreachable/)
+    // Nothing queued and nothing running: no banner.
+    verification = { running: false, checked: 0, total: 0, stopped: null, queued: 0 }
+    await act(async () => [...container.querySelectorAll("button")].find(b => b.textContent === "Refresh")!.click())
+    assert.equal(container.querySelector('[aria-label="Archive check"]'), null)
+  } finally {
+    await act(async () => root.unmount()); globalThis.fetch = oldFetch
+    for (const [key, descriptor] of originals) { if (descriptor) Object.defineProperty(globalThis, key, descriptor); else Reflect.deleteProperty(globalThis, key) }
+    win.close()
+  }
+})
+
 test("the list refreshes itself when the page becomes visible, but not with the delete dialog open", async () => {
   const win = new Window({ url: "http://localhost/snapshots" })
   const values = { window: win, document: win.document, navigator: win.navigator, IS_REACT_ACT_ENVIRONMENT: true }
@@ -411,6 +449,15 @@ test("the Live row shows whether the car is recording, the schedule, and takes a
     await act(async () => { await new Promise(r => setTimeout(r, 0)) })
     assert.match(liveText(), /Live · recording/)
     assert.match(liveText(), /Car last wrote 12 s ago · newest snapshot 23 min ago · next scheduled in 35 min/)
+    // The car's last-write age ticks every second between polls.
+    const realNow = Date.now
+    try {
+      Date.now = () => realNow() + 5000
+      await act(async () => { await new Promise(r => setTimeout(r, 1100)) })
+      assert.match(liveText(), /Car last wrote 1[78] s ago/, "the age didn't tick between polls")
+    } finally {
+      Date.now = realNow
+    }
     assert.equal(button().disabled, false)
     // Snapshot now: starts an on-demand snapshot and shows progress.
     freshAnswer = { ...freshAnswer, refreshing: true }
