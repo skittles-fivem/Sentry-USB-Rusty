@@ -29,8 +29,15 @@ fake_disconnect() { disconnects=$((disconnects + 1)); }
 archive_cycle_begin() { cycles=$((cycles + 1)); }
 archive_cycle_end() { [ "$cancel_after" = 0 ] || [ "$slices" -lt "$cancel_after" ]; }
 write_share_status() { status_writes=$((status_writes + 1)); }
+sleeps=0
+sleep() { sleeps=$((sleeps + 1)); }
+waiting_slices=0   # this many first slices find only clips waiting for Manager
 verify_archived_clips() {
   slices=$((slices + 1))
+  if [ "$slices" -le "$waiting_slices" ]; then
+    ARCHIVE_VERIFY_MATCHED=0 ARCHIVE_VERIFY_WAITING=$(wc -l < "$ARCHIVE_VERIFY_QUEUE")
+    return 0
+  fi
   local n
   n=$(wc -l < "$ARCHIVE_VERIFY_QUEUE")
   [ "$n" -le "$per_slice" ] || n=$per_slice
@@ -70,6 +77,24 @@ home_verify_backlog
 [ "$slices" = 1 ] || fail "spun on a slice with no progress ($slices slices)"
 grep -q "made no progress" "$LOG_FILE" || fail "no-progress stop not logged"
 per_slice=3
+
+# Only clips waiting for Sentry Manager's checksum: waits and tries again
+# (instead of giving up until the next trip home), then drains.
+reset 4
+waiting_slices=1 sleeps=0
+ARCHIVE_VERIFY_MANAGER_POLL_SECONDS=60
+home_verify_backlog
+[ ! -e "$ARCHIVE_VERIFY_QUEUE" ] || fail "didn't come back for the waiting clips"
+[ "$sleeps" = 2 ] || fail "expected two 30 s waits, got $sleeps"
+grep -q "Waiting for Sentry Manager's checksums for 4 file(s)" "$LOG_FILE" || fail "wait not logged: $(cat "$LOG_FILE")"
+# ...but leaves if the car does while waiting.
+reset 4
+waiting_slices=5 sleeps=0
+sleep() { sleeps=$((sleeps + 1)); reachable=false; }
+home_verify_backlog
+[ "$slices" = 1 ] || fail "kept going after the car left during the wait"
+reachable=true waiting_slices=0
+sleep() { sleeps=$((sleeps + 1)); }
 
 # Can't connect: stops, retries next cycle.
 reset 8

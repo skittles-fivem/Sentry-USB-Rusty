@@ -17,7 +17,7 @@ extract() {
 for fn in sortfile prunefile archive_conf_value archive_verify_enabled archive_auto_delete_enabled \
   record_archive_link_targets queue_archived_for_verification archive_ssh_command \
   archive_remote_sha256 archive_set_aside_remote verify_archive_batch prune_archive_verify_ledger \
-  archive_local_is_reencoded archive_remote_is_reencoded archive_manager_original_sums \
+  archive_local_is_reencoded archive_remote_is_reencoded archive_manager_original_sums archive_manager_record_present \
   queue_unverified_archived queue_archive_rechecks snapshot_verified_twice auto_delete_verified_snapshots verify_archived_clips \
   json_string json_int json_bool build_share_status_json plan_share_transfer record_archive_throughput \
   write_share_status
@@ -256,6 +256,39 @@ verify_archived_clips
 grep -q "re-encoded $r17 from a copy that doesn't match" "$workdir/log" || fail "bad-source re-encode not explained: $(cat "$workdir/log")"
 ls "$workdir/share/RecentClips/2026-11-07/" | grep -q '17-00-00-front.mp4.mismatch' || fail "bad-source re-encode not renamed aside"
 grep -q 17-00-00 "$workdir/mutable/sentry_files_archived" && fail "bad-source re-encode not queued for re-send"
+
+# --- Manager's record verifies without reading the clip back ----------------
+# The record now exists. A clip with a matching line is verified from it:
+# the share copy is removed here to prove nothing is read back.
+mr=RecentClips/2026-11-07/2026-11-07_19-00-00-front.mp4
+make_snap snap-000019 2026-11-07_19-00-00-front.mp4
+ln -s "$snaps/snap-000019/mnt/TeslaCam/RecentClips/2026-11-07_19-00-00-front.mp4" "$lower/$mr"
+echo "$mr" >> "$workdir/mutable/sentry_files_archived"
+printf '%s  %s\n' "$(pi_sum 19)" "$mr" >> "$workdir/share/$ARCHIVE_MANAGER_CHECKSUMS"
+rm -f "$workdir/share/$mr"
+verify_archived_clips
+[ "$(status_of $mr)" = converted/1 ] || fail "clip with a matching Manager line should be converted/1 without read-back, got $(status_of $mr)"
+
+# No line yet: waits in the queue (not read back, not missing), stamped.
+mw=RecentClips/2026-11-07/2026-11-07_20-00-00-front.mp4
+make_snap snap-000020 2026-11-07_20-00-00-front.mp4
+ln -s "$snaps/snap-000020/mnt/TeslaCam/RecentClips/2026-11-07_20-00-00-front.mp4" "$lower/$mw"
+cp -L "$lower/$mw" "$workdir/share/$mw"
+echo "$mw" >> "$workdir/mutable/sentry_files_archived"
+: > "$workdir/log"
+verify_archived_clips
+[ -z "$(status_of $mw)" ] || fail "clip without a Manager line was checked instead of waiting: $(status_of $mw)"
+grep -q "^$mw"$'\t' "$ARCHIVE_VERIFY_QUEUE" || fail "waiting clip left the queue"
+awk -F'\t' -v r="$mw" '$1 == r && $5 ~ /^[0-9]+$/ { ok = 1 } END { exit !ok }' "$ARCHIVE_VERIFY_QUEUE" || fail "waiting clip not stamped with its queue time"
+grep -q "1 waiting for Sentry Manager's checksum" "$workdir/log" || fail "waiting not reported: $(cat "$workdir/log")"
+# Still waiting on the next pass (the stamp is kept, not reset).
+verify_archived_clips
+[ -z "$(status_of $mw)" ] || fail "waiting clip checked on the second pass"
+
+# Past the wait limit (0 = don't wait): read back as before.
+echo 'export ARCHIVE_AUTO_DELETE_VERIFIED=true ARCHIVE_VERIFY_MANAGER_WAIT_HOURS=0' > "$workdir/sentryusb.conf"
+verify_archived_clips
+[ "$(status_of $mw)" = ok/1 ] || fail "clip past the wait should be read back and ok/1, got $(status_of $mw)"
 
 # --- briefly absent (Manager's no-hard-link replace) is not missing ---------
 # The clip is gone at the first look and back by the re-check: verified,

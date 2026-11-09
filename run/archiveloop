@@ -1203,6 +1203,7 @@ function home_verify_backlog () {
     archive_cycle_begin
     ARCHIVE_VERIFY_RAN=0 ARCHIVE_VERIFY_STOPPED="" ARCHIVE_VERIFY_MATCHED=0
     ARCHIVE_VERIFY_RESEND=0 ARCHIVE_VERIFY_NOSOURCE=0 ARCHIVE_VERIFY_LEFT=0 ARCHIVE_VERIFY_CONVERTED=0
+    ARCHIVE_VERIFY_WAITING=0
     if ! archive_run_command /root/bin/connect-archive.sh
     then
       log "Couldn't connect to the archive to check the backlog; trying again next cycle"
@@ -1223,6 +1224,22 @@ function home_verify_backlog () {
     fi
     if [ $((ARCHIVE_VERIFY_MATCHED + ARCHIVE_VERIFY_CONVERTED + ARCHIVE_VERIFY_RESEND + ARCHIVE_VERIFY_NOSOURCE)) -eq 0 ]
     then
+      if [ -z "$ARCHIVE_VERIFY_STOPPED" ] && [ "${ARCHIVE_VERIFY_WAITING:-0}" -gt 0 ]
+      then
+        # Everything left is waiting for Sentry Manager to convert it and
+        # record its checksum. Check back in a while rather than giving up
+        # until the next trip home; stop if the car leaves.
+        log "Waiting for Sentry Manager's checksums for ${ARCHIVE_VERIFY_WAITING} file(s); checking again in ${ARCHIVE_VERIFY_MANAGER_POLL_SECONDS:-900}s"
+        local waited=0
+        while [ "$waited" -lt "${ARCHIVE_VERIFY_MANAGER_POLL_SECONDS:-900}" ]
+        do
+          sleep 30
+          waited=$((waited + 30))
+          archive_is_reachable || return 0
+          [ ! -e /tmp/archive_is_unreachable ] || return 0
+        done
+        continue
+      fi
       log "Backlog check made no progress${ARCHIVE_VERIFY_STOPPED:+ ($ARCHIVE_VERIFY_STOPPED)}; trying again next cycle"
       return 0
     fi
@@ -1744,9 +1761,11 @@ function intersect {
 # reads to tag snapshots "Verified on archive".
 #
 #   ARCHIVE_VERIFY_QUEUE   clips still to check, one per line:
-#                          "<archive relpath>\t<Pi source path>[\t<size>\t<sha256>]"
-#                          (size/sha256 are only on re-checks, so a re-check
-#                          still works after the source snapshot is gone).
+#                          "<archive relpath>\t<Pi source path>\t<size>\t<sha256>\t<queued unix>"
+#                          size/sha256 are "-" except on re-checks (so a
+#                          re-check still works after the source snapshot
+#                          is gone). Older lines without the last fields are
+#                          read as "-" and stamped when first seen.
 #                          Durable, so clips archived just before the car
 #                          leaves are checked the next time it's home.
 #   ARCHIVE_VERIFY_LEDGER  one line per check:
@@ -1843,7 +1862,7 @@ function queue_archived_for_verification () {
   archive_verify_enabled || return 0
   [ -s "$archived" ] || return 0
   [ -e "$targets" ] || : > "$targets"
-  awk -F'\t' -v lower="$lower" -v targets="$targets" '
+  awk -F'\t' -v lower="$lower" -v targets="$targets" -v now="$(date +%s)" '
     FILENAME == targets { t[$1] = $2; next }
     $0 != "" {
       target = ($0 in t) ? t[$0] : ""
@@ -1852,7 +1871,7 @@ function queue_archived_for_verification () {
       } else if (substr(target, 1, 1) != "/") {
         dir = $0; sub(/[^\/]*$/, "", dir); target = lower "/" dir target
       }
-      print $0 "\t" target
+      print $0 "\t" target "\t-\t-\t" now
     }' "$targets" "$archived" >> "$ARCHIVE_VERIFY_QUEUE" ||
     log "WARNING: could not queue archived clips for verification"
 }
@@ -1987,6 +2006,30 @@ function archive_remote_is_reencoded () {
 # the original. Absent file or line: the Pi falls back to the codec check.
 ARCHIVE_MANAGER_CHECKSUMS=.sentrymanager/original-checksums.sha256
 
+# Manager's record as the first source of truth. When the record exists on
+# the share (Manager is converting in place), a clip's line there is the
+# SHA-256 Manager computed on the NAS from the uploaded bytes, before
+# converting. Comparing it with the Pi's own hash verifies the upload without
+# the Pi reading the clip back. That matters on SMB/NFS, where the only other
+# way to hash the server copy is to download all of it. A clip with no line
+# yet waits in the queue for Manager to get to it, for up to
+# ARCHIVE_VERIFY_MANAGER_WAIT_HOURS (default 24; 0 = never wait), then falls
+# back to reading it back, which covers clips Manager never converts.
+function archive_manager_record_present () {
+  case "${ARCHIVE_SYSTEM:-none}" in
+    cifs|nfs) timeout 10 [ -f "${ARCHIVE_MOUNT:-}/$ARCHIVE_MANAGER_CHECKSUMS" ] ;;
+    rsync)
+      local -a ssh_cmd
+      archive_ssh_command
+      timeout 30 "${ssh_cmd[@]}" "$RSYNC_USER@$RSYNC_SERVER" \
+        "cd $(printf %q "$RSYNC_PATH") && test -f $(printf %q "$ARCHIVE_MANAGER_CHECKSUMS")" 2>/dev/null ;;
+    rclone)
+      timeout 60 rclone --config /root/.config/rclone/rclone.conf lsf \
+        "$RCLONE_DRIVE:$RCLONE_PATH/$ARCHIVE_MANAGER_CHECKSUMS" 2>/dev/null | grep -q . ;;
+    *) return 1 ;;
+  esac
+}
+
 # Print "<sha256>\t<relpath>" from Manager's record for the relpaths in $1.
 # Prints nothing (and succeeds) when the record doesn't exist.
 function archive_manager_original_sums () {
@@ -2026,12 +2069,48 @@ function archive_manager_original_sums () {
 function verify_archive_batch () {
   local batch=$1 rel src ksize ksum sum size
   local localsums="$ARCHIVE_VERIFY_WORK/local" rels="$ARCHIVE_VERIFY_WORK/rels"
+  local pre="$ARCHIVE_VERIFY_WORK/manager-pre" todo="$ARCHIVE_VERIFY_WORK/todo"
+  local readback="$ARCHIVE_VERIFY_WORK/readback"
   : > "$localsums"
+  : > "$pre"
+  : > "$todo"
+  : > "$readback"
   cut -f1 "$batch" > "$rels"
+
+  # With Manager's record on the share: clips with a line are judged from
+  # it (no read-back); clips without one wait for Manager, up to the wait
+  # limit, and only then are read back. The decision comes before hashing,
+  # so a waiting clip costs nothing this pass.
+  if [ "${ARCHIVE_MANAGER_RECORD:-0}" = 1 ]
+  then
+    archive_manager_original_sums "$rels" > "$pre"
+    local wait_h
+    wait_h=$(archive_conf_value ARCHIVE_VERIFY_MANAGER_WAIT_HOURS)
+    [[ "$wait_h" =~ ^[0-9]+$ ]] || wait_h=24
+    awk -F'\t' -v pre="$pre" -v now="$(date +%s)" -v wait="$((wait_h * 3600))" \
+        -v todo="$todo" -v deferred="$ARCHIVE_VERIFY_WORK/deferred" -v readback="$readback" '
+      FILENAME == pre { have[$2] = 1; next }
+      {
+        ks = ($3 == "") ? "-" : $3; kh = ($4 == "") ? "-" : $4
+        q = ($5 ~ /^[0-9]+$/) ? $5 : now
+        line = $1 "\t" $2 "\t" ks "\t" kh "\t" q
+        # >> : the deferred list collects across batches; todo and
+        # readback were emptied above for this batch.
+        if ($1 in have) { print line >> todo }
+        else if (now - q < wait) { print line >> deferred }
+        else { print line >> todo; print $1 >> readback }
+      }' "$pre" "$batch"
+  else
+    cp "$batch" "$todo"
+    cp "$rels" "$readback"
+  fi
+
   # Hash the Pi's copy: the snapshot file the clip was sent from. A re-check
   # whose snapshot is gone falls back to the hash taken the first time.
-  while IFS=$'\t' read -r rel src ksize ksum
+  while IFS=$'\t' read -r rel src ksize ksum _
   do
+    [ "${ksum:-}" != "-" ] || ksum=""
+    [ "${ksize:-}" != "-" ] || ksize=""
     if [ -n "$src" ] && [ -f "$src" ] &&
        sum=$(ionice -c2 -n7 nice -n19 sha256sum < "$src") &&
        size=$(stat -L -c %s -- "$src")
@@ -2043,9 +2122,14 @@ function verify_archive_batch () {
     else
       printf '%s\t-\t-\t%s\n' "$rel" "$src" >> "$localsums"
     fi
-  done < "$batch"
+  done < "$todo"
+  rm -f "$todo"
 
-  archive_remote_sha256 "$rels" > "$ARCHIVE_VERIFY_WORK/remote" || return 1
+  : > "$ARCHIVE_VERIFY_WORK/remote"
+  if [ -s "$readback" ]
+  then
+    archive_remote_sha256 "$readback" > "$ARCHIVE_VERIFY_WORK/remote" || return 1
+  fi
 
   # A clip that's briefly absent isn't missing. Sentry Manager replaces a
   # clip in place when it converts it; on a share without hard links, its
@@ -2053,28 +2137,37 @@ function verify_archive_batch () {
   # copy in. Calling that "missing" would re-send the original over
   # Manager's work. Ask once more after a pause before deciding.
   local absent="$ARCHIVE_VERIFY_WORK/absent"
-  awk -F'\t' -v remote="$ARCHIVE_VERIFY_WORK/remote" '
+  awk -F'\t' -v remote="$ARCHIVE_VERIFY_WORK/remote" -v readback="$readback" '
+    FILENAME == readback { asked[$0] = 1; next }
     FILENAME == remote { seen[$2] = 1; next }
-    $3 != "-" && !($1 in seen) { print $1 }' "$ARCHIVE_VERIFY_WORK/remote" "$localsums" > "$absent"
+    $3 != "-" && ($1 in asked) && !($1 in seen) { print $1 }' "$readback" "$ARCHIVE_VERIFY_WORK/remote" "$localsums" > "$absent"
   if [ -s "$absent" ]
   then
     sleep "${ARCHIVE_VERIFY_ABSENT_RECHECK_SECONDS:-20}"
     archive_remote_sha256 "$absent" >> "$ARCHIVE_VERIFY_WORK/remote" || true
   fi
 
-  awk -F'\t' -v now="$(date +%s)" -v remote="$ARCHIVE_VERIFY_WORK/remote" -v prev="$ARCHIVE_VERIFY_WORK/prev" '
+  # Manager's line (pre) decides clips that have one: equal to the Pi's hash
+  # means the share held exactly the uploaded bytes when Manager converted
+  # them ("converted"); different goes on as a mismatch, which the
+  # reclassification below explains as a bad-source conversion.
+  awk -F'\t' -v now="$(date +%s)" -v remote="$ARCHIVE_VERIFY_WORK/remote" -v prev="$ARCHIVE_VERIFY_WORK/prev" -v pre="$pre" '
     FILENAME == prev   { ps[$1] = $5; ph[$1] = $3; pc[$1] = $6 + 0; next }
+    FILENAME == pre    { m[$2] = $1; next }
     FILENAME == remote { r[$2] = $1; next }
     {
       if ($3 == "-")          status = "nosource"
+      else if ($1 in m)       status = (m[$1] == $3) ? "converted" : "mismatch"
       else if (!($1 in r))    status = "missing"
       else if (r[$1] == $3)   status = "ok"
       else                    status = "mismatch"
       count = 0
       if (status == "ok")
         count = (ps[$1] == "ok" && ph[$1] == $3) ? pc[$1] + 1 : 1
+      else if (status == "converted")
+        count = (ps[$1] == "ok" || ps[$1] == "converted") ? pc[$1] + 1 : 1
       print $1 "\t" $2 "\t" $3 "\t" now "\t" status "\t" count "\t" $4
-    }' "$ARCHIVE_VERIFY_WORK/prev" "$ARCHIVE_VERIFY_WORK/remote" "$localsums" > "$ARCHIVE_VERIFY_WORK/results"
+    }' "$ARCHIVE_VERIFY_WORK/prev" "$pre" "$ARCHIVE_VERIFY_WORK/remote" "$localsums" > "$ARCHIVE_VERIFY_WORK/results"
 
   # A mismatch that is Sentry Manager's in-place re-encode (server copy
   # H.265/AV1, Pi copy not) is never renamed aside or re-sent as damage:
@@ -2186,13 +2279,13 @@ function queue_archive_rechecks () {
   local gap
   gap=$(archive_conf_value ARCHIVE_VERIFY_RECHECK_SECONDS)
   [[ "$gap" =~ ^[0-9]+$ ]] || gap=3600
-  awk -F'\t' -v cutoff="$(( $(date +%s) - gap ))" '
+  awk -F'\t' -v cutoff="$(( $(date +%s) - gap ))" -v now="$(date +%s)" '
     { last[$1] = $0 }
     END {
       for (r in last) {
         split(last[r], f, "\t")
         if ((f[5] == "ok" || f[5] == "converted") && f[6] + 0 == 1 && f[4] + 0 <= cutoff)
-          print f[1] "\t" f[7] "\t" f[2] "\t" f[3]
+          print f[1] "\t" f[7] "\t" f[2] "\t" f[3] "\t" now
       }
     }' "$ARCHIVE_VERIFY_LEDGER" >> "$ARCHIVE_VERIFY_QUEUE"
 }
@@ -2360,6 +2453,12 @@ function verify_archived_clips () {
   rm -rf "$ARCHIVE_VERIFY_WORK"
   mkdir -p "$ARCHIVE_VERIFY_WORK" || return 1
   : > "$ARCHIVE_VERIFY_WORK/results-all"
+  : > "$ARCHIVE_VERIFY_WORK/deferred"
+  ARCHIVE_MANAGER_RECORD=0
+  if archive_manager_record_present
+  then
+    ARCHIVE_MANAGER_RECORD=1
+  fi
 
   # Each clip's latest ledger line, to carry its "times verified" forward.
   if [ -s "$ARCHIVE_VERIFY_LEDGER" ]
@@ -2397,8 +2496,8 @@ function verify_archived_clips () {
     rm -f "$batch"
   done
 
-  # Whatever wasn't checked stays queued for the next cycle.
-  cat "$ARCHIVE_VERIFY_WORK"/batch-* > "$ARCHIVE_VERIFY_QUEUE.new" 2>/dev/null || true
+  # Whatever wasn't checked, or is waiting for Manager's line, stays queued.
+  cat "$ARCHIVE_VERIFY_WORK"/batch-* "$ARCHIVE_VERIFY_WORK/deferred" > "$ARCHIVE_VERIFY_QUEUE.new" 2>/dev/null || true
   if [ -s "$ARCHIVE_VERIFY_QUEUE.new" ]
   then
     mv "$ARCHIVE_VERIFY_QUEUE.new" "$ARCHIVE_VERIFY_QUEUE"
@@ -2407,13 +2506,15 @@ function verify_archived_clips () {
   fi
   prune_archive_verify_ledger || log "WARNING: could not prune the archive verification ledger"
 
-  local ok bad nosource converted left=0
+  local ok bad nosource converted left=0 waiting
+  waiting=$(wc -l < "$ARCHIVE_VERIFY_WORK/deferred")
   ok=$(awk -F'\t' '$5 == "ok"' "$ARCHIVE_VERIFY_WORK/results-all" | wc -l)
   converted=$(awk -F'\t' '$5 == "converted" || $5 == "converted_unconfirmed"' "$ARCHIVE_VERIFY_WORK/results-all" | wc -l)
   bad=$(awk -F'\t' '$5 == "mismatch" || $5 == "missing"' "$ARCHIVE_VERIFY_WORK/results-all" | wc -l)
   nosource=$(awk -F'\t' '$5 == "nosource"' "$ARCHIVE_VERIFY_WORK/results-all" | wc -l)
   [ ! -s "$ARCHIVE_VERIFY_QUEUE" ] || left=$(wc -l < "$ARCHIVE_VERIFY_QUEUE")
-  log "Archive verification: $ok matched, $converted re-encoded on the server by Sentry Manager, $bad to re-send, $nosource with no Pi copy left to compare, $left still queued${stopped:+ ($stopped)}"
+  log "Archive verification: $ok matched, $converted re-encoded on the server by Sentry Manager, $bad to re-send, $nosource with no Pi copy left to compare, $left still queued ($waiting waiting for Sentry Manager's checksum)${stopped:+ ($stopped)}"
+  ARCHIVE_VERIFY_WAITING=$waiting
   ARCHIVE_VERIFY_RAN=1
   ARCHIVE_VERIFY_MATCHED=$ok
   ARCHIVE_VERIFY_CONVERTED=$converted

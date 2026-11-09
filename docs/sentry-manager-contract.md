@@ -90,11 +90,31 @@ can't match the Pi's hash, so Sentry USB recognises re-encodes:
 "Separate" output mode (converted copies in another folder) leaves originals
 untouched and needs none of this.
 
+### Manager's record comes first (no read-back)
+
+On an SMB/NFS share, the Pi's only other way to hash the share's copy is to
+read all of it back over the network. So when the record file exists, the
+Pi looks there first:
+
+- **A clip with a line:** the Pi compares the line with its own hash, and
+  reads nothing back. An equal line means the share held exactly the
+  uploaded bytes when Manager converted them.
+- **A clip without a line yet:** it waits in the Pi's queue for Manager to
+  convert it, for up to 24 hours (`ARCHIVE_VERIFY_MANAGER_WAIT_HOURS`; 0 =
+  don't wait). Only then is it read back. While parked at home, the Pi
+  checks the record again every 15 minutes.
+- **Clips Manager never converts** fall back to read-back after the wait.
+  Optional, to save that traffic: Manager could also append a line for clips
+  it decides not to convert, in the same format. The Pi treats any line as
+  the uploaded bytes' hash.
+
 ### How Sentry USB decides
 
 | Share copy | Manager's record line | Result on the Pi |
 |---|---|---|
-| matches the Pi's hash | (not read) | `ok`: verified |
+| (not read) | equals the Pi's hash | `converted`: verified, no read-back |
+| (not read) | none yet, under 24 h | waits in the queue |
+| matches the Pi's hash | none, or no record file | `ok`: verified (read back) |
 | re-encoded | equals the Pi's hash | `converted`: verified, counts toward auto-delete |
 | re-encoded | differs from the Pi's hash | `mismatch`: Manager converted a bad upload. Its output is renamed to `.mismatch-<time>` and the original is re-uploaded, so expect it back to convert again. |
 | re-encoded | none, but the clip matched before it was converted | `converted`: verified |
