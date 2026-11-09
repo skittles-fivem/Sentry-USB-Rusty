@@ -18,6 +18,7 @@ for fn in sortfile prunefile archive_conf_value archive_verify_enabled archive_a
   record_archive_link_targets queue_archived_for_verification archive_ssh_command \
   archive_remote_sha256 archive_set_aside_remote verify_archive_batch prune_archive_verify_ledger \
   archive_quick_fingerprint archive_remote_quick_fingerprint archive_quick_result archive_verify_quick_mode \
+  archive_cached_local_sum precompute_local_hashes archive_local_quick_fingerprint \
   archive_stream_is_reencoded archive_local_is_reencoded archive_remote_is_reencoded archive_manager_original_sums archive_manager_record_present \
   queue_unverified_archived queue_archive_rechecks snapshot_verified_twice auto_delete_verified_snapshots verify_archived_clips \
   json_string json_int json_bool build_share_status_json plan_share_transfer record_archive_throughput \
@@ -38,8 +39,8 @@ logs=""
 log() { logs+="$*"$'\n'; echo "$*" >> "$workdir/log"; }
 archive_cancel_requested() { return 1; }
 archive_is_reachable() { return 0; }
-ionice() { shift 2; "$@"; }
-nice() { shift; "$@"; }
+ionice() { while [ "${1:-}" != "${1#-}" ]; do shift; done; "$@"; }
+nice() { while [ "${1:-}" != "${1#-}" ]; do shift; done; "$@"; }
 CLOCK=1000
 uptime_seconds() { echo "$CLOCK"; }
 : > "$workdir/released"
@@ -62,6 +63,8 @@ stsd_entry() { printf 'stsd\000\000\000\000\000\000\000\001\000\000\000\126%s' "
 ARCHIVE_MANAGER_CHECKSUMS=.sentrymanager/original-checksums.sha256
 export ARCHIVE_VERIFY_ABSENT_RECHECK_SECONDS=0
 ARCHIVE_QUICK_WHOLE_BELOW=2097152
+ARCHIVE_LOCAL_SUMS="$workdir/mutable/archive_local_sums.tsv"
+ARCHIVE_CONTROL_DIR="$workdir/ctl"; mkdir -p "$ARCHIVE_CONTROL_DIR"
 # The "missing" re-check pauses with sleep; a test can hook that pause to
 # simulate the share changing in between.
 on_pause=""
@@ -391,6 +394,52 @@ echo 'export ARCHIVE_VERIFY_MODE=full' > "$workdir/sentryusb.conf"
 q4=$(quick_clip 25)
 verify_archived_clips
 [ "$(status_of "$q4")" = ok/1 ] || fail "full mode should read back and be ok/1, got $(status_of "$q4")"
+
+# --- pre-hashing: the Pi's half is done after the snapshot, then reused ---
+echo 'export ARCHIVE_AUTO_DELETE_VERIFIED=true' > "$workdir/sentryusb.conf"
+mkdir -p "$lower/RecentClips/2026-11-08" "$workdir/share/RecentClips/2026-11-08"
+pre_rel=RecentClips/2026-11-08/2026-11-08_01-00-00-front.mp4
+make_snap snap-000030 2026-11-08_01-00-00-front.mp4
+pre_src="$snaps/snap-000030/mnt/TeslaCam/RecentClips/2026-11-08_01-00-00-front.mp4"
+ln -s "$pre_src" "$lower/$pre_rel"
+precompute_local_hashes
+grep -qF "$pre_src" "$ARCHIVE_LOCAL_SUMS" || fail "new clip not pre-hashed"
+[ "$(awk -F'\t' -v p="$pre_src" '$1 == p { print $3 }' "$ARCHIVE_LOCAL_SUMS")" = "$(sha256sum < "$pre_src" | cut -c1-64)" ] ||
+  fail "pre-hashed checksum is wrong"
+# A second run doesn't hash it again.
+before=$(wc -l < "$ARCHIVE_LOCAL_SUMS"); precompute_local_hashes
+[ "$(wc -l < "$ARCHIVE_LOCAL_SUMS")" = "$before" ] || fail "clip hashed twice"
+# While an archive cycle runs, pre-hashing stops.
+pre2_rel=RecentClips/2026-11-08/2026-11-08_02-00-00-front.mp4
+make_snap snap-000031 2026-11-08_02-00-00-front.mp4
+ln -s "$snaps/snap-000031/mnt/TeslaCam/RecentClips/2026-11-08_02-00-00-front.mp4" "$lower/$pre2_rel"
+: > "$ARCHIVE_CONTROL_DIR/archive-cycle"
+precompute_local_hashes
+grep -q "snap-000031" "$ARCHIVE_LOCAL_SUMS" && fail "pre-hashed during an archive cycle"
+rm -f "$ARCHIVE_CONTROL_DIR/archive-cycle"
+# Verification uses the stored checksum and doesn't read the Pi's copy:
+# a stored hash that differs from the real one decides the result, and a
+# guard catches any sha256sum of that file.
+cp -L "$lower/$pre_rel" "$workdir/share/$pre_rel"
+echo "$pre_rel" >> "$workdir/mutable/sentry_files_archived"
+echo 'export ARCHIVE_VERIFY_MODE=full' > "$workdir/sentryusb.conf"
+sed -i "s|^\($pre_src\t[0-9]*\t\)[0-9a-f]*|\1$(printf 'a%.0s' {1..64})|" "$ARCHIVE_LOCAL_SUMS"
+rm -f "$workdir/read-pi-copy"
+ionice() {
+  while [ "${1:-}" != "${1#-}" ]; do shift; done
+  if [ "$1" = nice ] && [ "${3:-}" = sha256sum ] && [ "$(readlink -f "/proc/$BASHPID/fd/0")" = "$(readlink -f "$pre_src")" ]
+  then touch "$workdir/read-pi-copy"; fi
+  "$@"
+}
+verify_archived_clips
+ionice() { while [ "${1:-}" != "${1#-}" ]; do shift; done; "$@"; }
+[ ! -e "$workdir/read-pi-copy" ] || fail "re-read the Pi's copy although it was pre-hashed"
+[ "$(status_of $pre_rel | cut -d/ -f1)" = mismatch ] || fail "stored checksum wasn't used (got $(status_of $pre_rel))"
+# A released snapshot's lines are dropped on the next run.
+rm -rf "$snaps/snap-000030"
+precompute_local_hashes
+grep -q "snap-000030" "$ARCHIVE_LOCAL_SUMS" && fail "lines for a released snapshot kept"
+echo 'export ARCHIVE_AUTO_DELETE_VERIFIED=true' > "$workdir/sentryusb.conf"
 
 # --- verification off: queue is dropped, nothing runs ----------------------
 echo 'export ARCHIVE_VERIFY=false' > "$workdir/sentryusb.conf"

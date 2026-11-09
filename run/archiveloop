@@ -2079,6 +2079,89 @@ function archive_manager_original_sums () {
   return 0
 }
 
+# Pre-hashing. A clip's check has two halves: the Pi's copy and the server's.
+# The Pi's half (a full SHA-256 read from the SD card, plus the quick-check
+# fingerprint on SMB/NFS) doesn't need the server, and snapshot files never
+# change. So it's done ahead of time, in the background after each snapshot
+# (precompute_local_hashes), and stored here. At home the verification only
+# has the server's half left: with Sentry Manager's record that's a pure
+# comparison, with nothing read on either side.
+#   "<snapshot file path>\t<size>\t<sha256>\t<quick fingerprint or ->"
+# A line counts only while the file's size still matches. Lines for released
+# snapshots are dropped by checking the snapshot directory, never the file
+# (that would mount every snapshot through autofs).
+ARCHIVE_LOCAL_SUMS=/mutable/archive_local_sums.tsv
+
+# Print the stored "<size>\t<sha256>\t<fingerprint>" for snapshot file $1 if
+# its size still matches $2.
+function archive_cached_local_sum () {
+  [ -s "$ARCHIVE_LOCAL_SUMS" ] || return 1
+  local line
+  line=$(awk -F'\t' -v p="$1" -v sz="$2" '$1 == p && $2 == sz { l = $2 "\t" $3 "\t" $4 } END { if (l != "") print l; else exit 1 }' "$ARCHIVE_LOCAL_SUMS") || return 1
+  printf '%s\n' "$line"
+}
+
+# Hash clips the Pi holds that aren't hashed yet, at idle I/O priority,
+# for at most ARCHIVE_PRECHECK_MAX_SECONDS (default 1200) per run. Stops
+# early while an archive cycle runs (it would compete with the upload).
+# One run at a time; best effort.
+function precompute_local_hashes () {
+  archive_verify_enabled || return 0
+  (
+    flock -n 8 || exit 0
+    local lower=/mutable/TeslaCam work=/tmp/archive-precheck
+    local max deadline n=0 rel target size sum fp
+    max=$(archive_conf_value ARCHIVE_PRECHECK_MAX_SECONDS)
+    [[ "$max" =~ ^[0-9]+$ ]] || max=1200
+    deadline=$(( $(uptime_seconds) + max ))
+    rm -rf "$work"; mkdir -p "$work" || exit 0
+    [ -e "$ARCHIVE_LOCAL_SUMS" ] || : > "$ARCHIVE_LOCAL_SUMS" || exit 0
+    # Drop lines for snapshots that are gone.
+    awk -F'\t' '{ d = $1; sub(/\/mnt\/.*/, "", d); print d }' "$ARCHIVE_LOCAL_SUMS" | sort -u |
+      while IFS= read -r d; do [ -d "$d" ] || echo "$d"; done > "$work/gone"
+    if [ -s "$work/gone" ]
+    then
+      awk -F'\t' -v gone="$work/gone" 'FILENAME == gone { g[$0] = 1; next }
+        { d = $1; sub(/\/mnt\/.*/, "", d); if (!(d in g)) print }' "$work/gone" "$ARCHIVE_LOCAL_SUMS" > "$ARCHIVE_LOCAL_SUMS.new" &&
+        mv "$ARCHIVE_LOCAL_SUMS.new" "$ARCHIVE_LOCAL_SUMS"
+    fi
+    # Clips in the link farm (what an archive sends), in folders this
+    # device archives, whose snapshot file isn't hashed yet. Newest first:
+    # they're the ones the next archive sends.
+    local folders=""
+    [ "${ARCHIVE_SAVEDCLIPS:-true}" != true ] || folders+=" SavedClips"
+    [ "${ARCHIVE_SENTRYCLIPS:-true}" != true ] || folders+=" SentryClips"
+    [ "${ARCHIVE_RECENTCLIPS:-false}" != true ] || folders+=" RecentClips"
+    [ "${ARCHIVE_TRACKMODECLIPS:-true}" != true ] || folders+=" TeslaTrackMode"
+    [ -n "$folders" ] || exit 0
+    # shellcheck disable=SC2086 # folder names, split on purpose
+    # %p keeps the folder name in the relpath. A folder the car hasn't made
+    # yet (TeslaTrackMode, often) makes find exit non-zero; that's fine.
+    { (cd "$lower" && find $folders -type l -printf '%p\t%l\n' 2>/dev/null) || true; } |
+      awk -F'\t' -v have="$ARCHIVE_LOCAL_SUMS" 'FILENAME == have { h[$1] = 1; next }
+        substr($2, 1, 1) == "/" && !($2 in h) { print }' "$ARCHIVE_LOCAL_SUMS" - |
+      sort -t$'\t' -k1,1r > "$work/todo"
+    while IFS=$'\t' read -r rel target
+    do
+      [ "$(uptime_seconds)" -lt "$deadline" ] || break
+      [ ! -e "$ARCHIVE_CONTROL_DIR/archive-cycle" ] || break
+      size=$(stat -L -c %s -- "$target" 2>/dev/null) || continue
+      # Short recordings aren't archived.
+      if [ "$size" -lt 100000 ] && [[ "$rel" == *.mp4 ]]; then continue; fi
+      sum=$(ionice -c3 nice -n19 sha256sum < "$target" 2>/dev/null) || continue
+      fp=-
+      if archive_verify_quick_mode
+      then
+        fp=$(ionice -c3 nice -n19 archive_quick_fingerprint "$target" 2>/dev/null) || fp=-
+      fi
+      printf '%s\t%s\t%s\t%s\n' "$target" "$size" "${sum%% *}" "$fp" >> "$ARCHIVE_LOCAL_SUMS"
+      n=$((n + 1))
+    done < "$work/todo"
+    [ "$n" = 0 ] || log "Pre-hashed $n clip(s) on the Pi for archive verification"
+    rm -rf "$work"
+  ) 8> /tmp/archive-precheck.lock
+}
+
 # Quick check for SMB/NFS shares. Without Sentry Manager's record, the only
 # way to SHA-256 the share's copy of a clip is to read all of it back over
 # the network (about 30-40 MB per clip). The quick check reads about 300 KB
@@ -2147,6 +2230,17 @@ function archive_quick_fingerprint () {
       dd if="$f" iflag=skip_bytes,count_bytes skip=$((mdat_off + mdat_len * k / 5)) count=65536 2>/dev/null
     done | sha256sum | cut -c1-64)
   printf 'mp4:%s:%s:%s\n' "$size" "$moovsha" "$slicesha"
+}
+
+# The Pi copy's fingerprint: pre-hashed if available, else read now.
+function archive_local_quick_fingerprint () {
+  local size cached fp
+  if size=$(stat -L -c %s -- "$1" 2>/dev/null) && cached=$(archive_cached_local_sum "$1" "$size")
+  then
+    fp=$(cut -f3 <<< "$cached")
+    if [ "$fp" != "-" ] && [ -n "$fp" ]; then printf '%s\n' "$fp"; return 0; fi
+  fi
+  ionice -c2 -n7 nice -n19 archive_quick_fingerprint "$1"
 }
 
 # The share copy's fingerprint, bounded so a hung SMB/NFS mount can't stall
@@ -2226,7 +2320,13 @@ function verify_archive_batch () {
   do
     [ "${ksum:-}" != "-" ] || ksum=""
     [ "${ksize:-}" != "-" ] || ksize=""
-    if [ -n "$src" ] && [ -f "$src" ] &&
+    local cached=""
+    if [ -n "$src" ] && size=$(stat -L -c %s -- "$src" 2>/dev/null) &&
+       cached=$(archive_cached_local_sum "$src" "$size")
+    then
+      # Pre-hashed after the snapshot: no need to read the clip again.
+      printf '%s\t%s\t%s\t%s\n' "$rel" "$size" "$(cut -f2 <<< "$cached")" "$src" >> "$localsums"
+    elif [ -n "$src" ] && [ -f "$src" ] &&
        sum=$(ionice -c2 -n7 nice -n19 sha256sum < "$src") &&
        size=$(stat -L -c %s -- "$src")
     then
@@ -2275,7 +2375,7 @@ function verify_archive_batch () {
       # don't read the share's copy at all.
       [ "$qsum" != "-" ] || continue
       if [ -z "$qsrc" ] || [ ! -f "$qsrc" ] ||
-         ! lfp=$(ionice -c2 -n7 nice -n19 archive_quick_fingerprint "$qsrc")
+         ! lfp=$(archive_local_quick_fingerprint "$qsrc")
       then
         echo "$qrel" >> "$still"
         continue
@@ -4073,6 +4173,9 @@ function snapshotloop {
     /root/bin/make_snapshot.sh || log "ERROR: make_snapshot.sh failed (exit $?)"
     # The next boot's clock must not start before this snapshot.
     save_clock_checkpoint || true
+    # Hash the new clips now, in the background at idle priority, so the
+    # Pi's half of the archive check is done before the clips are uploaded.
+    precompute_local_hashes &
     # Incrementally process new clips after each snapshot.
     # The processor skips already-processed files, so this is lightweight.
     # Runs in a subshell so the snapshot loop isn't blocked.
