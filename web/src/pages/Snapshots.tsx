@@ -88,7 +88,7 @@ function formatAgo(secs: number): string {
  *  could see half-updated folders); "Snapshot now" takes a real snapshot the
  *  same safe way the scheduled ones are taken, and the new clips then show
  *  up as a new snapshot row. */
-export function LiveRow({ onSnapshotTaken }: { onSnapshotTaken: () => void }) {
+export function LiveRow({ onSnapshotTaken, reloadKey = 0 }: { onSnapshotTaken: () => void; reloadKey?: number }) {
   const [live, setLive] = useState<LiveStatus | null>(null)
   const [fresh, setFresh] = useState<Freshness | null>(null)
   const [note, setNote] = useState<string | null>(null)
@@ -108,6 +108,12 @@ export function LiveRow({ onSnapshotTaken }: { onSnapshotTaken: () => void }) {
       // Offline for a moment: keep the last values.
     }
   }, [onSnapshotTaken])
+  // The page's Refresh button bumps reloadKey: reload now, not at the next poll.
+  useEffect(() => {
+    if (!reloadKey) return
+    const now = setTimeout(() => void load(), 0)
+    return () => clearTimeout(now)
+  }, [reloadKey, load])
   // Poll every 30 s, every 5 s while a snapshot is being taken; the first
   // load is scheduled like the others rather than run inside the effect.
   useEffect(() => {
@@ -253,6 +259,8 @@ export default function Snapshots() {
   const [deletion, setDeletion] = useState<Deletion | null>(null)
   const [deleting, setDeleting] = useState(false)
   const [confirmWord, setConfirmWord] = useState("")
+  // Bumped by the Refresh button so the Live row reloads too.
+  const [liveReload, setLiveReload] = useState(0)
   const [completed, setCompleted] = useState(0)
   const inFlight = useRef(false)
   const requestId = useRef(0)
@@ -417,6 +425,7 @@ export default function Snapshots() {
           disabled={loading || deleting}
           onClick={() => {
             setError(null)
+            setLiveReload((n) => n + 1)
             void refresh()
           }}
         >
@@ -481,7 +490,7 @@ export default function Snapshots() {
         </p>
         <SelectMenu label="Sort snapshots" value={sort} onChange={value => { setHoverPreview(null); setFocusPreview(null); setSort(value) }} align="end" options={[{ value: "oldest", label: "Oldest first" }, { value: "newest", label: "Newest first" }]} />
       </div>
-      <LiveRow onSnapshotTaken={onSnapshotTaken} />
+      <LiveRow onSnapshotTaken={onSnapshotTaken} reloadKey={liveReload} />
       {loading ? (
         <p role="status" className="p-8 text-slate-400">
           Loading snapshots…

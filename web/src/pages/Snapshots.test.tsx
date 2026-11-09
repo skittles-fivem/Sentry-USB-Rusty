@@ -421,7 +421,16 @@ test("the Live row shows whether the car is recording, the schedule, and takes a
     // Rate-limited: says when it's available again.
     freshAnswer = { snapshot_ts: 1000 - 60, refreshing: false, next_refresh_ts: 1000 + 120, checked_ts: 1000, server_ts: 1000 }
     liveAnswer = { car_last_write_ts: 1000 - 4000, next_scheduled_ts: null, server_ts: 1000 }
+    // The page's Refresh button reloads the Live row at once.
+    liveAnswer = { car_last_write_ts: 1000 - 3, next_scheduled_ts: 1000 + 10 * 60, server_ts: 1000 }
+    freshAnswer = { snapshot_ts: 1000 - 23 * 60, refreshing: false, next_refresh_ts: null, checked_ts: null, server_ts: 1000 }
+    await act(async () => [...container.querySelectorAll("button")].find((b) => b.textContent === "Refresh")!.click())
+    await act(async () => { await new Promise(r => setTimeout(r, 0)) })
+    assert.match(liveText(), /Car last wrote 3 s ago/, "Refresh didn't reload the Live row")
+    assert.match(liveText(), /next scheduled in 10 min/)
     // A parked car reads as not recording; the button says when it's next allowed.
+    freshAnswer = { snapshot_ts: 1000 - 60, refreshing: false, next_refresh_ts: 1000 + 120, checked_ts: 1000, server_ts: 1000 }
+    liveAnswer = { car_last_write_ts: 1000 - 4000, next_scheduled_ts: null, server_ts: 1000 }
     await act(async () => root.unmount())
     const container2 = win.document.createElement("div"); win.document.body.append(container2)
     const root2 = createRoot(container2)
@@ -433,6 +442,9 @@ test("the Live row shows whether the car is recording, the schedule, and takes a
     assert.match(text2, /Snapshot now \(in 2 min\)/)
     await act(async () => root2.unmount())
   } finally {
+    // Unmount even on failure: a mounted Live row keeps polling and the
+    // test runner would never exit.
+    await act(async () => { try { root.unmount() } catch { /* already unmounted */ } })
     globalThis.fetch = oldFetch
     liveAnswer = { car_last_write_ts: null, next_scheduled_ts: null, server_ts: 1000 }
     freshAnswer = { snapshot_ts: null, refreshing: false, next_refresh_ts: null, checked_ts: null, server_ts: 1000 }
