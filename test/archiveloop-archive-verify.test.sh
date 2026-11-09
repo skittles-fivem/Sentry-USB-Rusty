@@ -17,6 +17,7 @@ extract() {
 for fn in sortfile prunefile archive_conf_value archive_verify_enabled archive_auto_delete_enabled \
   record_archive_link_targets queue_archived_for_verification archive_ssh_command \
   archive_remote_sha256 archive_set_aside_remote verify_archive_batch prune_archive_verify_ledger \
+  archive_quick_fingerprint archive_remote_quick_fingerprint archive_quick_result archive_verify_quick_mode \
   archive_stream_is_reencoded archive_local_is_reencoded archive_remote_is_reencoded archive_manager_original_sums archive_manager_record_present \
   queue_unverified_archived queue_archive_rechecks snapshot_verified_twice auto_delete_verified_snapshots verify_archived_clips \
   json_string json_int json_bool build_share_status_json plan_share_transfer record_archive_throughput \
@@ -60,6 +61,7 @@ ARCHIVE_REENCODED_SAMPLE_ENTRY=' 73 74 73 64( [0-9a-f]{2}){12} (68 76 63 31|68 6
 stsd_entry() { printf 'stsd\000\000\000\000\000\000\000\001\000\000\000\126%s' "$1"; }
 ARCHIVE_MANAGER_CHECKSUMS=.sentrymanager/original-checksums.sha256
 export ARCHIVE_VERIFY_ABSENT_RECHECK_SECONDS=0
+ARCHIVE_QUICK_WHOLE_BELOW=2097152
 # The "missing" re-check pauses with sleep; a test can hook that pause to
 # simulate the share changing in between.
 on_pause=""
@@ -129,7 +131,7 @@ grep -q 10-01-00 "$workdir/mutable/sentry_files_archived" && fail "damaged clip 
 grep -q 11-00-00 "$workdir/mutable/sentry_files_archived" && fail "missing clip still marked archived (would never be re-sent)"
 grep -q 10-00-00 "$workdir/mutable/sentry_files_archived" || fail "verified clip dropped from the archived list"
 [ ! -e "$ARCHIVE_VERIFY_QUEUE" ] || fail "queue not emptied after a complete pass"
-grep -q "1 matched, 0 re-encoded on the server by Sentry Manager, 2 to re-send" <<< "$logs" || fail "summary line wrong: $logs"
+grep -q "1 matched, 0 matched by quick check, 0 re-encoded on the server by Sentry Manager, 2 to re-send" <<< "$logs" || fail "summary line wrong: $logs"
 
 # --- re-send, then second check; auto-delete off releases nothing ------------
 (cd "$lower" && for f in RecentClips/2026-11-07/2026-11-07_10-01-00-front.mp4 RecentClips/2026-11-07/2026-11-07_11-00-00-front.mp4; do cp -L "$f" "$workdir/share/$f"; done)
@@ -350,6 +352,45 @@ stsd_entry avc1 > "$workdir/h264.mp4"
 archive_local_is_reencoded "$workdir/h264.mp4" && fail "an avc1 (H.264) sample entry taken for a re-encode"
 stsd_entry av01 > "$workdir/av1.mp4"
 archive_local_is_reencoded "$workdir/av1.mp4" || fail "an av01 sample entry not detected"
+
+# --- SMB quick check (no Manager record): size + moov + video slices -------
+# A synthetic MP4 above the 2 MiB whole-file limit: ftyp, mdat (3 MiB), moov.
+make_mp4() {  # file
+  { printf '\000\000\000\030ftypmp42\000\000\000\000mp42isom'
+    printf '\000\060\000\000mdat'; head -c $((3145728 - 8)) /dev/urandom
+    printf '\000\000\020\000moov'; head -c $((4096 - 8)) /dev/urandom; } > "$1"
+}
+rm -f "$workdir/share/$ARCHIVE_MANAGER_CHECKSUMS"   # no Manager on this share now
+echo 'export ARCHIVE_AUTO_DELETE_VERIFIED=true' > "$workdir/sentryusb.conf"
+quick_clip() {  # hh -> relpath; Pi copy in a snapshot, identical copy on the share
+  local name="2026-11-07_$1-00-00-front.mp4" rel="RecentClips/2026-11-07/2026-11-07_$1-00-00-front.mp4"
+  mkdir -p "$snaps/snap-0000$1/mnt/TeslaCam/RecentClips"
+  make_mp4 "$snaps/snap-0000$1/mnt/TeslaCam/RecentClips/$name"
+  echo "3149848 TeslaCam/RecentClips/$name" > "$snaps/snap-0000$1/snap.bin.toc"; : > "$snaps/snap-0000$1/snap.bin"
+  ln -s "$snaps/snap-0000$1/mnt/TeslaCam/RecentClips/$name" "$lower/$rel"
+  cp -L "$lower/$rel" "$workdir/share/$rel"
+  echo "$rel" >> "$workdir/mutable/sentry_files_archived"
+  echo "$rel"
+}
+q1=$(quick_clip 22)
+verify_archived_clips
+[ "$(status_of "$q1")" = ok_quick/1 ] || fail "identical MP4 should pass the quick check, got $(status_of "$q1")"
+# Damage inside a sampled slice (40% into mdat): mismatch.
+q2=$(quick_clip 23)
+off=$(( 32 + 3145728 * 2 / 5 + 100 ))
+printf 'ZZZZZZZZ' | dd of="$workdir/share/$q2" bs=1 seek=$off conv=notrunc status=none
+verify_archived_clips
+[ "$(status_of "$q2")" = mismatch/0 ] || fail "damaged slice should be a mismatch, got $(status_of "$q2")"
+# Cut off (no moov): mismatch.
+q3=$(quick_clip 24)
+truncate -s 2500000 "$workdir/share/$q3"
+verify_archived_clips
+[ "$(status_of "$q3")" = mismatch/0 ] || fail "cut-off copy should be a mismatch, got $(status_of "$q3")"
+# Forced full read-back: plain ok.
+echo 'export ARCHIVE_VERIFY_MODE=full' > "$workdir/sentryusb.conf"
+q4=$(quick_clip 25)
+verify_archived_clips
+[ "$(status_of "$q4")" = ok/1 ] || fail "full mode should read back and be ok/1, got $(status_of "$q4")"
 
 # --- verification off: queue is dropped, nothing runs ----------------------
 echo 'export ARCHIVE_VERIFY=false' > "$workdir/sentryusb.conf"

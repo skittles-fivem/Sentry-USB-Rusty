@@ -8,6 +8,7 @@ interface ArchiveVerifySettings {
   verify: boolean
   auto_delete: boolean
   trust_unconfirmed?: boolean
+  full_readback?: boolean
   archive_system: string
   recent_clips_archived: boolean
 }
@@ -32,7 +33,7 @@ export function ArchiveVerifySection() {
     return () => { active = false }
   }, [])
 
-  async function save(change: Partial<Pick<ArchiveVerifySettings, "verify" | "auto_delete" | "trust_unconfirmed">>) {
+  async function save(change: Partial<Pick<ArchiveVerifySettings, "verify" | "auto_delete" | "trust_unconfirmed" | "full_readback">>) {
     setSaving(true)
     setError(null)
     try {
@@ -110,6 +111,30 @@ export function ArchiveVerifySection() {
           </InfoButton>
         }
       />
+      {(settings?.archive_system === "cifs" || settings?.archive_system === "nfs") && (
+        <Toggle
+          checked={!!settings?.full_readback}
+          disabled={!settings || saving || !settings.verify}
+          onChange={(full_readback) => void save({ full_readback })}
+          label="Read back whole clips (SMB/NFS)"
+          sub="Slower, and downloads every clip again. Off uses the quick check."
+          help={
+            <InfoButton title="Quick check or full read-back">
+              <p>
+                An SMB/NFS share can't compute a checksum itself, so a full check means the Pi reads every clip back
+                over the network. When Sentry Manager's checksum record is on the share, the Pi uses that instead and
+                reads nothing back.
+              </p>
+              <p>
+                Otherwise the quick check compares the clip's size, its frame index (the MP4 "moov" box, which holds
+                every frame's size and timing, so frame count and frame rate must match), and four 64 KB samples of the
+                video: about 300 KB per clip instead of the whole file. A cut-off or truncated copy can't pass, but
+                damage confined to video between the samples can. Turn this on to read clips back whole instead.
+              </p>
+            </InfoButton>
+          }
+        />
+      )}
       <Toggle
         checked={!!settings?.trust_unconfirmed}
         disabled={!settings || saving || noArchive || !settings.verify}

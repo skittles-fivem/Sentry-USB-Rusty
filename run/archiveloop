@@ -1770,8 +1770,11 @@ function intersect {
 #                          leaves are checked the next time it's home.
 #   ARCHIVE_VERIFY_LEDGER  one line per check:
 #                          "<relpath>\t<size>\t<sha256>\t<unix>\t<status>\t<times verified>\t<Pi source path>"
-#                          status: ok | converted | converted_unconfirmed |
+#                          status: ok | ok_quick | converted | converted_unconfirmed |
 #                                  mismatch | missing | nosource
+#                          ok_quick: matched by the quick check (size, moov
+#                          index and video slices; SMB/NFS without Manager's
+#                          record). Counts like ok.
 #                          converted: Sentry Manager re-encoded the server copy
 #                          in place (H.265/AV1), and the original is confirmed
 #                          by Manager's checksum record or by an earlier match.
@@ -2076,6 +2079,104 @@ function archive_manager_original_sums () {
   return 0
 }
 
+# Quick check for SMB/NFS shares. Without Sentry Manager's record, the only
+# way to SHA-256 the share's copy of a clip is to read all of it back over
+# the network (about 30-40 MB per clip). The quick check reads about 300 KB
+# instead and compares a fingerprint of each copy:
+#   - the size;
+#   - the SHA-256 of the MP4's moov box, the index that holds every frame's
+#     size, timing and position. Identical moov boxes mean the same frame
+#     count, frame rate and frame layout, and a cut-off copy can't pass (its
+#     moov is missing or points past the end);
+#   - the SHA-256 of four 64 KiB slices of the video data (mdat) at 20, 40,
+#     60 and 80 %, to catch corruption inside the video.
+# It can miss damage confined to video data between the slices; the full
+# check can't. ARCHIVE_VERIFY_MODE=full forces the full read-back (Settings).
+# Files under 2 MiB, or that aren't readable MP4s on the Pi, are hashed whole.
+ARCHIVE_QUICK_WHOLE_BELOW=2097152
+
+# Print a quick fingerprint of file $1, or fail if it can't be read.
+# $2=mp4-only: don't fall back to hashing the whole file (for the share's
+# copy, when the Pi's copy is an MP4: a share copy that isn't a readable MP4
+# is a mismatch, and downloading it to prove that would defeat the point).
+function archive_quick_fingerprint () {
+  local f=$1 mode=${2:-} size pos=0 hdr len type n=0
+  local moov_off="" moov_len="" mdat_off="" mdat_len="" moovsha slicesha k
+  size=$(stat -L -c %s -- "$f" 2>/dev/null) || return 1
+  if [ "$size" -lt "$ARCHIVE_QUICK_WHOLE_BELOW" ] && [ "$mode" != mp4-only ]
+  then
+    printf 'whole:%s:%s\n' "$size" "$(sha256sum < "$f" | cut -c1-64)"
+    return
+  fi
+  # Walk the top-level boxes by their headers: 16 bytes each, a few reads.
+  while [ "$pos" -lt "$size" ] && [ "$n" -lt 64 ]
+  do
+    n=$((n + 1))
+    hdr=$(dd if="$f" iflag=skip_bytes,count_bytes skip="$pos" count=16 2>/dev/null | od -An -v -tx1 | tr -d ' \n')
+    [ "${#hdr}" -ge 16 ] || break
+    len=$((16#${hdr:0:8}))
+    type=${hdr:8:8}
+    if [ "$len" -eq 1 ]
+    then
+      [ "${#hdr}" -ge 32 ] || break
+      len=$((16#${hdr:16:16}))
+    elif [ "$len" -eq 0 ]
+    then
+      len=$((size - pos))
+    fi
+    [ "$len" -ge 8 ] || break
+    case "$type" in
+      6d6f6f76) moov_off=$pos moov_len=$len ;;   # moov
+      6d646174) mdat_off=$pos mdat_len=$len ;;   # mdat
+    esac
+    pos=$((pos + len))
+  done
+  if [ -z "$moov_off" ] || [ -z "$mdat_off" ] || [ $((moov_off + moov_len)) -gt "$size" ]
+  then
+    if [ "$mode" = mp4-only ]
+    then
+      printf 'not-mp4:%s\n' "$size"
+    else
+      printf 'whole:%s:%s\n' "$size" "$(sha256sum < "$f" | cut -c1-64)"
+    fi
+    return
+  fi
+  moovsha=$(dd if="$f" iflag=skip_bytes,count_bytes skip="$moov_off" count="$moov_len" 2>/dev/null | sha256sum | cut -c1-64)
+  slicesha=$(for k in 1 2 3 4
+    do
+      dd if="$f" iflag=skip_bytes,count_bytes skip=$((mdat_off + mdat_len * k / 5)) count=65536 2>/dev/null
+    done | sha256sum | cut -c1-64)
+  printf 'mp4:%s:%s:%s\n' "$size" "$moovsha" "$slicesha"
+}
+
+# The share copy's fingerprint, bounded so a hung SMB/NFS mount can't stall
+# the archive loop. The function and its size limit are exported to the
+# timeout's child bash.
+function archive_remote_quick_fingerprint () {
+  export -f archive_quick_fingerprint
+  # shellcheck disable=SC2016 # $1/$2 are expanded by the inner bash
+  ARCHIVE_QUICK_WHOLE_BELOW=$ARCHIVE_QUICK_WHOLE_BELOW timeout 300 \
+    bash -c 'archive_quick_fingerprint "$1" "$2"' _ "$ARCHIVE_MOUNT/$1" "$2"
+}
+
+# "<relpath>\t<status>" from two fingerprints. A whole-file fingerprint
+# (small files) is a full-content comparison, so it counts as plain ok.
+function archive_quick_result () {
+  if [ "$2" != "$3" ]; then printf '%s\tmismatch\n' "$1"
+  elif [ "${2%%:*}" = whole ]; then printf '%s\tok\n' "$1"
+  else printf '%s\tok_quick\n' "$1"
+  fi
+}
+
+# True when this cycle checks SMB/NFS copies with the quick check rather
+# than reading them back whole. Read fresh, like the other settings.
+function archive_verify_quick_mode () {
+  case "${ARCHIVE_SYSTEM:-none}" in cifs|nfs) ;; *) return 1 ;; esac
+  local v
+  v=$(archive_conf_value ARCHIVE_VERIFY_MODE)
+  [ "${v,,}" != full ]
+}
+
 # Check one batch of queue lines ($1) and append the results to the ledger.
 # $ARCHIVE_VERIFY_WORK/prev holds each clip's latest ledger line from before
 # this run, which carries the "times verified" count forward.
@@ -2157,6 +2258,55 @@ function verify_archive_batch () {
     mv "$still" "$readback"
   fi
 
+  # Quick check (SMB/NFS): fingerprint both copies instead of reading the
+  # share's copy back. Needs the Pi's copy; a re-check whose snapshot is gone
+  # stays on the full read-back.
+  local quick="$ARCHIVE_VERIFY_WORK/quick"
+  : > "$quick"
+  if [ -s "$readback" ] && archive_verify_quick_mode
+  then
+    timeout 10 [ -d "${ARCHIVE_MOUNT:-}" ] || return 1
+    local still="$ARCHIVE_VERIFY_WORK/readback-still" lfp rfp qrel qsum qsrc qabsent=""
+    : > "$still"
+    while IFS=$'\t' read -r qrel _ qsum qsrc
+    do
+      grep -qxF -- "$qrel" "$readback" || continue
+      # No Pi copy and no stored hash: nothing to compare (nosource), so
+      # don't read the share's copy at all.
+      [ "$qsum" != "-" ] || continue
+      if [ -z "$qsrc" ] || [ ! -f "$qsrc" ] ||
+         ! lfp=$(ionice -c2 -n7 nice -n19 archive_quick_fingerprint "$qsrc")
+      then
+        echo "$qrel" >> "$still"
+        continue
+      fi
+      local rmode=""
+      [ "${lfp%%:*}" != mp4 ] || rmode=mp4-only
+      if ! rfp=$(archive_remote_quick_fingerprint "$qrel" "$rmode")
+      then
+        qabsent+="$qrel"$'\t'"$lfp"$'\t'"$rmode"$'\n'
+        continue
+      fi
+      archive_quick_result "$qrel" "$lfp" "$rfp" >> "$quick"
+    done < "$localsums"
+    # Briefly absent isn't missing (see the read-back case below).
+    if [ -n "$qabsent" ]
+    then
+      sleep "${ARCHIVE_VERIFY_ABSENT_RECHECK_SECONDS:-20}"
+      while IFS=$'\t' read -r qrel lfp rmode
+      do
+        [ -n "$qrel" ] || continue
+        if rfp=$(archive_remote_quick_fingerprint "$qrel" "$rmode")
+        then
+          archive_quick_result "$qrel" "$lfp" "$rfp" >> "$quick"
+        else
+          printf '%s\tmissing\n' "$qrel" >> "$quick"
+        fi
+      done <<< "$qabsent"
+    fi
+    mv "$still" "$readback"
+  fi
+
   : > "$ARCHIVE_VERIFY_WORK/remote"
   if [ -s "$readback" ]
   then
@@ -2183,25 +2333,27 @@ function verify_archive_batch () {
   # means the share held exactly the uploaded bytes when Manager converted
   # them ("converted"); different goes on as a mismatch, which the
   # reclassification below explains as a bad-source conversion.
-  awk -F'\t' -v now="$(date +%s)" -v remote="$ARCHIVE_VERIFY_WORK/remote" -v prev="$ARCHIVE_VERIFY_WORK/prev" -v pre="$pre" -v codec="$codec_only" '
+  awk -F'\t' -v now="$(date +%s)" -v remote="$ARCHIVE_VERIFY_WORK/remote" -v prev="$ARCHIVE_VERIFY_WORK/prev" -v pre="$pre" -v codec="$codec_only" -v quick="$quick" '
     FILENAME == prev   { ps[$1] = $5; ph[$1] = $3; pc[$1] = $6 + 0; next }
     FILENAME == pre    { m[$2] = $1; next }
     FILENAME == codec  { reenc[$0] = 1; next }
+    FILENAME == quick  { qs[$1] = $2; next }
     FILENAME == remote { r[$2] = $1; next }
     {
       if ($3 == "-")          status = "nosource"
       else if ($1 in m)       status = (m[$1] == $3) ? "converted" : "mismatch"
       else if ($1 in reenc)   status = "mismatch"   # classified as a re-encode below
+      else if ($1 in qs)      status = qs[$1]
       else if (!($1 in r))    status = "missing"
       else if (r[$1] == $3)   status = "ok"
       else                    status = "mismatch"
       count = 0
-      if (status == "ok")
-        count = (ps[$1] == "ok" && ph[$1] == $3) ? pc[$1] + 1 : 1
+      if (status == "ok" || status == "ok_quick")
+        count = ((ps[$1] == "ok" || ps[$1] == "ok_quick") && ph[$1] == $3) ? pc[$1] + 1 : 1
       else if (status == "converted")
-        count = (ps[$1] == "ok" || ps[$1] == "converted") ? pc[$1] + 1 : 1
+        count = (ps[$1] == "ok" || ps[$1] == "ok_quick" || ps[$1] == "converted") ? pc[$1] + 1 : 1
       print $1 "\t" $2 "\t" $3 "\t" now "\t" status "\t" count "\t" $4
-    }' "$ARCHIVE_VERIFY_WORK/prev" "$pre" "$codec_only" "$ARCHIVE_VERIFY_WORK/remote" "$localsums" > "$ARCHIVE_VERIFY_WORK/results"
+    }' "$ARCHIVE_VERIFY_WORK/prev" "$pre" "$codec_only" "$quick" "$ARCHIVE_VERIFY_WORK/remote" "$localsums" > "$ARCHIVE_VERIFY_WORK/results"
 
   # A mismatch that is Sentry Manager's in-place re-encode (server copy
   # H.265/AV1, Pi copy not) is never renamed aside or re-sent as damage:
@@ -2232,7 +2384,7 @@ function verify_archive_batch () {
         printf '%s\tconverted\n' "$rel" >> "$reclass"
       elif [ -n "$orig" ]; then
         log "ERROR: archive verification: Sentry Manager re-encoded $rel from a copy that doesn't match the Pi's (SHA-256); renaming its output aside and sending the original again"
-      elif [ "$prev_status" = ok ] || [ "$prev_status" = converted ]; then
+      elif [ "$prev_status" = ok ] || [ "$prev_status" = ok_quick ] || [ "$prev_status" = converted ]; then
         printf '%s\tconverted\n' "$rel" >> "$reclass"
       else
         printf '%s\tconverted_unconfirmed\n' "$rel" >> "$reclass"
@@ -2246,7 +2398,7 @@ function verify_archive_batch () {
       FILENAME == rc { to[$1] = $2; next }
       ($1 in to) && $5 == "mismatch" {
         $5 = to[$1]
-        if ($5 == "converted") $6 = (ps[$1] == "ok" || ps[$1] == "converted") ? pc[$1] + 1 : 1
+        if ($5 == "converted") $6 = (ps[$1] == "ok" || ps[$1] == "ok_quick" || ps[$1] == "converted") ? pc[$1] + 1 : 1
         else $6 = 0
       }
       { print }' "$ARCHIVE_VERIFY_WORK/prev" "$reclass" "$ARCHIVE_VERIFY_WORK/results" > "$ARCHIVE_VERIFY_WORK/results.new" &&
@@ -2318,7 +2470,7 @@ function queue_archive_rechecks () {
     END {
       for (r in last) {
         split(last[r], f, "\t")
-        if ((f[5] == "ok" || f[5] == "converted") && f[6] + 0 == 1 && f[4] + 0 <= cutoff)
+        if ((f[5] == "ok" || f[5] == "ok_quick" || f[5] == "converted") && f[6] + 0 == 1 && f[4] + 0 <= cutoff)
           print f[1] "\t" f[7] "\t" f[2] "\t" f[3] "\t" now
       }
     }' "$ARCHIVE_VERIFY_LEDGER" >> "$ARCHIVE_VERIFY_QUEUE"
@@ -2346,7 +2498,7 @@ function snapshot_verified_twice () {
       return p
     }
     FILENAME == ledger {
-      if ((($5 == "ok" || $5 == "converted") && $6 + 0 >= 2) || ($5 == "converted_unconfirmed" && trust == "true")) {
+      if ((($5 == "ok" || $5 == "ok_quick" || $5 == "converted") && $6 + 0 >= 2) || ($5 == "converted_unconfirmed" && trust == "true")) {
         k = key($1); if (!(k in vs) || $2 + 0 > vs[k]) vs[k] = $2 + 0
       }
       next
@@ -2540,17 +2692,18 @@ function verify_archived_clips () {
   fi
   prune_archive_verify_ledger || log "WARNING: could not prune the archive verification ledger"
 
-  local ok bad nosource converted left=0 waiting
+  local ok quickok bad nosource converted left=0 waiting
   waiting=$(wc -l < "$ARCHIVE_VERIFY_WORK/deferred")
   ok=$(awk -F'\t' '$5 == "ok"' "$ARCHIVE_VERIFY_WORK/results-all" | wc -l)
+  quickok=$(awk -F'\t' '$5 == "ok_quick"' "$ARCHIVE_VERIFY_WORK/results-all" | wc -l)
   converted=$(awk -F'\t' '$5 == "converted" || $5 == "converted_unconfirmed"' "$ARCHIVE_VERIFY_WORK/results-all" | wc -l)
   bad=$(awk -F'\t' '$5 == "mismatch" || $5 == "missing"' "$ARCHIVE_VERIFY_WORK/results-all" | wc -l)
   nosource=$(awk -F'\t' '$5 == "nosource"' "$ARCHIVE_VERIFY_WORK/results-all" | wc -l)
   [ ! -s "$ARCHIVE_VERIFY_QUEUE" ] || left=$(wc -l < "$ARCHIVE_VERIFY_QUEUE")
-  log "Archive verification: $ok matched, $converted re-encoded on the server by Sentry Manager, $bad to re-send, $nosource with no Pi copy left to compare, $left still queued ($waiting waiting for Sentry Manager's checksum)${stopped:+ ($stopped)}"
+  log "Archive verification: $ok matched, $quickok matched by quick check, $converted re-encoded on the server by Sentry Manager, $bad to re-send, $nosource with no Pi copy left to compare, $left still queued ($waiting waiting for Sentry Manager's checksum)${stopped:+ ($stopped)}"
   ARCHIVE_VERIFY_WAITING=$waiting
   ARCHIVE_VERIFY_RAN=1
-  ARCHIVE_VERIFY_MATCHED=$ok
+  ARCHIVE_VERIFY_MATCHED=$((ok + quickok))
   ARCHIVE_VERIFY_CONVERTED=$converted
   ARCHIVE_VERIFY_RESEND=$bad
   ARCHIVE_VERIFY_NOSOURCE=$nosource

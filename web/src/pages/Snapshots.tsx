@@ -14,6 +14,8 @@ export interface ArchiveCoverage {
   verified_twice: number
   /** Of verified: re-encoded in place by Sentry Manager (checked by codec, not checksum). */
   converted?: number
+  /** Of verified: matched by the SMB/NFS quick check rather than a full checksum. */
+  quick?: number
   /** Re-encoded by Sentry Manager before anything confirmed the original. */
   unconfirmed?: number
   pending: number
@@ -66,7 +68,7 @@ export function ArchiveTag({ archive }: { archive?: ArchiveCoverage | null }) {
     case "verified":
       return (
         <span className={`${tagClass} border-emerald-400/30 bg-emerald-400/10 text-emerald-300`}
-          title={`All ${archive.clips} clips were sent to the archive server and their SHA-256 checksums match the Pi's copy.${archive.converted ? ` ${archive.converted} of them were re-encoded by Sentry Manager (H.265/AV1); their originals were confirmed by checksum before or during conversion.` : ""}${archive.verified_twice === archive.clips ? " Every clip has been checked twice." : ""}${checked}`}>
+          title={`All ${archive.clips} clips were sent to the archive server and their SHA-256 checksums match the Pi's copy.${archive.converted ? ` ${archive.converted} of them were re-encoded by Sentry Manager (H.265/AV1); their originals were confirmed by checksum before or during conversion.` : ""}${archive.quick ? ` ${archive.quick} were checked with the quick check (size, frame index and spot checks of the video) instead of reading them back whole.` : ""}${archive.verified_twice === archive.clips ? " Every clip has been checked twice." : ""}${checked}`}>
           <CheckCircleIcon className="h-3 w-3" />
           Verified on archive{archive.verified_twice === archive.clips ? " ×2" : ""}
         </span>
