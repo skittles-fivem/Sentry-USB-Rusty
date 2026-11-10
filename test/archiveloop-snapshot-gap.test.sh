@@ -20,7 +20,7 @@ do
   eval "$src"
 done
 grep -q '^SNAPSHOT_GAP_MARKER=' "$script" || { echo "SNAPSHOT_GAP_MARKER not defined" >&2; exit 1; }
-grep -q 'snapshot_gap_check || true' "$script" || { echo "snapshotloop doesn't call snapshot_gap_check" >&2; exit 1; }
+grep -q 'snapshot_gap_check "$snap_rc" || true' "$script" || { echo "snapshotloop doesn't call snapshot_gap_check" >&2; exit 1; }
 
 failures=0
 fail() { echo "FAIL: $*" >&2; failures=$((failures + 1)); }
@@ -66,17 +66,25 @@ snapshot_gap_check
 [ -z "$logs" ] || fail "a 30 min old snapshot is no gap: $logs"
 [ ! -e "$SNAPSHOT_GAP_MARKER" ] || fail "marker not cleared when there's no gap"
 
-# Newest 70 min old and the car wrote after it: footage may be lost.
+# Newest 70 min old, the car touched its drive 10 min ago, but the runs
+# succeeded (discarded as identical): housekeeping, not footage. Logged
+# only (the 2026-11-10 11:22 false alarm).
 snap_at 2 $((now - 4200))
 touch -d "@$((now - 600))" "$cam"
 logs=""
-snapshot_gap_check
+snapshot_gap_check 0
+grep -q "WARNING: snapshot gap: no snapshot for 70 min.*every run since .* found no new clip on the drive.*was housekeeping" <<< "$logs" || fail "identical runs with a recent drive write should be housekeeping: $logs"
+[ "$(pushes_count)" = 0 ] || fail "identical runs must not alert, even if the car touched its drive"
+# The same gap when a run fails: footage may be lost.
+rm -f "$SNAPSHOT_GAP_MARKER"
+logs=""
+snapshot_gap_check 1
 grep -q "ERROR: snapshot gap: no snapshot for 70 min" <<< "$logs" || fail "gap not logged as an error: $logs"
-grep -q "the car wrote to its drive at .*, after the last snapshot, but no snapshot since has kept it" <<< "$logs" || fail "wrong reason: $logs"
-[ "$(pushes_count)" = 1 ] || fail "car wrote after the last snapshot: one alert expected"
+grep -q "the last snapshot run failed (exit 1)" <<< "$logs" || fail "wrong reason: $logs"
+[ "$(pushes_count)" = 1 ] || fail "a failed run: one alert expected"
 # Reported once per gap, however many runs see it.
 logs=""
-snapshot_gap_check
+snapshot_gap_check 1
 [ -z "$logs" ] || fail "the same gap was reported again: $logs"
 [ "$(pushes_count)" = 1 ] || fail "the same gap alerted again"
 
@@ -115,7 +123,7 @@ snap_at 8 $((now - 4000))
 touch -d "@$((now - 4100))" "$cam"
 logs=""
 snapshot_gap_check
-grep -q "WARNING: snapshot gap: .*the car hasn't written to its drive since .*car awake over BLE: unknown" <<< "$logs" || fail "idle car not reported: $logs"
+grep -q "WARNING: snapshot gap: .*found no new clip on the drive.*car awake over BLE: unknown" <<< "$logs" || fail "idle car not reported: $logs"
 [ "$(pushes_count)" = 3 ] || fail "an idle car with unknown wake state should not alert"
 snap_at 9 $((now - 4000 + 1))
 AWAKE=yes

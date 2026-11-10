@@ -4833,8 +4833,11 @@ function uptime_seconds {
 # after every scheduled run. The schedule itself never slips by more than
 # one run; a gap means runs produced no snapshot. It logs why, once per gap
 # (keyed by the newest snapshot's time), and sends one push alert per gap:
-#  - the car wrote to its drive after the newest snapshot, yet no snapshot
-#    kept it (runs failed or were discarded): footage may be lost;
+#  - the last snapshot run failed: clips the car wrote may not be kept
+#    (judged by the run's own result, not by the drive's last-write time:
+#    the car touches its drive every few minutes even when it isn't
+#    recording, and a run comes out "identical" only when no new or longer
+#    file exists, so an identical run means nothing was missed);
 #  - the drive isn't presented to the car, or the USB link to the car is
 #    down: the car can't record to it at all (a down link alerts only while
 #    BLE says the car is awake: a sleeping car suspends its USB port);
@@ -4860,6 +4863,9 @@ function snapshot_gap_udc_state () {
 }
 
 function snapshot_gap_check () {
+  # $1: the exit status of the snapshot run just before (0 = kept, or
+  # discarded as identical).
+  local run_rc=${1:-0}
   local last now gap limit cam udc reason level=WARNING alert=false
   last=$(newest_snapshot_unix) || return 0
   now=$(date +%s)
@@ -4879,9 +4885,9 @@ function snapshot_gap_check () {
   local at_last at_cam
   at_last=$(date -d "@$last" '+%H:%M' 2>/dev/null || echo "$last")
   at_cam=$(date -d "@$cam" '+%H:%M' 2>/dev/null || echo "$cam")
-  if [ "$cam" -gt $((last + 120)) ]
+  if [ "$run_rc" != 0 ]
   then
-    reason="the car wrote to its drive at $at_cam, after the last snapshot, but no snapshot since has kept it"
+    reason="the last snapshot run failed (exit $run_rc), so clips the car wrote since $at_last may not be kept"
     level=ERROR alert=true
   elif ! usb_gadget_is_active
   then
@@ -4893,7 +4899,7 @@ function snapshot_gap_check () {
     # A sleeping car suspends its USB port; that's only trouble while awake.
     [ "$awake" != yes ] || alert=true
   else
-    reason="the car hasn't written to its drive since $at_cam, so there was nothing new to keep (it isn't recording)"
+    reason="every run since $at_last found no new clip on the drive, so there was nothing to keep (the car isn't recording; its last write, at $at_cam, was housekeeping)"
   fi
   log "$level: snapshot gap: no snapshot for $((gap / 60)) min (last at $at_last): $reason; car awake over BLE: $awake"
   echo "$last" > "$SNAPSHOT_GAP_MARKER" 2>/dev/null || true
@@ -4936,9 +4942,10 @@ function snapshotloop {
     fi
     # A failed snapshot is already logged and keeps its image for recovery;
     # under errexit it must not take down this worker and its siblings.
-    /root/bin/make_snapshot.sh || log "ERROR: make_snapshot.sh failed (exit $?)"
+    local snap_rc=0
+    /root/bin/make_snapshot.sh || { snap_rc=$?; log "ERROR: make_snapshot.sh failed (exit $snap_rc)"; }
     # Say so (once per gap) when the newest snapshot is now over an hour old.
-    snapshot_gap_check || true
+    snapshot_gap_check "$snap_rc" || true
     # The next boot's clock must not start before this snapshot.
     save_clock_checkpoint || true
     # Hash the new clips now, in the background at idle priority, so the
