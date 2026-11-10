@@ -15,6 +15,18 @@ const SNAPSHOTS_DIR: &str = "/backingfiles/snapshots";
 /// autofs root targeted by each snapshot's stable `mnt` symlink.
 const AUTOFS_SNAPSHOTS: &str = "/tmp/snapshots";
 const CAM_DISK: &str = "/backingfiles/cam_disk.bin";
+/// One line per committed snapshot, "<name>\t<unix time it was taken>",
+/// kept after the snapshot is released. archiveloop reads it for the archive
+/// status file's snapshot list and prunes it. Same file as make_snapshot.sh.
+const SNAPSHOT_LOG: &str = "/mutable/snapshot_log.tsv";
+
+/// Append a committed snapshot to [`SNAPSHOT_LOG`] (best effort).
+fn record_snapshot_taken(log: &Path, name: &str, started_unix: u64) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(log)?;
+    // One write per line, so concurrent appends can't interleave.
+    f.write_all(format!("{name}\t{started_unix}\n").as_bytes())
+}
 const REBUILD_FLAG: &str = "/mutable/.rebuild_snapshot_symlinks";
 
 /// Persistent marker for the one-time legacy event-cross-link purge.
@@ -78,6 +90,12 @@ pub async fn make_snapshot_with(skip_fsck: bool, caller_holds_lock: bool) -> Res
 
     std::fs::create_dir_all(&snap_dir)?;
     info!("Taking snapshot of cam disk in {}", snap_dir);
+
+    // When this snapshot was taken: the copy below captures the drive as of now.
+    let started_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
 
     // reflink=auto retains a full-copy fallback. Low best-effort priority keeps
     // car writes responsive while still progressing under continuous recording.
@@ -155,6 +173,9 @@ pub async fn make_snapshot_with(skip_fsck: bool, caller_holds_lock: bool) -> Res
     }
     if let Err(e) = std::fs::rename(&toc_path_tmp, &toc_path) {
         bail!("could not commit the TOC for {}: {}", snap_name, e);
+    }
+    if let Err(e) = record_snapshot_taken(Path::new(SNAPSHOT_LOG), &snap_name, started_unix) {
+        warn!("could not log snapshot {} in {}: {}", snap_name, SNAPSHOT_LOG, e);
     }
 
     // Create the stable target before per-clip links reference it.
@@ -2516,5 +2537,17 @@ mod tests {
         assert_eq!(num, 12, "must append past the image, not reuse its slot");
         assert!(kept, "the image without a TOC must survive");
         assert!(toc.as_deref().is_some_and(|t| t.contains("snap-000010")));
+    }
+
+    #[test]
+    fn committed_snapshots_are_appended_to_the_snapshot_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("snapshot_log.tsv");
+        super::record_snapshot_taken(&log, "snap-000011", 1_762_731_609).unwrap();
+        super::record_snapshot_taken(&log, "snap-000012", 1_762_735_089).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "snap-000011\t1762731609\nsnap-000012\t1762735089\n"
+        );
     }
 }

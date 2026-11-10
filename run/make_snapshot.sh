@@ -379,6 +379,11 @@ function snapshot {
     rm -rf "$newsnapname"
   fi
 
+  # When this snapshot was taken (the copy below captures the car's drive as
+  # of now), for the snapshot log.
+  local started
+  started=$(date +%s)
+
   # make a copy-on-write snapshot of the current image, at the lowest
   # best-effort I/O and CPU priority so it yields to the car's USB I/O
   ionice -c2 -n7 nice -n19 cp --reflink=always /backingfiles/cam_disk.bin "$newsnapname"
@@ -430,6 +435,19 @@ function snapshot {
     return 1
   fi
   log "comparing new snapshot with $oldname"
+  local newcount oldcount=0
+  newcount=$(wc -l < "${newsnapname}.toc_")
+  [ ! -e "${oldname}.toc" ] || oldcount=$(wc -l < "${oldname}.toc")
+  # An empty listing after a snapshot that had files is a mount or scan that
+  # read nothing, not a car that deleted everything: "identical" would
+  # discard footage the image may hold. Keep the image for the boot-time TOC
+  # rebuild instead, like a failed scan.
+  if [ "$newcount" -eq 0 ] && [ "$oldcount" -gt 0 ]
+  then
+    log "ERROR: new snapshot lists no files (the previous one had $oldcount); keeping the image without a TOC"
+    rm -f "${newsnapname}.toc_"
+    return 1
+  fi
   if [[ ! -e "${oldname}.toc" ]] || diff "${oldname}.toc" "${newsnapname}.toc_" | grep -qe '^>'
   then
     # Commit the TOC first, then link. The links stay marked as owed until
@@ -440,6 +458,9 @@ function snapshot {
       log "ERROR: could not commit the TOC for $newsnapdir"
       return 1
     fi
+    # Log when it was taken (kept after the snapshot is released, for the
+    # archive status file's snapshot list). Best effort.
+    printf '%s\t%s\n' "$(basename "$newsnapdir")" "$started" >> /mutable/snapshot_log.tsv 2>/dev/null || true
     # The car auto-deletes Sentry events when the cam disk fills, so we
     # cannot tell user deletions apart from firmware cleanup. Don't sync
     # deletions from the cam disk into snapshot symlinks.
@@ -449,7 +470,11 @@ function snapshot {
       rm -f "${newsnapname}.relink_pending"
     fi
   else
-    log "new snapshot is identical to previous one, discarding"
+    # Say when the car last wrote to its drive: an identical snapshot means
+    # it wrote no new or longer clip since the previous snapshot.
+    local camwrite
+    camwrite=$(date -d "@$(stat -c %Y /backingfiles/cam_disk.bin 2>/dev/null || echo 0)" '+%F %T' 2>/dev/null || echo unknown)
+    log "new snapshot is identical to previous one ($newcount files; the car last wrote to its drive at $camwrite), discarding"
     /root/bin/release_snapshot.sh "$newsnapdir"
     rm -rf "$newsnapdir"
   fi

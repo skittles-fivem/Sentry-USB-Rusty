@@ -3479,6 +3479,43 @@ function json_bool () {
   if "$@" >/dev/null 2>&1; then printf 'true'; else printf 'false'; fi
 }
 
+# Snapshot log: "<name>\t<unix time taken>" per committed snapshot, written
+# by make_snapshot (bash or Rust) and kept after the snapshot is released.
+SNAPSHOT_LOG=/mutable/snapshot_log.tsv
+
+# Bring the snapshot log up to date for the status file: add snapshots on
+# the Pi that it doesn't list yet (taken before the log existed; their time
+# is the image's mtime, set when it was copied), and drop lines older than 8
+# days so it stays small. Prints the "snapshots" JSON array: every snapshot
+# taken in the last 7 days, oldest first, at most 1000, one per name and
+# time.
+function snapshot_log_json () {
+  local toc dir name taken
+  for toc in /backingfiles/snapshots/snap-[0-9]*/snap.bin.toc
+  do
+    [ -e "$toc" ] || continue
+    dir=${toc%/snap.bin.toc}
+    name=${dir##*/}
+    grep -q "^$name"$'\t' "$SNAPSHOT_LOG" 2>/dev/null && continue
+    taken=$(stat -c %Y "$dir/snap.bin" 2>/dev/null || stat -c %Y "$toc" 2>/dev/null) || continue
+    printf '%s\t%s\n' "$name" "$taken" >> "$SNAPSHOT_LOG" 2>/dev/null || true
+  done
+  local now
+  now=$(date +%s)
+  if [ -s "$SNAPSHOT_LOG" ] &&
+     awk -F'\t' -v cut=$((now - 8 * 86400)) '$2 + 0 >= cut' "$SNAPSHOT_LOG" > "$SNAPSHOT_LOG.new" 2>/dev/null
+  then
+    mv -f "$SNAPSHOT_LOG.new" "$SNAPSHOT_LOG" 2>/dev/null || rm -f "$SNAPSHOT_LOG.new"
+  fi
+  { cat "$SNAPSHOT_LOG" 2>/dev/null || true; } |
+    awk -F'\t' -v cut=$((now - 7 * 86400)) '
+      $1 ~ /^snap-[0-9]+$/ && $2 ~ /^[0-9]+$/ && $2 + 0 >= cut && !seen[$1 "\t" $2]++ { print $2 "\t" $1 }' |
+    sort -n | tail -n 1000 |
+    awk -F'\t' 'BEGIN { printf "[" }
+      { printf "%s\n    { \"name\": \"%s\", \"started_unix\": %s }", (NR > 1 ? "," : ""), $2, $1 }
+      END { printf (NR ? "\n  ]" : "]") }'
+}
+
 function build_share_status_json () {
   local clip=null stopped=null ran=false
   [ -z "${ARCHIVE_LAST_CLIP:-}" ] || clip=$(json_string "$ARCHIVE_LAST_CLIP")
@@ -3508,6 +3545,10 @@ function build_share_status_json () {
   printf '  },\n'
   printf '  "auto_delete_enabled": %s,\n' "$(json_bool archive_auto_delete_enabled)"
   printf '  "state": %s,\n' "$(json_string "${ARCHIVE_SHARE_STATE:-idle}")"
+  local interval="${SNAPSHOT_INTERVAL:-3480}"
+  [[ "$interval" =~ ^[0-9]+$ ]] && [ "$interval" -gt 0 ] || interval=3480
+  printf '  "snapshot_interval_s": %s,\n' "$interval"
+  printf '  "snapshots": %s,\n' "$(snapshot_log_json)"
   if [ -n "${ARCHIVE_PLAN_START:-}" ]
   then
     printf '  "transfer": {\n'
@@ -4725,6 +4766,81 @@ function uptime_seconds {
 # Schedule each snapshot from when the previous one STARTED, and skip the idle
 # wait: a mid-write copy is safe (make_snapshot fscks the copy), as the
 # boot-time snapshot already relies on.
+# A snapshot gap: the newest snapshot is older than SNAPSHOT_GAP_ALERT_SECONDS
+# (default 3600, the car's ~1 h RecentClips buffer). snapshotloop calls this
+# after every scheduled run. The schedule itself never slips by more than
+# one run; a gap means runs produced no snapshot. It logs why, once per gap
+# (keyed by the newest snapshot's time), and sends one push alert per gap:
+#  - the car wrote to its drive after the newest snapshot, yet no snapshot
+#    kept it (runs failed or were discarded): footage may be lost;
+#  - the drive isn't presented to the car, or the USB link to the car is
+#    down: the car can't record to it at all;
+#  - otherwise the car simply hasn't written to the drive (it isn't
+#    recording, e.g. parked with Sentry Mode off), so nothing was missed.
+SNAPSHOT_GAP_MARKER=/mutable/snapshot_gap_reported
+
+# Unix time of the newest snapshot with a committed TOC (when it was taken),
+# or nothing when there is none.
+function newest_snapshot_unix () {
+  local toc
+  toc=$(LC_ALL=C find /backingfiles/snapshots -mindepth 2 -maxdepth 2 -path '*/snap-[0-9]*/snap.bin.toc' 2>/dev/null |
+    LC_ALL=C sort | tail -1)
+  [ -n "$toc" ] || return 1
+  stat -c %Y "$toc"
+}
+
+# The USB link state to the car ("configured" when the car is using the
+# drive), for the gap check.
+function snapshot_gap_udc_state () {
+  cat /sys/class/udc/*/state 2>/dev/null | head -1
+}
+
+function snapshot_gap_check () {
+  local last now gap limit cam udc reason level=WARNING alert=false
+  last=$(newest_snapshot_unix) || return 0
+  now=$(date +%s)
+  limit=${SNAPSHOT_GAP_ALERT_SECONDS:-3600}
+  gap=$((now - last))
+  if [ "$gap" -le "$limit" ]
+  then
+    rm -f "$SNAPSHOT_GAP_MARKER"
+    return 0
+  fi
+  # Once per gap (the newest snapshot's time identifies it).
+  [ "$(cat "$SNAPSHOT_GAP_MARKER" 2>/dev/null)" != "$last" ] || return 0
+  cam=$(stat -c %Y /backingfiles/cam_disk.bin 2>/dev/null || echo 0)
+  udc=$(snapshot_gap_udc_state)
+  local at_last at_cam
+  at_last=$(date -d "@$last" '+%H:%M' 2>/dev/null || echo "$last")
+  at_cam=$(date -d "@$cam" '+%H:%M' 2>/dev/null || echo "$cam")
+  if [ "$cam" -gt $((last + 120)) ]
+  then
+    reason="the car wrote to its drive at $at_cam, after the last snapshot, but no snapshot since has kept it"
+    level=ERROR alert=true
+  elif ! usb_gadget_is_active
+  then
+    reason="the USB drive isn't presented to the car, so the car can't record to it"
+    level=ERROR alert=true
+  elif [ -n "$udc" ] && [ "$udc" != configured ]
+  then
+    reason="the car isn't using the USB drive (USB state '$udc'); it last wrote at $at_cam"
+    alert=true
+  else
+    reason="the car hasn't written to its drive since $at_cam, so there was nothing new to keep (it isn't recording)"
+  fi
+  local awake=unknown
+  if car_is_awake_via_ble; then awake=yes; fi
+  log "$level: snapshot gap: no snapshot for $((gap / 60)) min (last at $at_last): $reason; car awake over BLE: $awake"
+  echo "$last" > "$SNAPSHOT_GAP_MARKER" 2>/dev/null || true
+  if [ "$alert" = true ] || [ "$awake" = yes ]
+  then
+    /root/bin/send-push-message "${NOTIFICATION_TITLE:-SentryUSB}:" \
+      "No snapshot for $((gap / 60)) min (last at $at_last): $reason." \
+      warning snapshot_gap "No snapshot for over an hour. Recent footage may not be kept." 2>/dev/null ||
+      log "failed to send snapshot gap notification"
+  fi
+}
+
 # When the next scheduled snapshot is due (unix time), for the web UI.
 NEXT_SNAPSHOT_FILE=/tmp/sentryusb-next-snapshot
 
@@ -4754,6 +4870,8 @@ function snapshotloop {
     # A failed snapshot is already logged and keeps its image for recovery;
     # under errexit it must not take down this worker and its siblings.
     /root/bin/make_snapshot.sh || log "ERROR: make_snapshot.sh failed (exit $?)"
+    # Say so (once per gap) when the newest snapshot is now over an hour old.
+    snapshot_gap_check || true
     # The next boot's clock must not start before this snapshot.
     save_clock_checkpoint || true
     # Hash the new clips now, in the background at idle priority, so the

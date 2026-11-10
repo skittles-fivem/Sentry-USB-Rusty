@@ -23,7 +23,7 @@ for fn in sortfile prunefile archive_conf_value archive_verify_enabled archive_a
   requeue_unconfirmed_for_basic_rule archive_basic_describe archive_current_source archive_resolve_batch_sources requeue_nosource_with_copy archive_verify_parallel archive_remote_quick_fingerprints archive_lowprio_fn archive_verify_basic_mode archive_basic_fingerprints archive_basic_result verify_archive_batch_basic archive_verify_finish_batch \
   archive_stream_is_reencoded archive_local_is_reencoded archive_remote_is_reencoded archive_manager_original_sums archive_manager_record_present \
   queue_unverified_archived queue_archive_rechecks snapshot_verified_twice auto_delete_verified_snapshots verify_archived_clips \
-  json_string json_int json_bool build_share_status_json plan_share_transfer record_archive_throughput \
+  json_string json_int json_bool snapshot_log_json build_share_status_json plan_share_transfer record_archive_throughput \
   write_share_status
 do
   src=$(extract "$fn")
@@ -67,6 +67,7 @@ export ARCHIVE_VERIFY_ABSENT_RECHECK_SECONDS=0
 ARCHIVE_QUICK_WHOLE_BELOW=2097152
 eval "$(grep '^ARCHIVE_BASIC_RULE_VERSION=' "$script")"
 ARCHIVE_BASIC_RULE_FILE="$workdir/mutable/archive_basic_rule"
+SNAPSHOT_LOG="$workdir/mutable/snapshot_log.tsv"
 ARCHIVE_LOCAL_SUMS="$workdir/mutable/archive_local_sums.tsv"
 ARCHIVE_VERIFY_PROGRESS="$workdir/progress.json"
 ARCHIVE_WORK_PROGRESS="$workdir/work-progress.json"
@@ -728,6 +729,59 @@ for want in '"state": "idle"' '"result": "ok"' '"files_archived": 2' '"matched":
 done
 ARCHIVE_PLAN_START="" ; write_share_status
 grep -q '"transfer": null' "$status_json" || fail "no transfer this cycle should write transfer: null"
+
+# Snapshot interval and the snapshot log (last 7 days, oldest first).
+now=$(date +%s)
+{
+  printf 'snap-000900\t%s\n' $((now - 9 * 86400))       # older than 8 days: pruned from the log
+  printf 'snap-000901\t%s\n' $((now - 7 * 86400 - 3600)) # kept in the log, but older than 7 days
+  printf 'snap-000903\t%s\n' $((now - 3600))
+  printf 'snap-000902\t%s\n' $((now - 7200))
+  printf 'snap-000903\t%s\n' $((now - 3600))             # duplicate line
+  printf 'garbage line\n'
+} > "$SNAPSHOT_LOG"
+SNAPSHOT_INTERVAL=3480 write_share_status
+out=$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))))' "$status_json") || fail "status with snapshots is not valid JSON: $(cat "$status_json")"
+python3 - "$status_json" "$now" "$snaps" <<'PYCHECK' || fail "snapshot fields wrong: $out"
+import json, os, sys
+d = json.load(open(sys.argv[1])); now = int(sys.argv[2]); snaps = sys.argv[3]
+assert d["schema"] == 1 and d["snapshot_interval_s"] == 3480, d.get("snapshot_interval_s")
+s = d["snapshots"]
+names = [e["name"] for e in s]
+times = [e["started_unix"] for e in s]
+assert times == sorted(times), "not oldest first"
+assert "snap-000900" not in names and "snap-000901" not in names, names
+assert names.count("snap-000903") == 1 and "snap-000902" in names, names
+assert names.index("snap-000902") < names.index("snap-000903")
+# Snapshots on the Pi that the log didn't list are added (time = image mtime).
+on_pi = [n for n in os.listdir(snaps) if os.path.exists(os.path.join(snaps, n, "snap.bin.toc"))]
+for n in on_pi:
+    t = int(os.stat(os.path.join(snaps, n, "snap.bin")).st_mtime) if os.path.exists(os.path.join(snaps, n, "snap.bin")) else None
+    if t is None or t >= now - 7 * 86400:
+        assert n in names, (n, names)
+assert all(set(e) == {"name", "started_unix"} for e in s)
+PYCHECK
+grep -q 'snap-000900' "$SNAPSHOT_LOG" && fail "a line older than 8 days should be pruned from the log"
+grep -q 'snap-000901' "$SNAPSHOT_LOG" || fail "a 7-8 day old line should stay in the log"
+# A bad interval falls back to the default; an empty log gives [].
+rm -f "$SNAPSHOT_LOG"; mv "$snaps" "$snaps.away"; mkdir -p "$snaps"
+SNAPSHOT_INTERVAL=abc write_share_status
+grep -q '"snapshot_interval_s": 3480' "$status_json" || fail "bad interval should fall back to 3480"
+grep -q '"snapshots": \[\]' "$status_json" || fail "no snapshots should write an empty list: $(cat "$status_json")"
+rmdir "$snaps"; mv "$snaps.away" "$snaps"
+# At most 1000 entries, the newest.
+for i in $(seq 1 1100); do printf 'snap-%06d\t%s\n' $((2000 + i)) $((now - 5000 + i)); done > "$SNAPSHOT_LOG"
+write_share_status
+# (Snapshots made earlier in this test are added from disk too, with newer times.)
+python3 - "$status_json" <<'PYCAP' || fail "snapshot list should be capped at the newest 1000"
+import json, sys
+s = json.load(open(sys.argv[1]))["snapshots"]
+names = {e["name"] for e in s}
+assert len(s) == 1000, len(s)
+assert "snap-003100" in names and "snap-002001" not in names
+assert [e["started_unix"] for e in s] == sorted(e["started_unix"] for e in s)
+PYCAP
+rm -f "$SNAPSHOT_LOG"
 
 if [ "$failures" -gt 0 ]; then
   echo "$failures failure(s)" >&2
