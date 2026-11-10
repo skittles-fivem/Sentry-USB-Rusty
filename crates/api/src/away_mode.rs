@@ -234,6 +234,9 @@ struct Inner {
     ap_generation: u64,
     ap_start_error: Option<String>,
     retry_at: Option<Instant>,
+    /// The last hotspot failure written to the Away Mode log, so a failure
+    /// that repeats on every retry is logged once, not every minute.
+    last_failure_logged: Option<String>,
 }
 
 fn mgr() -> &'static Mutex<Inner> {
@@ -260,6 +263,7 @@ fn mgr() -> &'static Mutex<Inner> {
             ap_generation: 0,
             ap_start_error: None,
             retry_at: None,
+            last_failure_logged: None,
         })
     })
 }
@@ -638,11 +642,29 @@ async fn activate_ap(plan: &[ApBand]) -> Result<(), String> {
     Err(format!("Failed to bring up AP: {last_error}"))
 }
 
+/// Start of the error when NetworkManager has no hotspot profile at all.
+/// Retrying can't help until setup creates it, so retries back off to
+/// [`AP_MISSING_RETRY`] and the failure is logged once.
+const AP_PROFILE_MISSING: &str = "The hotspot isn't set up: NetworkManager has no SENTRYUSB_AP profile";
+const AP_MISSING_RETRY: Duration = Duration::from_secs(30 * 60);
+const AP_RETRY: Duration = Duration::from_secs(60);
+
+fn ap_retry_delay(error: &str) -> Duration {
+    if error.starts_with(AP_PROFILE_MISSING) { AP_MISSING_RETRY } else { AP_RETRY }
+}
+
 async fn start_ap() -> Result<(), String> {
         if networkd::applicable().await.map_err(|error| format!("{error:#}"))? {
             return networkd::start().await.map_err(|error| format!("{error:#}"));
         }
         if wait_for_networkmanager().await {
+            // Without the profile every attempt waits 90 s for ap0 and then
+            // fails on each band; say what's missing instead.
+            if matches!(ap_profile::read_nm_ap_profile().await, Ok(None)) {
+                return Err(format!(
+                    "{AP_PROFILE_MISSING}. Set the WiFi Access Point name and password and run setup, or turn Away Mode off. Retrying every 30 min."
+                ));
+            }
             ensure_ap0().await?;
             // Activation races NetworkManager unless `ap0` is ready.
             if !wait_for_ap0_ready().await {
@@ -766,7 +788,11 @@ fn complete_ap_start(inner: &mut Inner, generation: u64, result: Result<(), Stri
         // Failure flags must not suppress archiveloop WiFi recovery or
         // make a dispatcher resurrect a hotspot that never started.
         remove_flag_file();
-        away_mode_log(&format!("Hotspot failed: {}", inner.ap_start_error.as_deref().unwrap_or_default()));
+        // Log a failure once; the same one on every retry is noise.
+        if inner.last_failure_logged != inner.ap_start_error {
+            away_mode_log(&format!("Hotspot failed: {}", inner.ap_start_error.as_deref().unwrap_or_default()));
+            inner.last_failure_logged = inner.ap_start_error.clone();
+        }
     }
 }
 
@@ -794,11 +820,11 @@ async fn check_running_ap() {
 fn finish_ap_start(inner: &mut Inner, generation: u64, result: Result<(), String>) -> bool {
     if inner.ap_generation != generation { return false; }
     match result {
-        Ok(()) => { inner.ap_phase = ApPhase::On; false }
+        Ok(()) => { inner.ap_phase = ApPhase::On; inner.last_failure_logged = None; false }
         Err(error) => {
             inner.ap_phase = ApPhase::Off;
+            inner.retry_at = Some(Instant::now() + ap_retry_delay(&error));
             inner.ap_start_error = Some(error);
-            inner.retry_at = Some(Instant::now() + Duration::from_secs(60));
             if inner.mode == "manual" {
                 inner.state = "idle";
                 inner.enabled_at = None;
@@ -1384,6 +1410,7 @@ mod tests {
             pending_is_home: None, pending_count: 0,
             stop: std::sync::Arc::new(Notify::new()), epoch: 1,
             ap_phase: ApPhase::Starting, ap_generation: 7, ap_start_error: None, retry_at: None,
+            last_failure_logged: None,
         }
     }
 
@@ -1413,6 +1440,26 @@ mod tests {
         assert_eq!(status["ap_on"], false);
         assert_eq!(inner.epoch, 1, "automatic watching must continue");
         assert!(inner.retry_at.unwrap() > Instant::now());
+    }
+
+    #[test]
+    fn a_missing_hotspot_profile_backs_off_and_is_logged_once() {
+        let missing = format!("{AP_PROFILE_MISSING}. Set it up.");
+        let mut inner = starting_session("auto");
+        assert!(finish_ap_start(&mut inner, 7, Err(missing.clone())));
+        let wait = inner.retry_at.unwrap() - Instant::now();
+        assert!(wait > Duration::from_secs(29 * 60), "missing profile should retry after ~30 min, got {wait:?}");
+        // Other failures keep the 1-minute retry.
+        let mut other = starting_session("auto");
+        finish_ap_start(&mut other, 7, Err("failed to create ap0".into()));
+        assert!(other.retry_at.unwrap() - Instant::now() <= Duration::from_secs(60));
+        // The same failure again isn't logged again; a success resets that.
+        inner.ap_generation = 8;
+        complete_ap_start(&mut inner, 8, Err(missing.clone()));
+        assert_eq!(inner.last_failure_logged.as_deref(), Some(missing.as_str()));
+        inner.ap_generation = 9;
+        assert!(!finish_ap_start(&mut inner, 9, Ok(())));
+        assert!(inner.last_failure_logged.is_none());
     }
 
     #[test]
