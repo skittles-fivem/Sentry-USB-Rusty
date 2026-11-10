@@ -180,17 +180,22 @@ Schema 1:
 
 `snapshot_interval_s` and `snapshots` are optional (absent from files
 written by older Sentry USB builds), and `schema` stays 1:
-- `snapshot_interval_s`: the configured SNAPSHOT_INTERVAL in seconds.
+- `snapshot_interval_s`: the SNAPSHOT_INTERVAL the Pi's snapshot loop uses,
+  in seconds. Written only when it's within 60-86400; otherwise left out.
 - `snapshots`: every snapshot run in the last 7 days, oldest first, at
   most 1000 (the newest), `started_unix` being when the run copied the
   car's drive.
-  - A kept snapshot has `name` and `"kept": true`, and stays listed after
+  - A kept snapshot has `name` (`snap-NNNNNN`, always matching
+    `^[A-Za-z0-9._-]{1,64}$`) and `"kept": true`, and stays listed after
     it's released or deleted. Snapshots taken before the Pi had this log are
     listed with their image's time, and only while they're still on the Pi.
   - A run discarded as identical to the previous snapshot has no `name` and
     `"kept": false`: the car wrote nothing new to the drive since the last
     snapshot, so there was nothing to keep. It still counts as a snapshot
     point.
+
+  The list survives reboots (it's kept in `/mutable/snapshot_log.tsv`), and
+  1000 entries take about 73 KB, so the file stays well under 256 KB.
 
   The car keeps about 60 min of RecentClips, so footage can only be lost
   when the car was driving and no run (kept or not) started within about

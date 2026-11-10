@@ -781,6 +781,13 @@ grep -q 'snap-000901' "$SNAPSHOT_LOG" || fail "a 7-8 day old line should stay in
 rm -f "$SNAPSHOT_LOG"; mv "$snaps" "$snaps.away"; mkdir -p "$snaps"
 SNAPSHOT_INTERVAL=abc write_share_status
 grep -q '"snapshot_interval_s": 3480' "$status_json" || fail "bad interval should fall back to 3480"
+for bad in 30 90000; do
+  SNAPSHOT_INTERVAL=$bad write_share_status
+  validate_json "$status_json" > /dev/null || fail "status not valid JSON with interval $bad"
+  grep -q '"snapshot_interval_s"' "$status_json" && fail "interval $bad is outside 60-86400 and should be left out"
+done
+SNAPSHOT_INTERVAL=60 write_share_status
+grep -q '"snapshot_interval_s": 60,' "$status_json" || fail "interval 60 is in range"
 grep -q '"snapshots": \[\]' "$status_json" || fail "no snapshots should write an empty list: $(cat "$status_json")"
 rmdir "$snaps"; mv "$snaps.away" "$snaps"
 # At most 1000 entries, the newest.
@@ -794,6 +801,9 @@ names = {e.get("name") for e in s}
 assert len(s) == 1000, len(s)
 assert "snap-003100" in names and "snap-002001" not in names
 assert [e["started_unix"] for e in s] == sorted(e["started_unix"] for e in s)
+import os, re
+assert os.path.getsize(sys.argv[1]) < 256 * 1024, os.path.getsize(sys.argv[1])
+assert all(re.fullmatch(r"[A-Za-z0-9._-]{1,64}", e["name"]) for e in s if "name" in e)
 PYCAP
 rm -f "$SNAPSHOT_LOG"
 

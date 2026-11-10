@@ -3554,9 +3554,15 @@ function build_share_status_json () {
   printf '  },\n'
   printf '  "auto_delete_enabled": %s,\n' "$(json_bool archive_auto_delete_enabled)"
   printf '  "state": %s,\n' "$(json_string "${ARCHIVE_SHARE_STATE:-idle}")"
+  # The interval snapshotloop really uses (it falls back to 3480 the same
+  # way). Sentry Manager accepts 60-86400 s; outside that the optional field
+  # is left out rather than reporting a value the loop doesn't use.
   local interval="${SNAPSHOT_INTERVAL:-3480}"
   [[ "$interval" =~ ^[0-9]+$ ]] && [ "$interval" -gt 0 ] || interval=3480
-  printf '  "snapshot_interval_s": %s,\n' "$interval"
+  if [ "$interval" -ge 60 ] && [ "$interval" -le 86400 ]
+  then
+    printf '  "snapshot_interval_s": %s,\n' "$interval"
+  fi
   printf '  "snapshots": %s,\n' "$(snapshot_log_json)"
   if [ -n "${ARCHIVE_PLAN_START:-}" ]
   then
