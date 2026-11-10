@@ -31,6 +31,25 @@ pub async fn shutdown() -> (StatusCode, Json<serde_json::Value>) {
     crate::json_ok()
 }
 
+/// Tells archiveloop's drive watchdog that the user turned the USB drives off
+/// on purpose, so it doesn't reconnect them after 5 minutes. In /tmp, so a
+/// reboot clears it; the watchdog also clears it once the drive is presented.
+const DRIVES_USER_OFF_MARKER: &str = "/tmp/sentryusb_drives_user_off";
+
+fn set_drives_user_off(off: bool) {
+    let r = if off {
+        std::fs::write(DRIVES_USER_OFF_MARKER, b"off\n")
+    } else {
+        match std::fs::remove_file(DRIVES_USER_OFF_MARKER) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        }
+    };
+    if let Err(e) = r {
+        tracing::warn!("drives-off marker {}: {}", DRIVES_USER_OFF_MARKER, e);
+    }
+}
+
 /// POST /api/system/toggle-drives
 pub async fn toggle_drives(State(_s): State<AppState>, _body: String) -> (StatusCode, Json<serde_json::Value>) {
     // Serialize user toggles with archive and watchdog gadget cycles.
@@ -40,10 +59,17 @@ pub async fn toggle_drives(State(_s): State<AppState>, _body: String) -> (Status
         // The previous lock holder may have changed state.
         let was_active = sentryusb_gadget::is_active();
         let r = if was_active {
+            // Marked before disabling, so the watchdog never sees the drive
+            // gone without it.
+            set_drives_user_off(true);
             sentryusb_gadget::disable()
         } else {
             sentryusb_gadget::enable()
         };
+        // Turned on, or a turn-off that failed and left the drive presented.
+        if (r.is_ok() && !was_active) || (r.is_err() && was_active && sentryusb_gadget::is_active()) {
+            set_drives_user_off(false);
+        }
         r.map_err(|e| {
             format!("USB gadget {} failed: {}", if was_active { "disable" } else { "enable" }, e)
         })
@@ -72,6 +98,7 @@ pub async fn gadget_enable() -> (StatusCode, Json<serde_json::Value>) {
     match tokio::task::spawn_blocking(|| {
         sentryusb_gadget::validate_storage()?;
         if sentryusb_gadget::is_active() { Ok(()) } else { sentryusb_gadget::enable() }
+            .inspect(|()| set_drives_user_off(false))
     }).await {
         Ok(Ok(())) => crate::json_ok(),
         Ok(Err(e)) => crate::json_error(
@@ -90,6 +117,7 @@ pub async fn gadget_disable() -> (StatusCode, Json<serde_json::Value>) {
     if !sentryusb_gadget::is_active() {
         return crate::json_ok();
     }
+    set_drives_user_off(true);
     match tokio::task::spawn_blocking(sentryusb_gadget::disable).await {
         Ok(Ok(())) => crate::json_ok(),
         Ok(Err(e)) => crate::json_error(

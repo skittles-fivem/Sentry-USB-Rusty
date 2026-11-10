@@ -4975,6 +4975,61 @@ function dump_gadget_stall_evidence () {
 # A car that is awake but legitimately not recording away from home can
 # still trip trigger 2 once; the cycle is harmless then (drive idle,
 # ~15s blip) and the rate limit keeps it from repeating.
+# Safety net for a drive left disconnected from the car. The stall checks
+# below only watch a presented drive, and archiveloop's own re-check runs
+# only after the car leaves home, so a reconnect that failed after a home
+# archive would leave the car without a drive (no Sentry, no dashcam) until
+# it drove away. Called by the watchdog every interval while the drive isn't
+# presented. When it stays disconnected for GADGET_ABSENT_SECS (default 300)
+# with no archive cycle running and no "drives off" from the user, re-present
+# it: log, alert once per outage, and retry every GADGET_ABSENT_SECS while it
+# keeps failing. Until the drive has been presented once this boot, it waits
+# GADGET_BOOT_ABSENT_SECS (default 900) from the watchdog's start instead, so
+# a slow boot (fsck, snapshot) isn't interrupted but a boot that never
+# presents the drive is still caught. State lives in the watchdog's globals:
+# GADGET_PRESENTED_ONCE, GADGET_WATCHDOG_STARTED, GADGET_ABSENT_SINCE,
+# GADGET_ABSENT_ALERTED.
+# Set by the web UI when the user turns the USB drives off; cleared when the
+# drive is presented again (and by a reboot: it's in /tmp).
+DRIVES_USER_OFF_MARKER=/tmp/sentryusb_drives_user_off
+
+function gadget_absent_check () {
+  local now=$1 limit=${GADGET_ABSENT_SECS:-300}
+  if [ "${GADGET_PRESENTED_ONCE:-0}" != 1 ]
+  then
+    [ $(( now - ${GADGET_WATCHDOG_STARTED:-$now} )) -ge "${GADGET_BOOT_ABSENT_SECS:-900}" ] || return 0
+  fi
+  # An archive cycle takes the drive down on purpose; time it from the end.
+  if [ -e "${ARCHIVE_CONTROL_DIR:-/tmp}/archive-cycle" ] || [ -e "$DRIVES_USER_OFF_MARKER" ]
+  then
+    GADGET_ABSENT_SINCE=0
+    return 0
+  fi
+  if [ "${GADGET_ABSENT_SINCE:-0}" = 0 ]
+  then
+    GADGET_ABSENT_SINCE=$now
+    return 0
+  fi
+  local gone=$(( now - GADGET_ABSENT_SINCE ))
+  [ "$gone" -ge "$limit" ] || return 0
+  log "ERROR: the USB drive has been disconnected from the car for $((gone / 60)) min outside an archive; re-presenting it"
+  if [ "${GADGET_ABSENT_ALERTED:-0}" != 1 ]
+  then
+    GADGET_ABSENT_ALERTED=1
+    /root/bin/send-push-message "${NOTIFICATION_TITLE:-SentryUSB}:" \
+      "The USB drive was disconnected from the car for $((gone / 60)) min outside an archive, so the car couldn't record. Reconnecting it now." \
+      warning drive_absent "The car had no USB drive for a few minutes. Reconnecting it." 2>/dev/null ||
+      log "failed to send drive-absent notification"
+  fi
+  # Retry no sooner than another full interval if this doesn't take.
+  GADGET_ABSENT_SINCE=$now
+  ensure_usb_drives_connected || log "ERROR: could not re-present the USB drive to the car"
+  if usb_gadget_is_active
+  then
+    log "USB drive re-presented to the car"
+  fi
+}
+
 function gadget_stall_watchdog () {
   echo -n gadgetwatchdog > /proc/self/comm
   local cam=/backingfiles/cam_disk.bin
@@ -4984,6 +5039,7 @@ function gadget_stall_watchdog () {
   # blind cycling just churns the car.
   local recovery_cooldown=600
   local max_recoveries=3
+  GADGET_WATCHDOG_STARTED=$(date +%s) GADGET_PRESENTED_ONCE=0 GADGET_ABSENT_SINCE=0 GADGET_ABSENT_ALERTED=0
   local fresh_seen=0
   local udc_bad_since=0
   local last_recovery=0
@@ -4994,15 +5050,18 @@ function gadget_stall_watchdog () {
   do
     sleep "${GADGET_WATCHDOG_INTERVAL:-30}"
 
-    # Only act while we intend to present the drive. During archiveloop's
-    # own gadget-down windows (music sync, boot, lock-chime cycle) this is
-    # false and the watchdog idles.
+    # The stall checks only act while the drive is presented. During
+    # archiveloop's own gadget-down windows (music sync, boot, lock-chime
+    # cycle) it isn't; gadget_absent_check catches one that never ends.
     if ! usb_gadget_is_active
     then
       fresh_seen=0
       udc_bad_since=0
+      gadget_absent_check "$(date +%s)"
       continue
     fi
+    GADGET_PRESENTED_ONCE=1 GADGET_ABSENT_SINCE=0 GADGET_ABSENT_ALERTED=0
+    rm -f "$DRIVES_USER_OFF_MARKER" 2>/dev/null || true
     [ -f "$cam" ] || continue
 
     local now mtime age reason=""
