@@ -396,6 +396,38 @@ pub fn prepare_setup_config_write(
     Ok(out)
 }
 
+/// `v3.29.0`, `3.29.0-test.1` -> (3, 29, 0). Pre-release suffixes are
+/// ignored for the ordering.
+pub fn release_number(v: &str) -> Option<(u64, u64, u64)> {
+    let core = v.trim().trim_start_matches('v').split(['-', '+']).next()?;
+    let mut it = core.split('.').map(|p| p.parse::<u64>().ok());
+    let n = (it.next()??, it.next().unwrap_or(Some(0))?, it.next().unwrap_or(Some(0))?);
+    if it.next().is_some() {
+        return None;
+    }
+    Some(n)
+}
+
+/// Preferences that change what gets installed or repaired on the Pi stay
+/// on the Pi; the rest are UI settings, bounded in size.
+const LOCAL_ONLY_PREFERENCES: &[&str] =
+    &["update_channel", "auto_install_stable_updates", "storage_auto_repair", "storage_auto_force_repair"];
+const MAX_PREFERENCE_BYTES: usize = 64 * 1024;
+
+fn check_preference(body: &Value) -> Result<(), (u16, String)> {
+    let key = body.get("key").and_then(Value::as_str).unwrap_or("");
+    if key.is_empty() || key.len() > 64 || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
+        return Err((400, "Invalid preference name".into()));
+    }
+    if LOCAL_ONLY_PREFERENCES.contains(&key) {
+        return Err((403, format!("{key} can only be changed on the Sentry USB itself")));
+    }
+    if body.to_string().len() > MAX_PREFERENCE_BYTES {
+        return Err((400, "Preference value is too large".into()));
+    }
+    Ok(())
+}
+
 /// Checks (and where needed rewrites) the body of a write request before it
 /// reaches the handler. `Ok(None)` passes the body through unchanged.
 pub fn check_write(
@@ -403,6 +435,7 @@ pub fn check_write(
     path: &str,
     body: &Value,
     active: &HashMap<String, String>,
+    running_version: &str,
 ) -> Result<Option<Value>, (u16, String)> {
     let bad = |m: String| (400u16, m);
     match (method, path) {
@@ -453,6 +486,7 @@ pub fn check_write(
             }
             Ok(Some(Value::Object(out)))
         }
+        (Method::Put, "/api/config/preference") => check_preference(body).map(|_| None),
         (Method::Put, "/api/system/update-source") => {
             // A custom source would install someone else's binaries as root.
             let repo = body.get("repo").and_then(Value::as_str).map(str::trim);
@@ -478,7 +512,16 @@ pub fn check_write(
                         && !v.contains("..")
                         && v.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+')) =>
                 {
-                    Ok(Some(serde_json::json!({"version": v})))
+                    // An older official release can bring back fixed holes
+                    // or not run on this install: no downgrades over the link.
+                    match (release_number(v), release_number(running_version)) {
+                        (Some(want), Some(have)) if want < have => Err((
+                            403,
+                            "Over Sentry Manager the Sentry USB can't be moved to an older version.".into(),
+                        )),
+                        (None, Some(_)) => Err(bad("version must be a release tag like v3.29.0".into())),
+                        _ => Ok(Some(serde_json::json!({"version": v}))),
+                    }
                 }
                 _ => Err(bad("version must be a release tag like v3.29.0".into())),
             },
@@ -586,6 +629,7 @@ mod tests {
             "/api/setup/test-archive",
             &json!({"ARCHIVE_SYSTEM": "cifs", "ARCHIVE_SERVER": "attacker.example", "SHARE_PASSWORD": ""}),
             &stored(),
+            "",
         )
         .is_err());
     }
@@ -736,7 +780,7 @@ mod tests {
     fn archive_test_only_probes_the_stored_destination() {
         let mut a = stored();
         a.insert("ARCHIVE_SYSTEM".into(), "cifs".into());
-        let t = |b: Value| check_write(Method::Post, "/api/setup/test-archive", &b, &a);
+        let t = |b: Value| check_write(Method::Post, "/api/setup/test-archive", &b, &a, "v3.29.0");
         // A new server, even with a password of its own.
         assert_eq!(
             t(json!({"ARCHIVE_SYSTEM": "cifs", "ARCHIVE_SERVER": "attacker.example", "SHARE_PASSWORD": "mine"})).unwrap_err().0,
@@ -750,7 +794,7 @@ mod tests {
     #[test]
     fn update_source_only_back_to_official() {
         let a = stored();
-        let ok = |b: Value| check_write(Method::Put, "/api/system/update-source", &b, &a);
+        let ok = |b: Value| check_write(Method::Put, "/api/system/update-source", &b, &a, "v3.29.0");
         assert_eq!(ok(json!({"repo": ""})).unwrap(), Some(json!({"repo": ""})));
         assert!(ok(json!({"repo": "sentry-six/sentry-usb-rusty"})).is_ok());
         assert_eq!(ok(json!({"repo": "attacker/Sentry-USB-Rusty"})).unwrap_err().0, 403);
@@ -761,12 +805,31 @@ mod tests {
     #[test]
     fn update_version_is_a_plain_tag() {
         let a = stored();
-        let chk = |b: Value| check_write(Method::Post, "/api/system/update", &b, &a);
+        let chk = |b: Value| check_write(Method::Post, "/api/system/update", &b, &a, "v3.29.0");
         assert!(chk(Value::Null).is_ok());
         assert!(chk(json!({"version": "v3.29.0-test.1"})).is_ok());
         for v in ["../../x", "v1/../../x", "https://evil/x", "a b", ""] {
             assert!(chk(json!({"version": v})).is_err(), "{v}");
         }
+        // No downgrades; same or newer is fine.
+        assert_eq!(chk(json!({"version": "v3.28.9"})).unwrap_err().0, 403);
+        assert_eq!(chk(json!({"version": "v2.0.0"})).unwrap_err().0, 403);
+        assert!(chk(json!({"version": "v3.29.0"})).is_ok());
+        assert!(chk(json!({"version": "v3.30.0-beta.1"})).is_ok());
+        assert!(chk(json!({"version": "nightly"})).is_err());
+        assert_eq!(release_number("v3.29.0-test.1"), Some((3, 29, 0)));
+    }
+
+    #[test]
+    fn preferences_that_install_or_repair_stay_local() {
+        let a = stored();
+        let p = |b: Value| check_write(Method::Put, "/api/config/preference", &b, &a, "");
+        for k in ["update_channel", "auto_install_stable_updates", "storage_auto_force_repair", "storage_auto_repair"] {
+            assert_eq!(p(json!({"key": k, "value": "prerelease"})).unwrap_err().0, 403, "{k}");
+        }
+        assert!(p(json!({"key": "../x", "value": 1})).is_err());
+        assert!(p(json!({"key": "theme", "value": "x".repeat(70_000)})).is_err());
+        assert_eq!(p(json!({"key": "theme", "value": "dark"})).unwrap(), None);
     }
 
     #[test]
@@ -778,6 +841,7 @@ mod tests {
             "/api/setup/test-archive",
             &json!({"ARCHIVE_SYSTEM": "cifs", "ARCHIVE_SERVER": "nas.local", "SHARE_PASSWORD": ""}),
             &a,
+            "",
         )
         .unwrap()
         .unwrap();
@@ -787,6 +851,7 @@ mod tests {
             "/api/setup/test-archive",
             &json!({"ARCHIVE_SYSTEM": "rsync", "RSYNC_USER": "-oProxyCommand=x"}),
             &a,
+            "",
         )
         .is_err());
     }

@@ -166,7 +166,7 @@ impl Server {
             body = Value::Null;
         } else {
             let active = crate::store::read_config();
-            match secrets::check_write(method, path, &body, &active) {
+            match secrets::check_write(method, path, &body, &active, &crate::running_version()) {
                 Ok(Some(b)) => body = b,
                 Ok(None) => {}
                 Err((status, msg)) => return (status, Some(res_json(id, status, json!({"error": msg})))),

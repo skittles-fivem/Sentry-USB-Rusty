@@ -149,6 +149,11 @@ pub fn spawn(router: axum::Router, version: String) {
     tokio::spawn(run(router));
 }
 
+/// The Sentry USB version passed to `spawn` (empty before that).
+pub(crate) fn running_version() -> String {
+    link().version.get().cloned().unwrap_or_default()
+}
+
 /// A default route exists (Wi-Fi or Ethernet is up).
 fn network_up() -> bool {
     std::fs::read_to_string("/proc/net/route")
