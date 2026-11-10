@@ -8,6 +8,11 @@ must do so they never undo each other's work.
 Sentry USB side: `run/archiveloop` (sections "Archive verification" and
 "Status file on the archive share"), `run/rsync_archive/archive-clips.sh`.
 
+Sentry Manager can also manage the Pi directly (status, settings, logs,
+updates) over an encrypted link the Pi opens to Manager. That is a separate
+contract: [sentry-manager-link.md](sentry-manager-link.md). On the Pi it is
+Settings → System → Sentry Manager, and `crates/manager_link`.
+
 ## 1. Layout (unchanged)
 
 Clips keep the Tesla layout and names: `RecentClips/<YYYY-MM-DD>/…`,
