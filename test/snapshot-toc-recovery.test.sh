@@ -96,9 +96,13 @@ grep -q 'link(s) for .*snap-000014 could not be made' "$LOG"
 chmod u+w "$farm/RecentClips/2026-10-30"
 : > "$LOG"
 clip snap-000015 9 "$b"   # same files: a duplicate, discarded
+# A real snapshot copy keeps the car's file times; so must this fixture.
+touch -r "$autofs/snap-000014/TeslaCam/RecentClips/$b" "$autofs/snap-000015/TeslaCam/RecentClips/$b"
 run_snapshot
 grep -q 're-making links for snap-000014' "$LOG"
 [[ ! -e $snaps/snap-000014/snap.bin.relink_pending && ! -e $snaps/snap-000015 ]]
+[[ -s $snaps/snap-000014/snap.bin.newest ]]   # the newest file time is kept beside the TOC
+
 [[ $(recent "$b") == "$snaps/snap-000014/mnt/TeslaCam/RecentClips/$b" ]]
 
 # 4. Boot-time rebuild: newest missing TOC first, once per boot.
@@ -127,6 +131,7 @@ mkdir -p "$autofs/snap-000013"; cp -r "$FIXTURE/." "$autofs/snap-000013/"
 head -c 9 /dev/zero > "$autofs/snap-000013/TeslaCam/RecentClips/$b"
 : > "$LOG"
 clip snap-000016 9 "$b"   # duplicate again
+touch -r "$autofs/snap-000014/TeslaCam/RecentClips/$b" "$autofs/snap-000016/TeslaCam/RecentClips/$b"
 run_snapshot
 grep -q 'filling in missing links for snap-000013' "$LOG"
 [[ $(recent "$c") == "$snaps/snap-000013/mnt/TeslaCam/RecentClips/$c" ]]

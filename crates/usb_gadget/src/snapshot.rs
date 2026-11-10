@@ -148,9 +148,19 @@ pub async fn make_snapshot_with(skip_fsck: bool, caller_holds_lock: bool) -> Res
         bail!("toc generation failed for {}; keeping the image without a TOC: {}", snap_mnt, e);
     }
 
-    // Discard snapshots with no TOC changes versus the prior capture.
+    // Discard snapshots with no TOC changes versus the prior capture, and no
+    // file modified in place since it (same names and sizes, newer mtime).
+    let new_newest = newest_mtime(&snap_mnt).await;
     let is_new = match prev_toc.as_ref() {
-        Some(prev) => toc_has_additions(prev, &toc_path_tmp).unwrap_or(true),
+        Some(prev) => {
+            let added = toc_has_additions(prev, &toc_path_tmp).unwrap_or(true);
+            let prev_newest = std::fs::read_to_string(prev.replace(".toc", ".newest")).ok();
+            let modified = modified_since(prev_newest.as_deref(), new_newest.as_deref());
+            if modified && !added {
+                info!("A file was modified in place since the previous snapshot; keeping {}", snap_name);
+            }
+            added || modified
+        }
         None => true,
     };
 
@@ -184,6 +194,9 @@ pub async fn make_snapshot_with(skip_fsck: bool, caller_holds_lock: bool) -> Res
     }
     if let Err(e) = std::fs::rename(&toc_path_tmp, &toc_path) {
         bail!("could not commit the TOC for {}: {}", snap_name, e);
+    }
+    if let Some(newest) = &new_newest {
+        let _ = std::fs::write(format!("{}.newest", snap_file), format!("{newest}\n"));
     }
     if let Err(e) = record_snapshot_taken(Path::new(SNAPSHOT_LOG), Some(&snap_name), started_unix) {
         warn!("could not log snapshot {} in {}: {}", snap_name, SNAPSHOT_LOG, e);
@@ -1199,6 +1212,29 @@ async fn generate_toc(root: &str, out_path: &str) -> Result<()> {
 fn shell_escape(s: &str) -> String {
     // Snapshot paths are fixed and contain no quotes.
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// The newest file modification time under `root` (find's `%T@`, seconds with
+/// a fraction), or `None` when it can't be read.
+async fn newest_mtime(root: &str) -> Option<String> {
+    let cmd = format!(
+        "ionice -c2 -n7 nice -n19 find {} -type f -printf '%T@\\n' | sort -n | tail -1",
+        shell_escape(root)
+    );
+    let out = sentryusb_shell::run_with_timeout(Duration::from_secs(300), "bash", &["-c", &cmd]).await.ok()?;
+    let t = out.trim().to_string();
+    (!t.is_empty() && t.parse::<f64>().is_ok()).then_some(t)
+}
+
+/// Whether a file was modified since the previous snapshot: its newest
+/// modification time (from its `.newest` file) is older than this one's.
+/// Unknown on either side (a snapshot from before `.newest` files) counts as
+/// not modified, so the name/size comparison alone decides, as before.
+fn modified_since(prev_newest: Option<&str>, new_newest: Option<&str>) -> bool {
+    match (prev_newest.and_then(|p| p.trim().parse::<f64>().ok()), new_newest.and_then(|n| n.trim().parse::<f64>().ok())) {
+        (Some(prev), Some(new)) => new > prev,
+        _ => false,
+    }
 }
 
 /// Whether a TOC adds or grows any file; compare whole size/path lines so a
@@ -2561,5 +2597,17 @@ mod tests {
             std::fs::read_to_string(&log).unwrap(),
             "snap-000011\t1762731609\t1\n-\t1762735089\t0\nsnap-000012\t1762738569\t1\n"
         );
+    }
+
+    #[test]
+    fn a_newer_modification_time_counts_as_a_change_only_when_both_are_known() {
+        use super::modified_since;
+        assert!(modified_since(Some("1762731609.250000000\n"), Some("1762731700.0")));
+        assert!(!modified_since(Some("1762731609.25"), Some("1762731609.25")));
+        assert!(!modified_since(Some("1762731700"), Some("1762731609")));
+        // A previous snapshot from before .newest files: name/size alone decide.
+        assert!(!modified_since(None, Some("1762731700")));
+        assert!(!modified_since(Some("garbage"), Some("1762731700")));
+        assert!(!modified_since(Some("1762731609"), None));
     }
 }

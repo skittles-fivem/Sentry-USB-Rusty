@@ -448,8 +448,24 @@ function snapshot {
     rm -f "${newsnapname}.toc_"
     return 1
   fi
-  if [[ ! -e "${oldname}.toc" ]] || diff "${oldname}.toc" "${newsnapname}.toc_" | grep -qe '^>'
+  # The TOC compares names and sizes. Also compare the newest file
+  # modification time (kept beside each committed TOC in .newest), so a clip
+  # rewritten in place with the same name and size can't pass as identical.
+  # Skipped when the previous snapshot predates .newest files.
+  local newnewest oldnewest="" modified=false
+  newnewest=$(find "$newsnapmnt" -type f -printf '%T@\n' 2>/dev/null | sort -n | tail -1)
+  [ ! -s "${oldname}.newest" ] || oldnewest=$(cat "${oldname}.newest" 2>/dev/null)
+  if [ -n "$oldnewest" ] && [ -n "$newnewest" ] &&
+     awk -v a="$newnewest" -v b="$oldnewest" 'BEGIN { exit !(a + 0 > b + 0) }'
   then
+    modified=true
+  fi
+  if [[ ! -e "${oldname}.toc" ]] || diff "${oldname}.toc" "${newsnapname}.toc_" | grep -qe '^>' || [ "$modified" = true ]
+  then
+    if [ "$modified" = true ] && [[ -e "${oldname}.toc" ]] && ! diff "${oldname}.toc" "${newsnapname}.toc_" | grep -qe '^>'
+    then
+      log "a file was modified in place since the previous snapshot (same names and sizes); keeping this one"
+    fi
     # Commit the TOC first, then link. The links stay marked as owed until
     # they all land, so a stop in between gets them made by a later run.
     if ! : > "${newsnapname}.relink_pending" ||
@@ -458,6 +474,7 @@ function snapshot {
       log "ERROR: could not commit the TOC for $newsnapdir"
       return 1
     fi
+    [ -z "$newnewest" ] || printf '%s\n' "$newnewest" > "${newsnapname}.newest" 2>/dev/null || true
     # Log when it was taken (kept after the snapshot is released, for the
     # archive status file's snapshot list). Best effort.
     printf '%s\t%s\t1\n' "$(basename "$newsnapdir")" "$started" >> /mutable/snapshot_log.tsv 2>/dev/null || true
