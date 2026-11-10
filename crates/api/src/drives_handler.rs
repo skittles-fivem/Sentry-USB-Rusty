@@ -60,6 +60,57 @@ pub fn is_archiving() -> bool {
     }
 }
 
+/// Phases in `/tmp/archive_status.json` that mean no work is running.
+const IDLE_PHASES: &[&str] = &["", "idle", "done", "complete", "completed", "finished", "none"];
+
+/// Whether any archive work is running: a fresh archive status in a busy
+/// phase (copying, uploading), a verify or pre-hash pass, or an archive
+/// cycle still holding its marker. For `GET /api/status`, so Sentry
+/// Manager holds queued updates and reboots until it is false. Reads only
+/// small files in /tmp (tmpfs), never the archive or the drives, so it
+/// can't block on archive I/O.
+pub fn archive_work_running() -> bool {
+    archive_work_running_at(
+        std::path::Path::new("/tmp/archive_status.json"),
+        std::path::Path::new(WORK_PROGRESS),
+        &sentryusb_drives::archive_control::ArchiveControl::default(),
+        std::time::SystemTime::now(),
+    )
+}
+
+fn archive_work_running_at(
+    status: &std::path::Path,
+    progress: &std::path::Path,
+    control: &sentryusb_drives::archive_control::ArchiveControl,
+    now: std::time::SystemTime,
+) -> bool {
+    // Same freshness rule as `is_archiving`: older than 120 s is not running.
+    // Read-only here; the file is not removed.
+    let status_busy = std::fs::metadata(status)
+        .ok()
+        .filter(|m| {
+            m.modified()
+                .ok()
+                .and_then(|t| now.duration_since(t).ok())
+                .is_none_or(|age| age <= std::time::Duration::from_secs(120))
+        })
+        .and_then(|_| std::fs::read_to_string(status).ok())
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v.get("phase").and_then(|p| p.as_str()).map(str::to_ascii_lowercase))
+        .is_some_and(|p| !IDLE_PHASES.contains(&p.as_str()));
+    if status_busy {
+        return true;
+    }
+    let unix = now.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    // Verifying and pre-hashing read the archive; waiting for Sentry
+    // Manager's checksums is idle time (and can last hours).
+    let work = read_work_progress(progress, unix);
+    if work.get("phase").and_then(|p| p.as_str()).is_some_and(|p| p != "waiting_manager" && !IDLE_PHASES.contains(&p)) {
+        return true;
+    }
+    control.active_cycle().is_some()
+}
+
 /// Reads archive status and removes it when older than 120 seconds.
 fn read_archive_status() -> Option<serde_json::Value> {
     const STATUS: &str = "/tmp/archive_status.json";
@@ -1679,5 +1730,53 @@ mod work_progress_tests {
         assert_eq!(read_work_progress(&p, 1890)["phase"], "waiting_manager");
         assert!(read_work_progress(&p, 1900 + 301).is_null());
         assert!(read_work_progress(&d.path().join("missing"), 1000).is_null());
+    }
+}
+
+#[cfg(test)]
+mod archive_work_tests {
+    use super::archive_work_running_at;
+    use sentryusb_drives::archive_control::ArchiveControl;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn archive_work_counts_every_busy_phase_and_nothing_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = dir.path().join("archive_status.json");
+        let progress = dir.path().join("progress.json");
+        let control = ArchiveControl::new(dir.path());
+        let now = SystemTime::now();
+        let unix = now.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() as i64;
+        let busy = || archive_work_running_at(&status, &progress, &control, now);
+
+        // Nothing written: idle.
+        assert!(!busy());
+
+        // Copying or uploading, fresh: busy. Idle-type phases: not.
+        for (phase, want) in [("archiving", true), ("uploading", true), ("copying", true), ("idle", false), ("done", false)] {
+            std::fs::write(&status, format!("{{\"phase\":\"{phase}\"}}")).unwrap();
+            assert_eq!(busy(), want, "{phase}");
+        }
+        // A status older than 120 s counts as not running (and is kept).
+        std::fs::write(&status, "{\"phase\":\"archiving\"}").unwrap();
+        assert!(!archive_work_running_at(&status, &progress, &control, now + Duration::from_secs(121)));
+        assert!(status.exists());
+        std::fs::remove_file(&status).unwrap();
+
+        // Verifying and pre-hashing are busy; waiting for Manager is not.
+        for (phase, want) in [("verifying", true), ("prehashing", true), ("waiting_manager", false)] {
+            std::fs::write(&progress, format!("{{\"phase\":\"{phase}\",\"updated_unix\":{unix}}}")).unwrap();
+            assert_eq!(busy(), want, "{phase}");
+        }
+        // Stale progress (no update for 15 minutes): not busy.
+        std::fs::write(&progress, format!("{{\"phase\":\"verifying\",\"updated_unix\":{}}}", unix - 901)).unwrap();
+        assert!(!busy());
+        std::fs::remove_file(&progress).unwrap();
+
+        // A running archive cycle (between phases): busy, but only while its process lives.
+        std::fs::write(dir.path().join("archive-cycle"), format!("{}:abc123", std::process::id())).unwrap();
+        assert!(busy());
+        std::fs::write(dir.path().join("archive-cycle"), "4194999:abc123").unwrap();
+        assert!(!busy());
     }
 }

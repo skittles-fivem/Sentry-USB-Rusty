@@ -348,6 +348,9 @@ struct PiStatus {
     storage_health: ManagedStorageHealth,
     /// Final hostname segment used as the stable device suffix.
     device_suffix: String,
+    /// Archive work is running (copying, uploading, verifying). Sentry
+    /// Manager holds queued updates and reboots until this is false.
+    archiving: bool,
 }
 
 pub async fn get_status(
@@ -414,6 +417,8 @@ pub async fn get_status(
     // Measured per request, not cached with the filesystem snapshot above.
     // Concurrent, so a first request's two 250 ms sampling windows overlap.
     (s.cpu_percent, s.disk_io) = tokio::join!(cpu_usage::get(), disk_io::get());
+    // Live, not cached: a few small tmpfs reads, no archive I/O.
+    s.archiving = crate::drives_handler::archive_work_running();
 
     (StatusCode::OK, Json(serde_json::to_value(s).unwrap_or_default()))
 }
@@ -455,6 +460,7 @@ fn status_fs_snapshot() -> PiStatus {
         sampled_at: unix_seconds(),
         storage_health: ManagedStorageHealth::unknown(),
         device_suffix: read_device_suffix(),
+        archiving: false,
     };
 
     s.storage_health = managed_storage_health();
