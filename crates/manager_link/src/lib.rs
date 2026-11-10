@@ -116,8 +116,18 @@ impl Link {
     }
 
     fn open_pairing(&self) {
-        *lock(&self.pairing_until) = Some(Instant::now() + PAIRING_WINDOW);
-        audit::record("info", "pairing_open", "Pairing window opened for 15 minutes", json!({}));
+        self.open_pairing_for(PAIRING_WINDOW);
+    }
+
+    fn open_pairing_for(&self, window: Duration) {
+        let window = window.min(PAIRING_WINDOW);
+        *lock(&self.pairing_until) = Some(Instant::now() + window);
+        let msg = match window.as_secs() {
+            60 => "Pairing window opened for 1 minute".to_string(),
+            s if s % 60 == 0 => format!("Pairing window opened for {} minutes", s / 60),
+            s => format!("Pairing window opened for {s} seconds"),
+        };
+        audit::record("info", "pairing_open", &msg, json!({}));
         self.set(|r| {
             r.not_paired = false;
             r.last_error = None;
@@ -463,6 +473,13 @@ pub fn save_settings(enabled: bool, address: &str) -> Result<(), String> {
 /// Opens (or re-opens) the 15-minute pairing window. A pin already saved
 /// stays in force, so re-pairing only works with the same Manager.
 pub fn start_pairing() -> Result<(), String> {
+    start_pairing_for(PAIRING_WINDOW)
+}
+
+/// `start_pairing` with a shorter window (capped at 15 minutes). For the
+/// off-Pi test harness (`examples/link_harness.rs`); the Pi's own routes
+/// always use the full window.
+pub fn start_pairing_for(window: Duration) -> Result<(), String> {
     let settings = store::Settings::from_config(&store::read_config());
     if !settings.web_password_set {
         return Err("Set a web username and password first".into());
@@ -470,7 +487,7 @@ pub fn start_pairing() -> Result<(), String> {
     if !settings.enabled {
         return Err("Turn on \"Managed by Sentry Manager\" first".into());
     }
-    link().open_pairing();
+    link().open_pairing_for(window);
     Ok(())
 }
 
