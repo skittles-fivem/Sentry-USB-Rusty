@@ -98,23 +98,31 @@ UDC=suspended
 logs=""
 snapshot_gap_check
 grep -q "WARNING: snapshot gap: .*the car isn't using the USB drive (USB state 'suspended')" <<< "$logs" || fail "USB link state not reported: $logs"
-[ "$(pushes_count)" = 3 ] || fail "car not using the drive should alert"
+[ "$(pushes_count)" = 2 ] || fail "a suspended USB link with the car asleep (or unknown) is logged only"
+# The same while the car is awake: that's trouble, so it alerts.
+snap_at 7 $((now - 3950))
+AWAKE=yes
+logs=""
+snapshot_gap_check
+grep -q "USB state 'suspended'.*car awake over BLE: yes" <<< "$logs" || fail "awake + suspended not reported: $logs"
+[ "$(pushes_count)" = 3 ] || fail "an awake car not using the drive should alert"
+AWAKE=no
 UDC=configured
 
-# The car didn't record (drive presented and in use, nothing written): logged,
-# and alerted only when the car is known to be awake.
-snap_at 5 $((now - 4000))
+# The car didn't record (drive presented and in use, nothing written): logged
+# only, awake or not (parked in Sentry Mode keeps the car awake).
+snap_at 8 $((now - 4000))
 touch -d "@$((now - 4100))" "$cam"
 logs=""
 snapshot_gap_check
 grep -q "WARNING: snapshot gap: .*the car hasn't written to its drive since .*car awake over BLE: unknown" <<< "$logs" || fail "idle car not reported: $logs"
 [ "$(pushes_count)" = 3 ] || fail "an idle car with unknown wake state should not alert"
-snap_at 6 $((now - 4000 + 1))
+snap_at 9 $((now - 4000 + 1))
 AWAKE=yes
 logs=""
 snapshot_gap_check
 grep -q "car awake over BLE: yes" <<< "$logs" || fail "awake state not reported: $logs"
-[ "$(pushes_count)" = 4 ] || fail "an awake car that isn't recording should alert"
+[ "$(pushes_count)" = 3 ] || fail "a car that isn't recording is logged only, even when awake (parked in Sentry)"
 
 if [ "$failures" -gt 0 ]
 then

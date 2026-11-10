@@ -4783,9 +4783,11 @@ function uptime_seconds {
 #  - the car wrote to its drive after the newest snapshot, yet no snapshot
 #    kept it (runs failed or were discarded): footage may be lost;
 #  - the drive isn't presented to the car, or the USB link to the car is
-#    down: the car can't record to it at all;
+#    down: the car can't record to it at all (a down link alerts only while
+#    BLE says the car is awake: a sleeping car suspends its USB port);
 #  - otherwise the car simply hasn't written to the drive (it isn't
-#    recording, e.g. parked with Sentry Mode off), so nothing was missed.
+#    recording: parked, including Sentry Mode with no events), so nothing
+#    was missed. That case is logged only, never alerted.
 SNAPSHOT_GAP_MARKER=/mutable/snapshot_gap_reported
 
 # Unix time of the newest snapshot with a committed TOC (when it was taken),
@@ -4819,6 +4821,8 @@ function snapshot_gap_check () {
   [ "$(cat "$SNAPSHOT_GAP_MARKER" 2>/dev/null)" != "$last" ] || return 0
   cam=$(stat -c %Y /backingfiles/cam_disk.bin 2>/dev/null || echo 0)
   udc=$(snapshot_gap_udc_state)
+  local awake=unknown
+  if car_is_awake_via_ble; then awake=yes; fi
   local at_last at_cam
   at_last=$(date -d "@$last" '+%H:%M' 2>/dev/null || echo "$last")
   at_cam=$(date -d "@$cam" '+%H:%M' 2>/dev/null || echo "$cam")
@@ -4833,15 +4837,16 @@ function snapshot_gap_check () {
   elif [ -n "$udc" ] && [ "$udc" != configured ]
   then
     reason="the car isn't using the USB drive (USB state '$udc'); it last wrote at $at_cam"
-    alert=true
+    # A sleeping car suspends its USB port; that's only trouble while awake.
+    [ "$awake" != yes ] || alert=true
   else
     reason="the car hasn't written to its drive since $at_cam, so there was nothing new to keep (it isn't recording)"
   fi
-  local awake=unknown
-  if car_is_awake_via_ble; then awake=yes; fi
   log "$level: snapshot gap: no snapshot for $((gap / 60)) min (last at $at_last): $reason; car awake over BLE: $awake"
   echo "$last" > "$SNAPSHOT_GAP_MARKER" 2>/dev/null || true
-  if [ "$alert" = true ] || [ "$awake" = yes ]
+  # Only real trouble alerts. A car that simply isn't writing (parked, Sentry
+  # Mode with no events) is logged, not alerted, even when it's awake.
+  if [ "$alert" = true ]
   then
     /root/bin/send-push-message "${NOTIFICATION_TITLE:-SentryUSB}:" \
       "No snapshot for $((gap / 60)) min (last at $at_last): $reason." \
