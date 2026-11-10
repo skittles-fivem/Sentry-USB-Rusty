@@ -226,9 +226,38 @@ fn notify_client() -> &'static reqwest::Client {
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .connect_timeout(std::time::Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= 5 {
+                    attempt.error("too many redirects")
+                } else if redirect_target_is_local(attempt.url()) {
+                    // The Pi's API trusts loopback without a login; a
+                    // notification server must not be able to bounce the
+                    // Pi onto it (or onto link-local metadata addresses).
+                    attempt.stop()
+                } else {
+                    attempt.follow()
+                }
+            }))
             .build()
             .expect("reqwest Client::build failed (TLS init?)")
     })
+}
+
+/// A redirect to this machine or a link-local address.
+fn redirect_target_is_local(url: &reqwest::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback() || ip.is_unspecified() || ip.is_link_local(),
+        Some(url::Host::Ipv6(ip)) => {
+            let ip = ip.to_canonical();
+            ip.is_loopback() || ip.is_unspecified() || matches!(ip, std::net::IpAddr::V6(v6) if (v6.segments()[0] & 0xffc0) == 0xfe80)
+                || matches!(ip, std::net::IpAddr::V4(v4) if v4.is_link_local())
+        }
+        Some(url::Host::Domain(d)) => {
+            let d = d.trim_end_matches('.').to_ascii_lowercase();
+            d == "localhost" || d.ends_with(".localhost")
+        }
+        None => true,
+    }
 }
 
 /// Client for Sentry Connect mobile push. It never follows redirects, so a
@@ -574,5 +603,23 @@ mod diagnostic_tests {
         assert!(!safe.contains("Bearer"));
         assert!(!super::safe_error_text("password=p%40ss", &["p@ss"]).contains("p%40ss"));
         assert!(!super::safe_error_text("HTTP 400 HTTPS://example/private-capability", &[]).contains("private-capability"));
+    }
+}
+
+#[cfg(test)]
+mod redirect_tests {
+    use super::redirect_target_is_local;
+
+    #[test]
+    fn redirects_to_the_pi_itself_are_not_followed() {
+        for u in [
+            "http://127.0.0.1/api/system/reboot", "http://localhost/", "http://[::1]/", "http://169.254.169.254/",
+            "http://[::ffff:127.0.0.1]/", "http://0.0.0.0/", "http://a.localhost./",
+        ] {
+            assert!(redirect_target_is_local(&reqwest::Url::parse(u).unwrap()), "{u}");
+        }
+        for u in ["https://discord.com/api", "http://192.168.1.5:8080/"] {
+            assert!(!redirect_target_is_local(&reqwest::Url::parse(u).unwrap()), "{u}");
+        }
     }
 }
