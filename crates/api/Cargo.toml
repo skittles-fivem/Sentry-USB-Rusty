@@ -39,6 +39,8 @@ sentryusb-ble-health = { path = "../ble_health", package = "sentryusb-ble-health
 # the BLE key-validity check (keys::key_is_usable) uses the real loader
 # instead of a duplicated, weaker "file exists" test.
 sentryusb-tesla-ble = { path = "../tesla_ble", package = "sentryusb-tesla-ble" }
+# Settings → Sentry Manager routes for the link client.
+sentryusb-manager-link = { path = "../manager_link", package = "sentryusb-manager-link" }
 
 [dev-dependencies]
 tempfile = "3"

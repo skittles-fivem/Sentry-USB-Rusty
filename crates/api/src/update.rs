@@ -1004,6 +1004,11 @@ fn is_prerelease_install(current: &str, releases: &[ReleaseInfo]) -> bool {
             .any(|r| !r.draft && r.prerelease && r.tag_name.trim().trim_start_matches('v') == tag)
 }
 
+/// The running Sentry USB version, as the status and update pages show it.
+pub fn current_version() -> String {
+    read_current_version()
+}
+
 pub(crate) fn read_current_version() -> String {
     std::fs::read_to_string("/opt/sentryusb/version")
         .or_else(|_| std::fs::read_to_string("/root/.sentryusb_version"))

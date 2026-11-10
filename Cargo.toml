@@ -18,6 +18,7 @@ members = [
     "crates/tesla_telemetry",
     "crates/tesla_ble",
     "crates/disk_reader",
+    "crates/manager_link",
 ]
 
 [workspace.package]

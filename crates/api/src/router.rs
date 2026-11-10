@@ -335,7 +335,16 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/cloud/pair/cancel", post(crate::cloud::pair_cancel))
         .route("/api/cloud/unpair", post(crate::cloud::unpair))
         .route("/api/cloud/upload-now", post(crate::cloud::upload_now))
-        .route("/api/cloud/backfill-ble", post(crate::cloud::backfill_ble));
+        .route("/api/cloud/backfill-ble", post(crate::cloud::backfill_ble))
+        // Settings → Sentry Manager. Behind the web login like the rest of
+        // /api; never on the link's own allowlist.
+        .route(
+            "/api/manager-link",
+            get(sentryusb_manager_link::ui::get_status).put(sentryusb_manager_link::ui::put_settings),
+        )
+        .route("/api/manager-link/log", get(sentryusb_manager_link::ui::get_log))
+        .route("/api/manager-link/pair", post(sentryusb_manager_link::ui::post_pair))
+        .route("/api/manager-link/unpair", post(sentryusb_manager_link::ui::post_unpair));
 
     api.with_state(state)
 }

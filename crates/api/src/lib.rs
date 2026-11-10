@@ -101,6 +101,12 @@ mod tests {
     use super::normalize_lon;
 
     #[test]
+    fn manager_link_knows_the_official_update_repo() {
+        // The link only lets Manager reset the update source to this one.
+        assert_eq!(sentryusb_manager_link::OFFICIAL_UPDATE_REPO, crate::update::OFFICIAL_UPDATE_REPO);
+    }
+
+    #[test]
     fn normalize_lon_wraps_world_copies() {
         assert!((normalize_lon(-221.5) - 138.5).abs() < 1e-9);
         assert!((normalize_lon(538.5) - 178.5).abs() < 1e-9);

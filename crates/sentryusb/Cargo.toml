@@ -26,6 +26,7 @@ sentryusb-setup = { path = "../setup", package = "sentryusb-setup" }
 sentryusb-gadget = { path = "../usb_gadget", package = "sentryusb-gadget" }
 sentryusb-status-led = { path = "../status_led" }
 sentryusb-cloud-uploader = { path = "../cloud_uploader", package = "sentryusb-cloud-uploader" }
+sentryusb-manager-link = { path = "../manager_link", package = "sentryusb-manager-link" }
 
 [lints]
 workspace = true
