@@ -68,6 +68,7 @@ ARCHIVE_QUICK_WHOLE_BELOW=2097152
 eval "$(grep '^ARCHIVE_BASIC_RULE_VERSION=' "$script")"
 ARCHIVE_BASIC_RULE_FILE="$workdir/mutable/archive_basic_rule"
 SNAPSHOT_LOG="$workdir/mutable/snapshot_log.tsv"
+CAR_FILES_LOG="$workdir/mutable/car_files.tsv" CAR_FILES_SHARE_NAME=car-files.tsv
 ARCHIVE_LOCAL_SUMS="$workdir/mutable/archive_local_sums.tsv"
 ARCHIVE_VERIFY_PROGRESS="$workdir/progress.json"
 ARCHIVE_WORK_PROGRESS="$workdir/work-progress.json"
@@ -715,6 +716,17 @@ do
   grep -qF "$want" <<< "$out" || fail "status file lacks $want: $out"
 done
 ls -A "$ARCHIVE_MOUNT/.sentryusb" | grep -qv '^archive-status.json$' && fail "temp file left beside the status file"
+# With a car file log, its last 7 days go beside the status file.
+now_cf=$(date +%s)
+printf '%s\tRecentClips/old.mp4\t1\t1\n%s\tRecentClips/2026-11-10_12-00-00-front.mp4\t30000000\t%s\n' \
+  $((now_cf - 8 * 86400)) "$now_cf" "$now_cf" > "$CAR_FILES_LOG"
+write_share_status || fail "status write with a car file log failed"
+cf="$ARCHIVE_MOUNT/.sentryusb/car-files.tsv"
+[ "$(head -1 "$cf")" = $'# first_seen_unix\tpath\tsize\tmtime_unix' ] || fail "car-files.tsv header wrong: $(head -1 "$cf" 2>&1)"
+grep -q '2026-11-10_12-00-00-front.mp4' "$cf" || fail "car-files.tsv lacks a recent clip"
+grep -q 'old.mp4' "$cf" && fail "car-files.tsv kept a line older than 7 days"
+ls -A "$ARCHIVE_MOUNT/.sentryusb" | grep -qv '^archive-status.json$\|^car-files.tsv$' && fail "temp file left beside the car file list"
+rm -f "$CAR_FILES_LOG" "$cf"
 
 # End of the cycle: idle with results; throughput learned for next time.
 ARCHIVE_SHARE_STATE=idle ARCHIVE_LAST_RESULT=ok ARCHIVE_LAST_ARCHIVED=2 ARCHIVE_LAST_LEFT=0

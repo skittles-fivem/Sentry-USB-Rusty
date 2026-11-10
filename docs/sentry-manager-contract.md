@@ -20,6 +20,7 @@ or clips without updating this document.
 | Path | What it is |
 |---|---|
 | `.sentryusb/archive-status.json` | Status file (section 4) |
+| `.sentryusb/car-files.tsv` | Every clip the car wrote to its USB drive in the last 7 days (section 4) |
 | `<clip folder>/.sentryusb-partial/<clip>.mp4` | An interrupted rsync upload, waiting to resume. Moved to its real name when complete; the folder is removed when empty. |
 | `.sentryusbtmp/` | SMB/NFS upload temp folder |
 | `<clip>.mp4.mismatch-<unix time>` | A server copy that failed its SHA-256 check, renamed aside (never deleted). The clip is re-uploaded under its real name. |
@@ -217,6 +218,34 @@ How Manager should use it:
   next cycle.
 - **Display:** it's worth showing last archive time, `last_clip` and the
   verification counts in Manager.
+
+### `.sentryusb/car-files.tsv`: what the car wrote
+
+Written beside the status file, whenever it's written. Every 10 minutes the
+Pi lists the clips on the car's drive (from an instant read-only copy,
+independent of the snapshots) and records each clip it hasn't seen, or that
+has grown since. The car keeps RecentClips about an hour, so every clip it
+writes is seen at least once. Tab-separated, one header line starting with
+`#`, then:
+
+```
+<first seen unix>	<path under TeslaCam>	<size bytes>	<mtime unix>
+```
+
+e.g. `1762800000	RecentClips/2026-11-10_12-00-00-front.mp4	30000000	1762790000`
+(RecentClips paths are the car's flat layout, without the date folder used on
+the share). A clip appears again with a later first-seen time when it grew;
+take the largest size per path. Lines from the last 7 days only.
+
+Use it to tell where footage went missing:
+- In this file but not on the share: the car wrote it and the Pi didn't keep
+  or upload it (a Sentry USB problem).
+- Expected (the car was driving) but not in this file: the car never wrote it
+  to the USB drive (a car or USB problem).
+
+The Pi also logs a daily line in its archiveloop log, e.g. "Car files for
+2026-11-10: 1234 RecentClips file(s) covering 310 minute(s), 3 Sentry
+event(s), 1 saved clip(s)".
 
 ## 5. Checking it works end to end
 

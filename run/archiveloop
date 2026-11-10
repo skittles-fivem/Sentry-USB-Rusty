@@ -3479,6 +3479,107 @@ function json_bool () {
   if "$@" >/dev/null 2>&1; then printf 'true'; else printf 'false'; fi
 }
 
+# Car file log: every clip file the car wrote to its drive, recorded by its
+# own worker (car_file_inventory_loop), independently of the snapshots. It
+# answers, for any day, "did the car write this footage at all?" separately
+# from "did the Pi keep it?": compare it with the snapshots and with what's
+# on the archive server. One line per clip, plus a line again whenever it
+# has grown since: "<first seen unix>\t<path under TeslaCam>\t<size>\t<mtime
+# unix>". Kept 8 days; the last 7 go to the share as .sentryusb/car-files.tsv.
+CAR_FILES_LOG=/mutable/car_files.tsv
+CAR_FILES_SUMMARY_STAMP=/mutable/car_files_summary_day
+CAR_FILES_SHARE_NAME=car-files.tsv
+
+# Add the clips in a listing ($1: "<path>\t<size>\t<mtime>" per file, paths
+# under TeslaCam) seen at unix time $2 to the car file log: a clip not
+# logged yet, or larger than last logged, gets a line. Only .mp4 clips.
+# Drops lines first seen more than 8 days ago.
+function car_files_record () {
+  local list=$1 now=$2
+  [ -e "$CAR_FILES_LOG" ] || : > "$CAR_FILES_LOG" || return 1
+  awk -F'\t' -v OFS='\t' -v log_file="$CAR_FILES_LOG" -v now="$now" '
+    FILENAME == log_file { if ($3 + 0 > last[$2] + 0 || !($2 in last)) last[$2] = $3 + 0; next }
+    tolower($1) ~ /\.mp4$/ && $2 ~ /^[0-9]+$/ && (!($1 in last) || $2 + 0 > last[$1]) {
+      m = $3; sub(/\..*/, "", m)
+      print now, $1, $2, m
+    }' "$CAR_FILES_LOG" "$list" > "$CAR_FILES_LOG.add" || { rm -f "$CAR_FILES_LOG.add"; return 1; }
+  cat "$CAR_FILES_LOG.add" >> "$CAR_FILES_LOG" || { rm -f "$CAR_FILES_LOG.add"; return 1; }
+  rm -f "$CAR_FILES_LOG.add"
+  local cut=$((now - 8 * 86400))
+  if awk -F'\t' -v cut="$cut" 'NR == 1 { exit !($1 + 0 < cut) }' "$CAR_FILES_LOG" 2>/dev/null
+  then
+    awk -F'\t' -v cut="$cut" '$1 + 0 >= cut' "$CAR_FILES_LOG" > "$CAR_FILES_LOG.new" &&
+      mv -f "$CAR_FILES_LOG.new" "$CAR_FILES_LOG"
+  fi
+}
+
+# One line summing up a day ($1, YYYY-MM-DD) from the car file log, by the
+# clips' own names (the car's local time): RecentClips files and the minutes
+# they cover, Sentry events and saved clips.
+function car_files_day_summary () {
+  local day=$1
+  awk -F'\t' -v day="$day" '
+    { p = $2; n = p; sub(/.*\//, "", n) }
+    substr(n, 1, 10) != day { next }
+    p ~ /^RecentClips\// { if (!(p in r)) { r[p] = 1; files++ }; minute[substr(n, 1, 16)] = 1; next }
+    p ~ /^SentryClips\// { d = p; sub(/\/[^\/]*$/, "", d); sentry[d] = 1; next }
+    p ~ /^SavedClips\// { d = p; sub(/\/[^\/]*$/, "", d); saved[d] = 1; next }
+    END {
+      for (m in minute) mins++
+      for (e in sentry) ev++
+      for (s in saved) sv++
+      printf "Car files for %s: %d RecentClips file(s) covering %d minute(s), %d Sentry event(s), %d saved clip(s)\n", day, files + 0, mins + 0, ev + 0, sv + 0
+    }' "$CAR_FILES_LOG" 2>/dev/null
+}
+
+# Log yesterday's summary once, on the first pass after midnight.
+function car_files_daily_summary () {
+  local today last
+  today=$(date +%F)
+  last=$(cat "$CAR_FILES_SUMMARY_STAMP" 2>/dev/null || true)
+  [ "$last" != "$today" ] || return 0
+  if [[ "$last" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]
+  then
+    log "$(car_files_day_summary "$last")"
+  fi
+  echo "$today" > "$CAR_FILES_SUMMARY_STAMP" 2>/dev/null || true
+}
+
+# List the car's clips now, from an instant read-only copy of its drive, and
+# record them. The copy is private to this pass (it never touches the
+# snapshots or the car's own image) and is removed at once.
+function car_file_inventory_once () {
+  local img=/backingfiles/.car-inventory.bin mnt=/tmp/car-inventory list=/tmp/car-inventory.list rc=0
+  rm -f "$img"
+  mkdir -p "$mnt" || return 1
+  ionice -c2 -n7 nice -n19 cp --reflink=always /backingfiles/cam_disk.bin "$img" 2>/dev/null || { rm -f "$img"; return 1; }
+  if ! /root/bin/mountimage "$img" "$mnt" -o ro 2>/dev/null
+  then
+    rm -f "$img"
+    return 1
+  fi
+  (cd "$mnt/TeslaCam" 2>/dev/null && ionice -c2 -n7 nice -n19 find . -type f -printf '%P\t%s\t%T@\n') > "$list" 2>/dev/null || rc=1
+  umount "$mnt" 2>/dev/null || umount -l "$mnt" 2>/dev/null || true
+  rm -f "$img"
+  [ "$rc" = 0 ] || { rm -f "$list"; return 1; }
+  car_files_record "$list" "$(date +%s)"
+  rm -f "$list"
+}
+
+# Every CAR_FILE_INVENTORY_INTERVAL seconds (default 600; the car keeps
+# RecentClips about an hour, so every clip is seen at least once).
+function car_file_inventory_loop {
+  echo -n carfileinventory > /proc/self/comm
+  local interval="${CAR_FILE_INVENTORY_INTERVAL:-600}"
+  [[ "$interval" =~ ^[0-9]+$ ]] && [ "$interval" -ge 60 ] || interval=600
+  while true
+  do
+    car_file_inventory_once || log "car file inventory: could not list the car's drive this time"
+    car_files_daily_summary || true
+    sleep "$interval"
+  done
+}
+
 # Snapshot log, written by make_snapshot (bash or Rust), one line per run:
 # "<name>\t<unix time taken>\t1" for a kept snapshot (lines kept after the
 # snapshot is released), "-\t<unix time>\t0" for a run discarded as
@@ -3627,13 +3728,29 @@ function write_share_status () {
   rm -rf "$stage"
   mkdir -p "$stage/$SHARE_STATUS_DIR" || return 1
   build_share_status_json > "$stage/$SHARE_STATUS_DIR/$SHARE_STATUS_NAME" || return 1
+  # The car file log's last 7 days, for Sentry Manager (best effort).
+  local have_car_files=false
+  if [ -s "$CAR_FILES_LOG" ]
+  then
+    { printf '# first_seen_unix\tpath\tsize\tmtime_unix\n'
+      awk -F'\t' -v cut=$(( $(date +%s) - 7 * 86400 )) '$1 + 0 >= cut' "$CAR_FILES_LOG"
+    } > "$stage/$SHARE_STATUS_DIR/$CAR_FILES_SHARE_NAME" 2>/dev/null && have_car_files=true
+  fi
   case "$ARCHIVE_SYSTEM" in
     cifs|nfs)
       # Copy to a dot-named temp file beside it, then rename over the old one.
       local dest="$ARCHIVE_MOUNT/$SHARE_STATUS_DIR"
       timeout 30 mkdir -p "$dest" &&
         timeout 30 cp "$stage/$SHARE_STATUS_DIR/$SHARE_STATUS_NAME" "$dest/.$SHARE_STATUS_NAME.tmp" &&
-        timeout 30 mv -f "$dest/.$SHARE_STATUS_NAME.tmp" "$dest/$SHARE_STATUS_NAME"
+        timeout 30 mv -f "$dest/.$SHARE_STATUS_NAME.tmp" "$dest/$SHARE_STATUS_NAME" || return 1
+      if [ "$have_car_files" = true ]
+      then
+        # Best effort: the status file above is what matters most.
+        if timeout 60 cp "$stage/$SHARE_STATUS_DIR/$CAR_FILES_SHARE_NAME" "$dest/.$CAR_FILES_SHARE_NAME.tmp"
+        then
+          timeout 30 mv -f "$dest/.$CAR_FILES_SHARE_NAME.tmp" "$dest/$CAR_FILES_SHARE_NAME" || true
+        fi
+      fi
       ;;
     rsync)
       # rsync writes a dot-named temp file and renames it into place.
@@ -3644,7 +3761,12 @@ function write_share_status () {
       ;;
     rclone)
       timeout 120 rclone --config /root/.config/rclone/rclone.conf copyto \
-        "$stage/$SHARE_STATUS_DIR/$SHARE_STATUS_NAME" "$RCLONE_DRIVE:$RCLONE_PATH/$SHARE_STATUS_DIR/$SHARE_STATUS_NAME"
+        "$stage/$SHARE_STATUS_DIR/$SHARE_STATUS_NAME" "$RCLONE_DRIVE:$RCLONE_PATH/$SHARE_STATUS_DIR/$SHARE_STATUS_NAME" || return 1
+      if [ "$have_car_files" = true ]
+      then
+        timeout 300 rclone --config /root/.config/rclone/rclone.conf copyto \
+          "$stage/$SHARE_STATUS_DIR/$CAR_FILES_SHARE_NAME" "$RCLONE_DRIVE:$RCLONE_PATH/$SHARE_STATUS_DIR/$CAR_FILES_SHARE_NAME" || true
+      fi
       ;;
     *)
       return 0
@@ -5885,11 +6007,13 @@ function camdiskworkers {
   do
     sleep 10
   done
-  local snap_pid fsm_pid gsw_pid
+  local snap_pid fsm_pid gsw_pid cfi_pid
   while true
   do
     snapshotloop &
     snap_pid=$!
+    car_file_inventory_loop &
+    cfi_pid=$!
     freespacemanager &
     fsm_pid=$!
     gadget_stall_watchdog &
@@ -5899,7 +6023,7 @@ function camdiskworkers {
     # supervisor itself dies before it can log, reap, or restart.
     wait -n || true
     log "cam-disk worker exited unexpectedly; restarting snapshot/space/watchdog workers"
-    kill "$snap_pid" "$fsm_pid" "$gsw_pid" 2>/dev/null || true
+    kill "$snap_pid" "$cfi_pid" "$fsm_pid" "$gsw_pid" 2>/dev/null || true
     wait 2>/dev/null || true
     sleep 10
   done

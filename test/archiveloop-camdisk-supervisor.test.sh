@@ -21,6 +21,7 @@ function log { echo "$@" >> "$tmp/log"; }
 function has_cam_disk { return 0; }
 function usb_storage_ready { return 0; }
 function snapshotloop { sleep 60; }
+function car_file_inventory_loop { sleep 60; }
 function gadget_stall_watchdog { sleep 60; }
 function freespacemanager {
   echo x >> "$tmp/fsm_spawns"
