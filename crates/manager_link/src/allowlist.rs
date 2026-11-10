@@ -182,11 +182,27 @@ fn pattern_matches(pattern: &str, path: &str) -> bool {
     }
 }
 
+/// Logs Manager may read. The router falls back to `/var/log/<name>` for
+/// any other name; over the link only the named logs are served, so no
+/// file that happens to sit in /var/log goes out.
+pub const LINK_LOGS: &[&str] = &[
+    "archiveloop", "manager-link", "setup", "diagnostics", "syslog", "kern", "auth", "daemon",
+    "sentryusb", "sentryusb-ble", "bluetooth",
+];
+
+fn log_name_ok(path: &str) -> bool {
+    match path.strip_prefix("/api/logs/") {
+        Some(rest) => LINK_LOGS.contains(&rest.split('/').next().unwrap_or("")),
+        None => true,
+    }
+}
+
 /// Whether the link may carry this request. The caller must also have
 /// checked `path_is_canonical` and `query_is_safe`; this re-checks them.
 pub fn is_allowed(method: Method, path: &str, query: &str) -> bool {
     path_is_canonical(path)
         && query_is_safe(query)
+        && log_name_ok(path)
         && ROUTES.iter().any(|(m, p)| *m == method && pattern_matches(p, path))
 }
 
@@ -197,7 +213,8 @@ mod tests {
     #[test]
     fn listed_routes_pass() {
         assert!(is_allowed(Get, "/api/status", ""));
-        assert!(is_allowed(Get, "/api/logs/archiveloop.log/page", "offset=0&limit=200"));
+        assert!(is_allowed(Get, "/api/logs/archiveloop/page", "lines=200"));
+        assert!(is_allowed(Get, "/api/logs/manager-link", ""));
         assert!(is_allowed(Delete, "/api/snapshots/snap-000123", ""));
         assert!(is_allowed(Put, "/api/setup/config", ""));
         assert!(is_allowed(Post, "/api/system/check-update", "include_prerelease=true"));
@@ -293,6 +310,18 @@ mod tests {
         }
         assert!(query_is_safe("offset=10&limit=200&q=a%20b+c"));
         assert!(!query_is_safe(&"a".repeat(MAX_QUERY_LEN + 1)));
+    }
+
+    #[test]
+    fn only_named_logs_are_readable() {
+        for name in ["shadow", "btmp", "wtmp", "sentryusb-cloud.log", "archiveloop.log", "journal"] {
+            for tail in ["", "/page", "/tail"] {
+                assert!(!is_allowed(Get, &format!("/api/logs/{name}{tail}"), ""), "{name}{tail}");
+            }
+        }
+        for name in LINK_LOGS {
+            assert!(is_allowed(Get, &format!("/api/logs/{name}/tail"), ""), "{name}");
+        }
     }
 
     #[test]
