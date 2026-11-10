@@ -9,6 +9,7 @@ import { PrefCard, PrefGrid } from "@/components/settings/PrefCard"
 import { ConfigBackupSection } from "@/components/settings/sections/ConfigBackupSection"
 import { StorageRepairCard } from "@/components/settings/sections/StorageRepairCard"
 import { ArchiveVerifySection } from "@/components/settings/sections/ArchiveVerifySection"
+import { ManagerLinkSection } from "@/components/settings/sections/ManagerLinkSection"
 import { InfoButton } from "@/components/ui/InfoButton"
 import { Toggle } from "@/components/ui/Toggle"
 
@@ -89,6 +90,7 @@ export function SystemTab({ onOpenRawConfig, onOpenWizard, version, hostname }: 
   return (
     <PrefGrid>
       <>
+      <ManagerLinkSection />
       <ConfigBackupSection />
       <PrefCard icon={<SettingsIcon className="h-3.5 w-3.5" />} halo="slate" title="Configuration">
         <p className="t-xs">Export your configuration or edit advanced settings.</p>
