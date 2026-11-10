@@ -50,11 +50,13 @@ pub fn is_secret_key(key: &str) -> bool {
 const SETTABLE: &[&str] = &[
     // Network
     "SSID", "WIFIPASS", "AP_SSID", "AP_PASS", "AP_IP", "SENTRYUSB_HOSTNAME", "TIME_ZONE",
-    // Archive
-    "ARCHIVE_SYSTEM", "ARCHIVE_SERVER", "SHARE_NAME", "SHARE_USER", "SHARE_PASSWORD",
-    "SHARE_DOMAIN", "CIFS_VERSION", "CIFS_SEC", "CIFS_NOSERVERINO", "RSYNC_USER",
-    "RSYNC_SERVER", "RSYNC_PATH", "RSYNC_SSH_PORT", "RCLONE_DRIVE", "RCLONE_PATH",
-    "MUSIC_SHARE_NAME", "ARCHIVE_DELAY", "ARCHIVE_STALL_GRACE_SECONDS",
+    // Archive. The destination itself (ARCHIVE_SYSTEM, servers, shares,
+    // users, paths, CIFS dialect) is NOT settable over the link: clips and
+    // the automatic config backup (SSH and BLE private keys, every
+    // password) go wherever it points, and several of those values reach
+    // eval'd mount lines and /etc/fstab. Only the share password, for the
+    // destination already set on the Pi, can be rotated.
+    "SHARE_PASSWORD", "CIFS_NOSERVERINO", "ARCHIVE_DELAY", "ARCHIVE_STALL_GRACE_SECONDS",
     "ARCHIVE_RECENTCLIPS", "ARCHIVE_SAVEDCLIPS", "ARCHIVE_SENTRYCLIPS",
     "ARCHIVE_TRACKMODECLIPS", "ARCHIVE_VERIFY", "ARCHIVE_VERIFY_MODE",
     "ARCHIVE_VERIFY_MAX_SECONDS", "ARCHIVE_VERIFY_RECHECK_SECONDS", "ARCHIVE_VERIFY_PARALLEL",
@@ -95,6 +97,92 @@ const ARGUMENT_KEYS: &[&str] = &[
 /// add options of the caller's choosing.
 const MOUNT_OPTION_KEYS: &[&str] = &["SHARE_USER", "SHARE_DOMAIN", "CIFS_VERSION", "CIFS_SEC"];
 
+/// Where archived clips and the automatic backup go. Read-only over the link.
+const ARCHIVE_DESTINATION_KEYS: &[&str] = &[
+    "ARCHIVE_SYSTEM", "ARCHIVE_SERVER", "SHARE_NAME", "SHARE_USER", "SHARE_DOMAIN",
+    "CIFS_VERSION", "CIFS_SEC", "RSYNC_USER", "RSYNC_SERVER", "RSYNC_PATH", "RSYNC_SSH_PORT",
+    "RCLONE_DRIVE", "RCLONE_PATH", "MUSIC_SHARE_NAME",
+];
+
+/// Numeric settings. Several are used in bash arithmetic (`$((X - 5000))`),
+/// which evaluates a non-numeric value as an expression, so only digits.
+const NUMBER_KEYS: &[&str] = &[
+    "ARCHIVE_DELAY", "ARCHIVE_STALL_GRACE_SECONDS", "ARCHIVE_VERIFY_MAX_SECONDS",
+    "ARCHIVE_VERIFY_RECHECK_SECONDS", "ARCHIVE_VERIFY_PARALLEL", "ARCHIVE_VERIFY_MANAGER_WAIT_HOURS",
+    "SNAPSHOT_INTERVAL", "GOTIFY_PRIORITY", "NTFY_PRIORITY", "TEMPERATURE_WARNING",
+    "TEMPERATURE_CAUTION", "TEMPERATURE_INTERVAL", "SENTRY_CASE", "RSYNC_SSH_PORT",
+];
+
+const BOOL_VALUES: &[&str] = &["true", "false", "yes", "no", "1", "0", "on", "off"];
+
+fn is_bool_key(key: &str) -> bool {
+    key.ends_with("_ENABLED")
+        || matches!(
+            key,
+            "ARCHIVE_RECENTCLIPS" | "ARCHIVE_SAVEDCLIPS" | "ARCHIVE_SENTRYCLIPS" | "ARCHIVE_TRACKMODECLIPS"
+                | "ARCHIVE_VERIFY" | "ARCHIVE_AUTO_DELETE_VERIFIED" | "CIFS_NOSERVERINO"
+                | "DRIVE_MAP_WHILE_AWAY" | "TELEGRAM_SILENT_NOTIFY" | "TEMPERATURE_POSTARCHIVE"
+        )
+}
+
+/// Short words: units, modes, regions, VINs, event names.
+const TOKEN_KEYS: &[&str] = &[
+    "ARCHIVE_VERIFY_MODE", "DRIVE_MAP_UNIT", "TEMPERATURE_UNIT", "SYSTEM_TEMPERATURE_UNIT",
+    "PRESSURE_UNIT", "AWS_REGION", "TESSIE_VIN", "TESLA_BLE_VIN", "IFTTT_EVENT_NAME",
+];
+
+/// Addresses the Pi sends requests to.
+const URL_KEYS: &[&str] = &[
+    "GOTIFY_DOMAIN", "MATRIX_SERVER_URL", "SIGNAL_URL", "DISCORD_WEBHOOK_URL", "SLACK_WEBHOOK_URL",
+    "WEBHOOK_URL", "NTFY_URL", "KEEP_AWAKE_WEBHOOK_URL",
+];
+
+/// A notification URL must be plain http(s) to some other machine. The
+/// Pi's API trusts loopback without a login, so a webhook pointed at
+/// 127.0.0.1 or localhost would let Manager call routes that are not on
+/// its allowlist; link-local covers cloud-style metadata addresses.
+fn check_url(key: &str, value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    let bad = || Err(format!("{key} must be an http:// or https:// address of another machine"));
+    let Some(rest) = value.strip_prefix("https://").or_else(|| value.strip_prefix("http://")) else {
+        return bad();
+    };
+    if value.chars().any(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '\\' | '<' | '>' | '$')) {
+        return bad();
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.contains('@') {
+        return bad();
+    }
+    let host = if let Some(h) = authority.strip_prefix('[') {
+        h.split(']').next().unwrap_or("")
+    } else {
+        authority.rsplit_once(':').map_or(authority, |(h, _)| h)
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() || host == "localhost" || host.ends_with(".localhost") {
+        return bad();
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        let ip = ip.to_canonical();
+        let blocked = ip.is_loopback()
+            || ip.is_unspecified()
+            || match ip {
+                std::net::IpAddr::V4(v4) => v4.is_link_local() || v4.octets()[0] == 0,
+                std::net::IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
+            };
+        if blocked {
+            return bad();
+        }
+    } else if host.chars().all(|c| c.is_ascii_digit() || c == '.') || host.starts_with("0x") {
+        // Numeric forms like 2130706433 or 127.1 that resolvers read as IPs.
+        return bad();
+    }
+    Ok(())
+}
+
 /// Checks one value Manager wants to write. Secrets are checked for control
 /// characters only, since passwords may hold any printable character.
 pub fn validate_value(key: &str, value: &str) -> Result<(), String> {
@@ -112,7 +200,46 @@ pub fn validate_value(key: &str, value: &str) -> Result<(), String> {
     }
     let only = |ok: fn(char) -> bool| value.chars().all(ok);
     let host_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '[' | ']');
+    // Typed keys first: these values reach shell arithmetic, `touch` paths,
+    // config files and URLs that the Pi fetches as root.
+    if NUMBER_KEYS.contains(&key) {
+        if !value.is_empty() && (value.len() > 12 || !only(|c| c.is_ascii_digit())) {
+            return Err(format!("{key} must be a whole number"));
+        }
+        return Ok(());
+    }
+    if is_bool_key(key) {
+        if !value.is_empty() && !BOOL_VALUES.contains(&value.to_ascii_lowercase().as_str()) {
+            return Err(format!("{key} must be true or false"));
+        }
+        return Ok(());
+    }
+    if TOKEN_KEYS.contains(&key) {
+        if !only(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) || value.starts_with('-') {
+            return Err(format!("{key} must be letters, digits, '.', '_' or '-'"));
+        }
+        return Ok(());
+    }
+    if key.starts_with("TRIGGER_FILE_") {
+        if value == "." || value == ".." || !only(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) {
+            return Err(format!("{key} must be a plain file name"));
+        }
+        return Ok(());
+    }
+    if URL_KEYS.contains(&key) {
+        return check_url(key, value);
+    }
     match key {
+        "AP_IP" if !value.is_empty() && value.parse::<std::net::Ipv4Addr>().is_err() => {
+            Err(format!("{key} must be an IPv4 address"))
+        }
+        "TELEGRAM_CHAT_ID"
+            if !value.is_empty()
+                && !(value.strip_prefix('-').unwrap_or(value).chars().all(|c| c.is_ascii_digit())
+                    || value.strip_prefix('@').is_some_and(|r| r.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))) =>
+        {
+            Err(format!("{key} must be a chat id or @channel"))
+        }
         "ARCHIVE_SERVER" | "RSYNC_SERVER" if !only(host_char) => {
             Err(format!("{key} must be a host name or IP address"))
         }
@@ -295,6 +422,17 @@ pub fn check_write(
                 let Value::String(value) = value else {
                     return Err(bad(format!("{key} must be a string")));
                 };
+                // Only the destination stored on the Pi can be tested.
+                if ARCHIVE_DESTINATION_KEYS.contains(&key.as_str())
+                    && value.trim() != active.get(key).map(|s| s.trim()).unwrap_or("")
+                {
+                    return Err((403, format!("{key} can only be changed on the Sentry USB itself")));
+                }
+                // The CIFS test passes the password inside `mount -o`, where
+                // a comma would add mount options.
+                if key == "SHARE_PASSWORD" && value.contains(',') {
+                    return Err(bad("Test a password with ',' on the Sentry USB itself".into()));
+                }
                 if is_secret_key(key) && value.is_empty() {
                     if let Some(stored) = active.get(key) {
                         // Only probe the stored destination with the stored
@@ -428,16 +566,16 @@ mod tests {
             &stored(),
         )
         .unwrap_err();
-        assert!(err.contains("SHARE_PASSWORD"), "{err}");
+        assert!(err.contains("ARCHIVE_SERVER"), "{err}");
         // The Wi-Fi password to another access point.
         assert!(prepare_setup_config_write(
             &json!({"SSID": "Evil", "ARCHIVE_SERVER": "nas.local"}),
             &stored(),
         )
         .is_err());
-        // With the password typed in again it is fine.
+        // Rotating the share password for the stored server is fine.
         let out = prepare_setup_config_write(
-            &json!({"SSID": "Home", "ARCHIVE_SERVER": "nas2.local", "SHARE_PASSWORD": "typed"}),
+            &json!({"SSID": "Home", "ARCHIVE_SERVER": "nas.local", "SHARE_PASSWORD": "typed"}),
             &stored(),
         )
         .unwrap();
@@ -508,6 +646,105 @@ mod tests {
         ] {
             assert!(prepare_setup_config_write(&body, &stored()).is_err(), "{body} was accepted");
         }
+    }
+
+    #[test]
+    fn archive_destination_is_read_only_even_with_a_new_password() {
+        // Clips and the automatic backup (SSH/BLE keys, passwords) follow
+        // the destination, so typing a password of one's own doesn't help.
+        for body in [
+            json!({"ARCHIVE_SERVER": "attacker.example", "SHARE_PASSWORD": "mine"}),
+            json!({"ARCHIVE_SYSTEM": "rsync", "RSYNC_SERVER": "attacker.example"}),
+            json!({"SHARE_NAME": "TeslaCam'x"}),
+            json!({"MUSIC_SHARE_NAME": "/x /root/bin nfs rw 0 0"}),
+            json!({"CIFS_VERSION": "3.0 0 0"}),
+            json!({"RCLONE_DRIVE": "evil"}),
+        ] {
+            assert!(prepare_setup_config_write(&body, &stored()).is_err(), "{body} was accepted");
+        }
+        // The same values sent back unchanged are fine.
+        assert!(prepare_setup_config_write(&json!({"SSID": "Home", "ARCHIVE_SERVER": "nas.local"}), &stored()).is_ok());
+    }
+
+    #[test]
+    fn typed_values_are_checked() {
+        for (k, v) in [
+            ("TEMPERATURE_WARNING", "a[x]"),
+            ("TEMPERATURE_CAUTION", "1+1"),
+            ("ARCHIVE_DELAY", "20 "),
+            ("SNAPSHOT_INTERVAL", "-1"),
+            ("SENTRY_CASE", "x"),
+            ("ARCHIVE_VERIFY", "reboot"),
+            ("WEBHOOK_ENABLED", "maybe"),
+            ("TRIGGER_FILE_SAVED", "../../etc/nologin"),
+            ("TRIGGER_FILE_ANY", ".."),
+            ("AP_IP", "192.168.66.1 x"),
+            ("TEMPERATURE_UNIT", "C;x"),
+            ("TESLA_BLE_VIN", "-x"),
+            ("TELEGRAM_CHAT_ID", "12a"),
+        ] {
+            assert!(validate_value(k, v).is_err(), "{k}={v:?} was accepted");
+        }
+        for (k, v) in [
+            ("TEMPERATURE_WARNING", "68000"),
+            ("ARCHIVE_DELAY", ""),
+            ("ARCHIVE_VERIFY", "True"),
+            ("TRIGGER_FILE_SAVED", "ARCHIVE_UPLOADED"),
+            ("AP_IP", "192.168.66.1"),
+            ("TELEGRAM_CHAT_ID", "-1001234"),
+            ("TELEGRAM_CHAT_ID", "@my_channel"),
+            ("TESLA_BLE_VIN", "5YJ3E1EA4JF000001"),
+        ] {
+            assert!(validate_value(k, v).is_ok(), "{k}={v:?} was refused");
+        }
+    }
+
+    #[test]
+    fn notification_urls_cannot_point_at_the_pi_itself() {
+        for v in [
+            "http://127.0.0.1/api/system/reboot",
+            "http://127.1/x",
+            "http://2130706433/x",
+            "http://0x7f000001/x",
+            "http://localhost:80/api",
+            "http://foo.localhost/",
+            "http://[::1]/api",
+            "http://[::ffff:127.0.0.1]/",
+            "http://0.0.0.0/",
+            "http://169.254.169.254/latest",
+            "http://[fe80::1]/",
+            "http://user@127.0.0.1/",
+            "file:///etc/shadow",
+            "gopher://nas/",
+            "https://example.com/$(x)",
+            "https://example.com/a b",
+        ] {
+            assert!(validate_value("WEBHOOK_URL", v).is_err(), "{v} was accepted");
+        }
+        for v in ["https://discord.com/api/webhooks/1/abc", "http://192.168.1.10:8080", "https://ntfy.example.com/topic", ""] {
+            assert!(validate_value("WEBHOOK_URL", v).is_ok(), "{v} was refused");
+        }
+        // Written through the setup config, too.
+        assert!(prepare_setup_config_write(
+            &json!({"SSID": "Home", "ARCHIVE_SERVER": "nas.local", "GOTIFY_DOMAIN": "http://127.0.0.1:80"}),
+            &stored()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn archive_test_only_probes_the_stored_destination() {
+        let mut a = stored();
+        a.insert("ARCHIVE_SYSTEM".into(), "cifs".into());
+        let t = |b: Value| check_write(Method::Post, "/api/setup/test-archive", &b, &a);
+        // A new server, even with a password of its own.
+        assert_eq!(
+            t(json!({"ARCHIVE_SYSTEM": "cifs", "ARCHIVE_SERVER": "attacker.example", "SHARE_PASSWORD": "mine"})).unwrap_err().0,
+            403
+        );
+        // A comma in the password would add mount options.
+        assert!(t(json!({"ARCHIVE_SYSTEM": "cifs", "ARCHIVE_SERVER": "nas.local", "SHARE_PASSWORD": "x,ip=10.0.0.9"})).is_err());
+        assert!(t(json!({"ARCHIVE_SYSTEM": "cifs", "ARCHIVE_SERVER": "nas.local", "SHARE_PASSWORD": "new-one"})).is_ok());
     }
 
     #[test]
