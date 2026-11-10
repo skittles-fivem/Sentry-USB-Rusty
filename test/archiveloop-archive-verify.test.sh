@@ -738,6 +738,11 @@ now=$(date +%s)
   printf 'snap-000903\t%s\n' $((now - 3600))
   printf 'snap-000902\t%s\n' $((now - 7200))
   printf 'snap-000903\t%s\n' $((now - 3600))             # duplicate line
+  printf -- '-\t%s\t0\n' $((now - 5400))                 # a run discarded as identical
+  printf -- '-\t%s\t0\n' $((now - 5400))                 # duplicate
+  printf -- '-\t%s\t0\n' $((now - 8 * 86400 + 60))       # discarded run, older than 7 days
+  printf 'snap-000904\t%s\t1\n' $((now - 600))           # three-column kept line
+  printf -- '-\t%s\t1\n' $((now - 500))                  # malformed: no name but kept
   printf 'garbage line\n'
 } > "$SNAPSHOT_LOG"
 SNAPSHOT_INTERVAL=3480 write_share_status
@@ -747,7 +752,7 @@ import json, os, sys
 d = json.load(open(sys.argv[1])); now = int(sys.argv[2]); snaps = sys.argv[3]
 assert d["schema"] == 1 and d["snapshot_interval_s"] == 3480, d.get("snapshot_interval_s")
 s = d["snapshots"]
-names = [e["name"] for e in s]
+names = [e.get("name") for e in s]
 times = [e["started_unix"] for e in s]
 assert times == sorted(times), "not oldest first"
 assert "snap-000900" not in names and "snap-000901" not in names, names
@@ -759,7 +764,16 @@ for n in on_pi:
     t = int(os.stat(os.path.join(snaps, n, "snap.bin")).st_mtime) if os.path.exists(os.path.join(snaps, n, "snap.bin")) else None
     if t is None or t >= now - 7 * 86400:
         assert n in names, (n, names)
-assert all(set(e) == {"name", "started_unix"} for e in s)
+kept = [e for e in s if e["kept"]]
+runs = [e for e in s if not e["kept"]]
+assert all(set(e) == {"name", "started_unix", "kept"} for e in kept), kept
+assert all(set(e) == {"started_unix", "kept"} for e in runs), runs
+# One discarded run in the window (duplicate and old ones dropped), between snap-000902 and 903.
+assert [e["started_unix"] for e in runs] == [now - 5400], runs
+i902, i903 = names.index("snap-000902"), names.index("snap-000903")
+assert s[i902]["started_unix"] < now - 5400 < s[i903]["started_unix"]
+assert "snap-000904" in names
+assert now - 500 not in times, "a nameless line marked kept is malformed"
 PYCHECK
 grep -q 'snap-000900' "$SNAPSHOT_LOG" && fail "a line older than 8 days should be pruned from the log"
 grep -q 'snap-000901' "$SNAPSHOT_LOG" || fail "a 7-8 day old line should stay in the log"
@@ -776,7 +790,7 @@ write_share_status
 python3 - "$status_json" <<'PYCAP' || fail "snapshot list should be capped at the newest 1000"
 import json, sys
 s = json.load(open(sys.argv[1]))["snapshots"]
-names = {e["name"] for e in s}
+names = {e.get("name") for e in s}
 assert len(s) == 1000, len(s)
 assert "snap-003100" in names and "snap-002001" not in names
 assert [e["started_unix"] for e in s] == sorted(e["started_unix"] for e in s)

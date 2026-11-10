@@ -3479,16 +3479,20 @@ function json_bool () {
   if "$@" >/dev/null 2>&1; then printf 'true'; else printf 'false'; fi
 }
 
-# Snapshot log: "<name>\t<unix time taken>" per committed snapshot, written
-# by make_snapshot (bash or Rust) and kept after the snapshot is released.
+# Snapshot log, written by make_snapshot (bash or Rust), one line per run:
+# "<name>\t<unix time taken>\t1" for a kept snapshot (lines kept after the
+# snapshot is released), "-\t<unix time>\t0" for a run discarded as
+# identical to the previous one (the car wrote nothing new). Lines from
+# before the third column existed are kept snapshots.
 SNAPSHOT_LOG=/mutable/snapshot_log.tsv
 
 # Bring the snapshot log up to date for the status file: add snapshots on
 # the Pi that it doesn't list yet (taken before the log existed; their time
 # is the image's mtime, set when it was copied), and drop lines older than 8
 # days so it stays small. Prints the "snapshots" JSON array: every snapshot
-# taken in the last 7 days, oldest first, at most 1000, one per name and
-# time.
+# run in the last 7 days, oldest first, at most 1000, one per name and time.
+# Kept snapshots: {"name", "started_unix", "kept": true}; runs discarded as
+# identical: {"started_unix", "kept": false}.
 function snapshot_log_json () {
   local toc dir name taken
   for toc in /backingfiles/snapshots/snap-[0-9]*/snap.bin.toc
@@ -3498,7 +3502,7 @@ function snapshot_log_json () {
     name=${dir##*/}
     grep -q "^$name"$'\t' "$SNAPSHOT_LOG" 2>/dev/null && continue
     taken=$(stat -c %Y "$dir/snap.bin" 2>/dev/null || stat -c %Y "$toc" 2>/dev/null) || continue
-    printf '%s\t%s\n' "$name" "$taken" >> "$SNAPSHOT_LOG" 2>/dev/null || true
+    printf '%s\t%s\t1\n' "$name" "$taken" >> "$SNAPSHOT_LOG" 2>/dev/null || true
   done
   local now
   now=$(date +%s)
@@ -3509,10 +3513,15 @@ function snapshot_log_json () {
   fi
   { cat "$SNAPSHOT_LOG" 2>/dev/null || true; } |
     awk -F'\t' -v cut=$((now - 7 * 86400)) '
-      $1 ~ /^snap-[0-9]+$/ && $2 ~ /^[0-9]+$/ && $2 + 0 >= cut && !seen[$1 "\t" $2]++ { print $2 "\t" $1 }' |
+      ($1 ~ /^snap-[0-9]+$/ || ($1 == "-" && $3 == "0")) && $2 ~ /^[0-9]+$/ && $2 + 0 >= cut &&
+      !seen[$1 "\t" $2]++ { print $2 "\t" $1 "\t" ($1 == "-" ? 0 : 1) }' |
     sort -n | tail -n 1000 |
     awk -F'\t' 'BEGIN { printf "[" }
-      { printf "%s\n    { \"name\": \"%s\", \"started_unix\": %s }", (NR > 1 ? "," : ""), $2, $1 }
+      {
+        if ($3 == 1) e = sprintf("{ \"name\": \"%s\", \"started_unix\": %s, \"kept\": true }", $2, $1)
+        else e = sprintf("{ \"started_unix\": %s, \"kept\": false }", $1)
+        printf "%s\n    %s", (NR > 1 ? "," : ""), e
+      }
       END { printf (NR ? "\n  ]" : "]") }'
 }
 

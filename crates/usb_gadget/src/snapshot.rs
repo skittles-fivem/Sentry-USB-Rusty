@@ -15,17 +15,24 @@ const SNAPSHOTS_DIR: &str = "/backingfiles/snapshots";
 /// autofs root targeted by each snapshot's stable `mnt` symlink.
 const AUTOFS_SNAPSHOTS: &str = "/tmp/snapshots";
 const CAM_DISK: &str = "/backingfiles/cam_disk.bin";
-/// One line per committed snapshot, "<name>\t<unix time it was taken>",
-/// kept after the snapshot is released. archiveloop reads it for the archive
-/// status file's snapshot list and prunes it. Same file as make_snapshot.sh.
+/// One line per snapshot run, "<name>\t<unix time it was taken>\t<kept 1|0>":
+/// a committed snapshot, or a run discarded as identical to the previous one
+/// (name "-", kept 0). Lines outlive the snapshot. archiveloop reads it for the
+/// archive status file's snapshot list and prunes it. Same file as
+/// make_snapshot.sh.
 const SNAPSHOT_LOG: &str = "/mutable/snapshot_log.tsv";
 
-/// Append a committed snapshot to [`SNAPSHOT_LOG`] (best effort).
-fn record_snapshot_taken(log: &Path, name: &str, started_unix: u64) -> std::io::Result<()> {
+/// Append a snapshot run to [`SNAPSHOT_LOG`]: `Some(name)` for a committed
+/// snapshot, `None` for a run discarded as identical (best effort).
+fn record_snapshot_taken(log: &Path, name: Option<&str>, started_unix: u64) -> std::io::Result<()> {
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(log)?;
+    let line = match name {
+        Some(n) => format!("{n}\t{started_unix}\t1\n"),
+        None => format!("-\t{started_unix}\t0\n"),
+    };
     // One write per line, so concurrent appends can't interleave.
-    f.write_all(format!("{name}\t{started_unix}\n").as_bytes())
+    f.write_all(line.as_bytes())
 }
 const REBUILD_FLAG: &str = "/mutable/.rebuild_snapshot_symlinks";
 
@@ -156,6 +163,10 @@ pub async fn make_snapshot_with(skip_fsck: bool, caller_holds_lock: bool) -> Res
 
     if is_duplicate {
         info!("Snapshot {} identical to previous; discarding", snap_name);
+        // The run still counts as a check of the drive: log it, unkept.
+        if let Err(e) = record_snapshot_taken(Path::new(SNAPSHOT_LOG), None, started_unix) {
+            warn!("could not log the discarded snapshot run in {}: {}", SNAPSHOT_LOG, e);
+        }
         let _ = std::fs::remove_file(&toc_path_tmp);
         let _ = std::fs::remove_file(&snap_file);
         let _ = std::fs::remove_dir_all(&snap_dir);
@@ -174,7 +185,7 @@ pub async fn make_snapshot_with(skip_fsck: bool, caller_holds_lock: bool) -> Res
     if let Err(e) = std::fs::rename(&toc_path_tmp, &toc_path) {
         bail!("could not commit the TOC for {}: {}", snap_name, e);
     }
-    if let Err(e) = record_snapshot_taken(Path::new(SNAPSHOT_LOG), &snap_name, started_unix) {
+    if let Err(e) = record_snapshot_taken(Path::new(SNAPSHOT_LOG), Some(&snap_name), started_unix) {
         warn!("could not log snapshot {} in {}: {}", snap_name, SNAPSHOT_LOG, e);
     }
 
@@ -2543,11 +2554,12 @@ mod tests {
     fn committed_snapshots_are_appended_to_the_snapshot_log() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("snapshot_log.tsv");
-        super::record_snapshot_taken(&log, "snap-000011", 1_762_731_609).unwrap();
-        super::record_snapshot_taken(&log, "snap-000012", 1_762_735_089).unwrap();
+        super::record_snapshot_taken(&log, Some("snap-000011"), 1_762_731_609).unwrap();
+        super::record_snapshot_taken(&log, None, 1_762_735_089).unwrap();
+        super::record_snapshot_taken(&log, Some("snap-000012"), 1_762_738_569).unwrap();
         assert_eq!(
             std::fs::read_to_string(&log).unwrap(),
-            "snap-000011\t1762731609\nsnap-000012\t1762735089\n"
+            "snap-000011\t1762731609\t1\n-\t1762735089\t0\nsnap-000012\t1762738569\t1\n"
         );
     }
 }

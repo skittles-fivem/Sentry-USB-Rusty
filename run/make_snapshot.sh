@@ -460,7 +460,7 @@ function snapshot {
     fi
     # Log when it was taken (kept after the snapshot is released, for the
     # archive status file's snapshot list). Best effort.
-    printf '%s\t%s\n' "$(basename "$newsnapdir")" "$started" >> /mutable/snapshot_log.tsv 2>/dev/null || true
+    printf '%s\t%s\t1\n' "$(basename "$newsnapdir")" "$started" >> /mutable/snapshot_log.tsv 2>/dev/null || true
     # The car auto-deletes Sentry events when the cam disk fills, so we
     # cannot tell user deletions apart from firmware cleanup. Don't sync
     # deletions from the cam disk into snapshot symlinks.
@@ -475,6 +475,9 @@ function snapshot {
     local camwrite
     camwrite=$(date -d "@$(stat -c %Y /backingfiles/cam_disk.bin 2>/dev/null || echo 0)" '+%F %T' 2>/dev/null || echo unknown)
     log "new snapshot is identical to previous one ($newcount files; the car last wrote to its drive at $camwrite), discarding"
+    # Log the run too ("-": no snapshot kept), so a stretch with nothing new
+    # to keep still shows regular runs rather than a missed snapshot.
+    printf '%s\t%s\t0\n' "-" "$started" >> /mutable/snapshot_log.tsv 2>/dev/null || true
     /root/bin/release_snapshot.sh "$newsnapdir"
     rm -rf "$newsnapdir"
   fi

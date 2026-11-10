@@ -170,8 +170,9 @@ Schema 1:
   "state": "transferring | idle",
   "snapshot_interval_s": 3480,
   "snapshots": [
-    { "name": "snap-000011", "started_unix": 1762731609 },
-    { "name": "snap-000012", "started_unix": 1762735089 }
+    { "name": "snap-000011", "started_unix": 1762731609, "kept": true },
+    { "started_unix": 1762735089, "kept": false },
+    { "name": "snap-000012", "started_unix": 1762738569, "kept": true }
   ],
   "transfer": null
 }
@@ -180,17 +181,21 @@ Schema 1:
 `snapshot_interval_s` and `snapshots` are optional (absent from files
 written by older Sentry USB builds), and `schema` stays 1:
 - `snapshot_interval_s`: the configured SNAPSHOT_INTERVAL in seconds.
-- `snapshots`: every snapshot taken in the last 7 days, oldest first, at
-  most 1000 (the newest), including ones since released or deleted. Each
-  has `name` and `started_unix`, when the snapshot copied the car's drive.
-  Snapshots taken before the Pi had this log are listed with their image's
-  time, and only while they're still on the Pi. A snapshot that turned out
-  identical to the previous one is discarded, not listed: the car wrote
-  nothing new since. The car keeps about 60 min of RecentClips, so two
-  consecutive entries more than ~65 min apart mean the footage between
-  them was overwritten before it was copied, unless the car wasn't
-  recording to the drive then (the Pi logs which, see "snapshot gap" in
-  its archiveloop log).
+- `snapshots`: every snapshot run in the last 7 days, oldest first, at
+  most 1000 (the newest), `started_unix` being when the run copied the
+  car's drive.
+  - A kept snapshot has `name` and `"kept": true`, and stays listed after
+    it's released or deleted. Snapshots taken before the Pi had this log are
+    listed with their image's time, and only while they're still on the Pi.
+  - A run discarded as identical to the previous snapshot has no `name` and
+    `"kept": false`: the car wrote nothing new to the drive since the last
+    snapshot, so there was nothing to keep. It still counts as a snapshot
+    point.
+
+  The car keeps about 60 min of RecentClips, so footage can only be lost
+  when the car was driving and no run (kept or not) started within about
+  60 min of it. A parked stretch shows regular unkept runs every
+  `snapshot_interval_s`.
 
 When a transfer is in progress, `transfer` is:
 `{"started_unix", "files", "bytes", "first_clip", "last_clip", "expected_finish_unix", "give_up_unix"}`.
