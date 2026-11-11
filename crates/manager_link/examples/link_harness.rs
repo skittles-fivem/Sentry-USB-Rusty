@@ -19,7 +19,8 @@
 //!   a `GET /api/status` call with no `request` entry after it is a status
 //!   push).
 //! - Commands on stdin, one per line: `pair [seconds]`, `confirm`,
-//!   `unpair`, `reconnect`, `impostor`, `status`, `log`, `quit`.
+//!   `unpair`, `reconnect`, `impostor`, `status`, `log`,
+//!   `archiving on|off` (the status push's `archiving`), `quit`.
 //! - Before the first pairing the client reads Manager's fingerprint and
 //!   waits for the owner to confirm it. The harness confirms it at once
 //!   (`event: "confirm"`, with the fingerprint), unless `--manual-confirm`
@@ -95,7 +96,7 @@ fn print_routes() -> ! {
             (Method::Put, "/api/setup/config") => ("", json!("from-get")),
             (Method::Get, "/api/config/preference") => ("key=harness", Value::Null),
             (Method::Put, "/api/config/preference") => ("", json!({"key": "harness", "value": 1})),
-            (Method::Put, "/api/notifications/settings") => ("", json!({"enabled": true})),
+            (Method::Put, "/api/notifications/settings") => ("", notification_defaults()),
             (Method::Put, "/api/system/keep-accessory-config") => ("", json!({"enabled": true, "minutes": 15})),
             (Method::Put, "/api/system/update-source") => ("", json!({"repo": ""})),
             (Method::Post, "/api/setup/test-archive") => {
@@ -224,7 +225,7 @@ async fn run(args: Args, manager: String, dir: PathBuf) {
     tokio::spawn(watch_state());
 
     let fake = Arc::new(Mutex::new(FakePi::default()));
-    sentryusb_manager_link::spawn(stand_in_router(fake), args.version.clone());
+    sentryusb_manager_link::spawn(stand_in_router(fake.clone()), args.version.clone());
 
     if !args.manual_confirm {
         tokio::spawn(auto_confirm());
@@ -279,6 +280,13 @@ async fn run(args: Args, manager: String, dir: PathBuf) {
                 });
                 Ok(())
             }
+            Some("archiving") => match words.next() {
+                Some(w @ ("on" | "off")) => {
+                    fake_lock(&fake).archiving = w == "on";
+                    Ok(())
+                }
+                _ => Err("archiving on|off".to_string()),
+            },
             Some("status") => {
                 emit(json!({"event": "status", "body": sentryusb_manager_link::status_json()}));
                 Ok(())
@@ -429,6 +437,8 @@ struct FakePi {
     keep_accessory: Option<Value>,
     update_source: String,
     drives_active: bool,
+    /// `archiving` in the status push (`archiving on|off` on stdin).
+    archiving: bool,
     actions: Vec<String>,
 }
 
@@ -522,7 +532,7 @@ fn stand_in_router(fake: Fake) -> Router {
         .route("/api/notifications/settings", get({
             let fk = f();
             move || async move {
-                Json(fake_lock(&fk).notifications.clone().unwrap_or_else(|| json!({"enabled": true, "events": {"archive_done": true}})))
+                Json(fake_lock(&fk).notifications.clone().unwrap_or_else(notification_defaults))
             }
         }).put({
             let fk = f();
@@ -624,6 +634,14 @@ fn stand_in_router(fake: Fake) -> Router {
         .layer(axum::middleware::from_fn(trace))
 }
 
+/// Shaped like the Pi's `NotificationSettings` (crates/api
+/// notification_center.rs): one switch per type, no provider secrets.
+fn notification_defaults() -> Value {
+    json!({"archive_start": true, "archive_complete": true, "archive_error": true, "temperature": true,
+        "keep_awake_failure": true, "update": true, "drives": true, "rtc_battery": true, "music_sync": true,
+        "keep_accessory": true, "storage_repair": true})
+}
+
 fn snapshot_ids() -> [&'static str; 3] {
     ["snap-000041", "snap-000042", "snap-000043"]
 }
@@ -654,6 +672,9 @@ fn status(fake: &Fake) -> Value {
         "wifi_rate_state": "ok", "ether_rate_state": "absent",
         "wifi_sample_age_ms": 500, "ether_sample_age_ms": null, "sampled_at": now_unix(),
         "storage_health": {"state": "healthy"},
+        "device_suffix": "harness",
+        // As the Pi's: archive work is running (Manager holds queued updates and reboots).
+        "archiving": g.archiving,
         "harness_actions": g.actions,
     })
 }

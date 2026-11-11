@@ -204,7 +204,8 @@ wait_ev "$m" 30 '.event=="connected" and .mode=="key"' || bad "restart with the 
 step "5. allowlisted routes through Manager's proxy"
 dev="${MANAGER_DEVICE_ID:-$id}"
 proxy() { # proxy METHOD PATH QUERY BODY -> prints "status body"
-    local url="$MANAGER_API/api/sentryusb/$dev/proxy$2"
+    # Manager's proxy path leaves out the Pi's /api: .../proxy/status is GET /api/status.
+    local url="$MANAGER_API/api/sentryusb/$dev/proxy${2#/api}"
     [[ -n "$3" ]] && url="$url?$3"
     local args=(-sS -o "$state/proxy.out" -w '%{http_code}' -X "$1")
     [[ "$4" != null ]] && args+=(-H 'Content-Type: application/json' --data-binary "$4")
@@ -241,10 +242,10 @@ elif [[ -n "${MANAGER_API:-}" ]]; then
     code=$(proxy GET /api/terminal "" null || echo 000)
     if [[ "$code" =~ ^4 ]] && no_ev "$m" 3 '.path=="/api/terminal"'; then ok "Manager refused /api/terminal ($code), the Pi never saw it"; else bad "/api/terminal -> $code"; fi
 else
-    echo "  MANAGER_API not set: send these by hand (curl \$MANAGER_API/api/sentryusb/$dev/proxy<path>) and watch $events for \"request\":"
-    "$bin/link_harness" --print-routes | jq -r '"    " + .method + " " + .path + (if .query != "" then "?" + .query else "" end) + (if .body != null then "  " + (.body|tostring) else "" end)'
-    echo "    PUT /api/system/update-source  {\"repo\":\"someone/else\"}   -> 403 from the Pi (event \"refused\")"
-    echo "    GET /api/terminal                                        -> refused by Manager, no Pi event"
+    echo "  MANAGER_API not set: send these by hand (curl \$MANAGER_API/api/sentryusb/$dev/proxy<path without /api>) and watch $events for \"request\":"
+    "$bin/link_harness" --print-routes | jq -r '"    " + .method + " " + (.path | ltrimstr("/api")) + (if .query != "" then "?" + .query else "" end) + (if .body != null then "  " + (.body|tostring) else "" end)'
+    echo "    PUT /system/update-source  {\"repo\":\"someone/else\"}   -> 403 from the Pi (event \"refused\")"
+    echo "    GET /terminal                                        -> refused by Manager, no Pi event"
 fi
 echo "  (Manager's log should list each proxied action: who, which Pi, which route, the result)"
 
