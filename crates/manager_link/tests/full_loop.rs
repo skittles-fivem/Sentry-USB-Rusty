@@ -110,8 +110,15 @@ async fn flip_the_switch_pair_and_unpair() {
                     let _ = ws.send(Message::text(req.to_string())).await;
                     // Everything the Pi sends after the handshake.
                     while let Some(Ok(m)) = ws.next().await {
-                        if let Message::Text(t) = m {
-                            let _ = seen.send(serde_json::from_str(t.as_str()).unwrap());
+                        match m {
+                            Message::Text(t) => {
+                                let _ = seen.send(serde_json::from_str(t.as_str()).unwrap());
+                            }
+                            Message::Close(f) => {
+                                let code = f.map(|f| u16::from(f.code));
+                                let _ = seen.send(json!({"t": "__close", "code": code}));
+                            }
+                            _ => {}
                         }
                     }
                 });
@@ -229,6 +236,14 @@ async fn flip_the_switch_pair_and_unpair() {
     // Unpair drops the link and forgets key and pin; it never pairs again
     // by itself.
     sentryusb_manager_link::unpair().unwrap();
+    // ...closing with 4001 ("unpaired"), so Manager forgets this Pi too.
+    loop {
+        let f = next(&mut seen_rx).await;
+        if f["t"] == "__close" {
+            assert_eq!(f["code"], 4001, "{f}");
+            break;
+        }
+    }
     let s = wait_for("pairing_expired").await;
     while seen_rx.try_recv().is_ok() {}
     assert_eq!(s["paired"], false);

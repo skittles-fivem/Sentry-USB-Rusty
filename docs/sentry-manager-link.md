@@ -107,7 +107,10 @@ sends it over the link.
 5. **Afterwards, every connection uses the link key** and never the password.
    - Changing the Pi's web password doesn't unpair it.
    - "Unpair" on either side deletes the key on that side, and the other side's
-     next handshake fails.
+     next handshake fails. Unpair on the Pi while connected also closes the
+     link with WebSocket code 4001 (`unpaired`, the code Manager uses), so
+     Manager marks the Pi unpaired at once: a Pi without a key never connects
+     again to fail a handshake.
    - A failed handshake is reported as "not paired" on both sides.
 
 **Storage:**

@@ -13,6 +13,8 @@ use serde_json::{json, Value};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::handshake::{self, is_hex64, Secret};
@@ -33,6 +35,8 @@ pub const MAX_HANDSHAKE_FRAME: usize = 8 * 1024;
 /// any parsing).
 pub const MAX_FRAME: usize = 2 * 1024 * 1024;
 pub const PATH: &str = "/api/sentryusb/link";
+/// WebSocket close code for "unpaired", sent by either side.
+pub const UNPAIRED_CLOSE: u16 = 4001;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -417,6 +421,13 @@ pub async fn run(
             }
             _ = &mut silence => break "no answer from Sentry Manager for 90 seconds".into(),
             _ = stop.changed() => {
+                // Unpaired here (the key is already gone): close with 4001,
+                // as Manager does, so Manager marks this Sentry USB unpaired
+                // too instead of waiting for a handshake that never comes.
+                if store::load().map(|s| s.link_key.is_none()).unwrap_or(false) {
+                    let _ = tx.send(Message::Close(Some(CloseFrame { code: CloseCode::from(UNPAIRED_CLOSE), reason: "unpaired".into() }))).await;
+                    break "unpaired on the Sentry USB".into();
+                }
                 let _ = tx.send(Message::Close(None)).await;
                 break "stopped on the Sentry USB".into();
             }
