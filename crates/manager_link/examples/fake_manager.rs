@@ -4,15 +4,17 @@
 //!
 //! - Serves `wss://127.0.0.1:<port>/api/sentryusb/link` with the test
 //!   fixture certificate (`tests/fixtures/manager.cert.der`).
-//! - Pairs with a Pi whose web login is `--user`/`--password` (the slot is
-//!   always open), hands out a random link key and keeps it in memory, so
-//!   later connections use key mode.
+//! - Pairs with a Pi whose web login is `--user`/`--password` and which
+//!   entered the pairing code `--code` (the slot is always open; protocol
+//!   v2, P = HMAC(K, "pair-code|" + code)), hands out a random link key and
+//!   keeps it in memory, so later connections use key mode. A wrong proof is
+//!   denied with "wrong password", as Manager does.
 //! - After each handshake it sends every allowlisted route once, then a few
 //!   requests the Pi must refuse, waiting for each answer.
 //! - Prints each frame from the Pi, and each answer's summary, as JSON lines.
 //!
 //! ```text
-//! cargo run -p sentryusb-manager-link --example fake_manager -- --port 10000 --user admin --password pw
+//! cargo run -p sentryusb-manager-link --example fake_manager -- --port 10000 --user admin --password pw --code K7QP-M2XD-9WRT
 //! ```
 
 use std::collections::HashMap;
@@ -25,7 +27,7 @@ use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::Message;
 
 use sentryusb_manager_link::allowlist::{Method, ROUTES};
-use sentryusb_manager_link::handshake::{self, Secret};
+use sentryusb_manager_link::handshake::{self, PairingCode, Secret};
 
 const CERT: &[u8] = include_bytes!("../tests/fixtures/manager.cert.der");
 const KEY: &[u8] = include_bytes!("../tests/fixtures/manager.key.der");
@@ -40,7 +42,7 @@ fn emit(mut v: Value) {
 #[tokio::main]
 async fn main() {
     let mut port = 10000u16;
-    let (mut user, mut pass) = (String::new(), String::new());
+    let (mut user, mut pass, mut code) = (String::new(), String::new(), String::new());
     let mut it = std::env::args().skip(1);
     while let Some(f) = it.next() {
         let v = it.next().expect("value");
@@ -48,10 +50,12 @@ async fn main() {
             "--port" => port = v.parse().expect("port"),
             "--user" => user = v,
             "--password" => pass = v,
+            "--code" => code = v,
             _ => panic!("unknown flag {f}"),
         }
     }
-    let k = handshake::derive_pairing_key(&user, &pass);
+    let code = PairingCode::parse(&code).expect("--code: a pairing code such as K7QP-M2XD-9WRT");
+    let k = handshake::derive_pair_secret(&handshake::derive_pairing_key(&user, &pass), &code);
     let fp = sentryusb_manager_link::tls::sha256_hex(CERT);
     let keys: Arc<Mutex<HashMap<String, Secret>>> = Default::default();
 
@@ -98,8 +102,13 @@ async fn send(ws: &mut Ws, v: Value) {
 
 async fn session(mut ws: Ws, k: &Secret, fp: &str, keys: &Mutex<HashMap<String, Secret>>) {
     let mn = handshake::random_hex32().unwrap();
-    send(&mut ws, json!({"t": "hello", "v": 1, "nonce": mn, "fp": fp})).await;
+    send(&mut ws, json!({"t": "hello", "v": handshake::VERSION, "nonce": mn, "fp": fp})).await;
     let Some(auth) = recv(&mut ws).await else { return };
+    if auth["v"] != json!(handshake::VERSION) {
+        emit(json!({"event": "denied", "why": "version", "v": auth["v"]}));
+        send(&mut ws, json!({"t": "denied", "why": "version"})).await;
+        return;
+    }
     let (pn, id, mode) = (
         auth["nonce"].as_str().unwrap_or("").to_string(),
         auth["id"].as_str().unwrap_or("").to_string(),
@@ -108,8 +117,9 @@ async fn session(mut ws: Ws, k: &Secret, fp: &str, keys: &Mutex<HashMap<String, 
     let secret = if mode == "pair" { Some(k.clone()) } else { keys.lock().unwrap().get(&id).cloned() };
     let good = secret.as_ref().is_some_and(|s| auth["proof"].as_str() == Some(handshake::pi_proof(s, &mn, &pn, fp, &id).as_str()));
     if !good {
-        emit(json!({"event": "denied", "id": id, "mode": mode}));
-        send(&mut ws, json!({"t": "denied", "why": "not paired"})).await;
+        let why = if mode == "pair" { "wrong password" } else { "not paired" };
+        emit(json!({"event": "denied", "id": id, "mode": mode, "why": why}));
+        send(&mut ws, json!({"t": "denied", "why": why})).await;
         let _ = ws.close(None).await;
         return;
     }

@@ -12,24 +12,24 @@
 //!   `/api/logs/manager-link` serves the client's real security log.
 //! - Every event goes to stdout as one JSON line: the client's own security
 //!   log entries (`src: "pi"`, `event` = the log's `kind`: `pairing_open`,
-//!   `paired`, `connected`, `disconnected`, `attempt_failed`, `network`,
+//!   `pairing_closed`, `paired`, `connected`, `disconnected`, `attempt_failed`, `network`,
 //!   `request`, `refused`, `fingerprint_mismatch`, `bad_proof`,
 //!   `alert_sent`, `unpaired`), link state changes (`src: "harness"`,
 //!   `event: "state"`), and every call into the router (`event: "handler"`;
 //!   a `GET /api/status` call with no `request` entry after it is a status
 //!   push).
-//! - Commands on stdin, one per line: `pair [seconds]`, `confirm`,
-//!   `unpair`, `reconnect`, `impostor`, `status`, `log`,
-//!   `archiving on|off` (the status push's `archiving`), `quit`.
-//! - Before the first pairing the client reads Manager's fingerprint and
-//!   waits for the owner to confirm it. The harness confirms it at once
-//!   (`event: "confirm"`, with the fingerprint), unless `--manual-confirm`
-//!   is given: then send `confirm` after comparing it with Manager's.
+//! - Commands on stdin, one per line: `pair CODE [seconds]`, `unpair`,
+//!   `reconnect`, `impostor`, `status`, `log`,
+//!   `archiving on|off` (the status push's `archiving`), `quit`. The code
+//!   is never echoed: a `pair` command is reported as `pair <code>`.
+//! - Pairing works as on the Pi: the pairing code Manager shows (`--code`
+//!   or `--code-env`) opens the pairing window, like pressing Pair.
 //!
 //! ```text
 //! cargo run -p sentryusb-manager-link --example link_harness -- \
 //!     --manager nas.local:10000 --user admin --password-env WEB_PASSWORD \
-//!     [--pair-window 120] [--state-dir DIR] [--fake-manager-cert] [--manual-confirm] [--version v-harness]
+//!     [--code K7QP-M2XD-9WRT | --code-env VAR] [--pair-window 120] [--state-dir DIR] \
+//!     [--fake-manager-cert] [--version v-harness]
 //! cargo run -p sentryusb-manager-link --example link_harness -- --print-routes
 //! ```
 
@@ -71,15 +71,16 @@ struct Args {
     pair_window: u64,
     state_dir: Option<PathBuf>,
     fake_manager_cert: bool,
-    manual_confirm: bool,
+    /// The pairing code Manager shows. Only ever passed to `start_pairing_for`.
+    code: Option<String>,
     version: String,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: link_harness --manager HOST:PORT --user USER (--password PASS | --password-env VAR)\n\
-         \x20                   [--pair-window SECONDS (0 = don't open; default 900)] [--state-dir DIR]\n\
-         \x20                   [--fake-manager-cert] [--manual-confirm] [--version VERSION]"
+         \x20                   [--code CODE | --code-env VAR] [--pair-window SECONDS (0 = don't open; default 900)]\n\
+         \x20                   [--state-dir DIR] [--fake-manager-cert] [--version VERSION]"
     );
     std::process::exit(2);
 }
@@ -121,7 +122,7 @@ fn parse_args() -> Args {
         pair_window: 900,
         state_dir: None,
         fake_manager_cert: false,
-        manual_confirm: false,
+        code: None,
         version: "v-harness".into(),
     };
     let mut it = std::env::args().skip(1);
@@ -135,7 +136,8 @@ fn parse_args() -> Args {
             "--pair-window" => a.pair_window = val().parse().unwrap_or_else(|_| usage()),
             "--state-dir" => a.state_dir = Some(PathBuf::from(val())),
             "--fake-manager-cert" => a.fake_manager_cert = true,
-            "--manual-confirm" => a.manual_confirm = true,
+            "--code" => a.code = Some(val()),
+            "--code-env" => a.code = Some(std::env::var(val()).unwrap_or_else(|_| usage())),
             "--version" => a.version = val(),
             _ => usage(),
         }
@@ -227,11 +229,9 @@ async fn run(args: Args, manager: String, dir: PathBuf) {
     let fake = Arc::new(Mutex::new(FakePi::default()));
     sentryusb_manager_link::spawn(stand_in_router(fake.clone()), args.version.clone());
 
-    if !args.manual_confirm {
-        tokio::spawn(auto_confirm());
-    }
-    if args.pair_window > 0 {
-        let r = sentryusb_manager_link::start_pairing_for(Duration::from_secs(args.pair_window));
+    // Like pressing Pair on the Pi: the address is already saved.
+    if let (Some(code), true) = (&args.code, args.pair_window > 0) {
+        let r = sentryusb_manager_link::start_pairing_for("", code, Duration::from_secs(args.pair_window));
         emit(json!({"event": "pair", "ok": r.is_ok(), "error": r.err()}));
     }
     if args.fake_manager_cert {
@@ -261,13 +261,15 @@ async fn run(args: Args, manager: String, dir: PathBuf) {
             return;
         };
         let mut words = line.split_whitespace();
+        let mut shown = line.clone();
         let r: Result<(), String> = match words.next() {
             None => continue,
             Some("pair") => {
+                let code = words.next().unwrap_or("").to_string();
                 let secs = words.next().and_then(|s| s.parse().ok()).unwrap_or(900);
-                sentryusb_manager_link::start_pairing_for(Duration::from_secs(secs))
+                shown = format!("pair <code> {secs}");
+                sentryusb_manager_link::start_pairing_for("", &code, Duration::from_secs(secs))
             }
-            Some("confirm") => confirm_shown(),
             Some("unpair") => sentryusb_manager_link::unpair(),
             // Off and on again: the next connection is a fresh handshake
             // (key mode once paired).
@@ -301,28 +303,7 @@ async fn run(args: Args, manager: String, dir: PathBuf) {
             }
             Some(other) => Err(format!("unknown command {other:?}")),
         };
-        emit(json!({"event": "command", "line": line, "ok": r.is_ok(), "error": r.err()}));
-    }
-}
-
-/// Confirms the fingerprint the status page shows (`confirm`).
-fn confirm_shown() -> Result<(), String> {
-    let s = sentryusb_manager_link::status_json();
-    let fp = s["check"]["fingerprint"].as_str().ok_or("no fingerprint to confirm")?.to_string();
-    emit(json!({"event": "confirm", "fingerprint": fp, "display": s["check"]["display"]}));
-    sentryusb_manager_link::confirm_pairing(&fp)
-}
-
-/// Without `--manual-confirm`: presses "It matches, pair" whenever the
-/// status page asks.
-async fn auto_confirm() {
-    loop {
-        if sentryusb_manager_link::status_json()["state"] == "confirm_fingerprint" {
-            if let Err(e) = confirm_shown() {
-                emit(json!({"event": "confirm_failed", "error": e}));
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        emit(json!({"event": "command", "line": shown, "ok": r.is_ok(), "error": r.err()}));
     }
 }
 

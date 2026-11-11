@@ -47,35 +47,27 @@ pub async fn put_settings(Json(body): Json<SettingsBody>) -> Response {
     }
 }
 
-/// POST /api/manager-link/pair: opens the 15-minute pairing window.
-pub async fn post_pair() -> Response {
-    match blocking(crate::start_pairing).await {
+#[derive(Deserialize)]
+pub struct PairBody {
+    #[serde(default)]
+    address: String,
+    code: String,
+}
+
+/// POST /api/manager-link/pair `{"address": "host[:port]", "code": "K7QP-M2XD-9WRT"}`:
+/// saves the address and opens the 15-minute pairing window with the code
+/// Sentry Manager shows. The code is kept in memory only; it is never
+/// stored, logged or echoed back (errors are fixed texts).
+///
+/// Like unpair it needs the web login, whose cookie is `SameSite=Strict`,
+/// and it takes only a JSON body, which a plain cross-site form can't send.
+pub async fn post_pair(Json(body): Json<PairBody>) -> Response {
+    if body.address.len() > 300 {
+        return err(StatusCode::BAD_REQUEST, "Address is too long".into());
+    }
+    match blocking(move || crate::start_pairing(&body.address, &body.code)).await {
         Ok(Ok(())) => get_status().await,
         Ok(Err(e)) => err(StatusCode::BAD_REQUEST, e),
-        Err(r) => r,
-    }
-}
-
-#[derive(Deserialize)]
-pub struct ConfirmBody {
-    fingerprint: String,
-}
-
-/// POST /api/manager-link/confirm `{"fingerprint": "<the one shown>"}`: the
-/// owner checked it matches Sentry Manager's, so pin it and pair.
-///
-/// Like pair and unpair it needs the web login, whose cookie is
-/// `SameSite=Strict`, so another site can't send it. It also takes only a
-/// JSON body (`Content-Type: application/json`, which a plain form can't
-/// send cross-site without a CORS preflight the Pi never allows), and the
-/// fingerprint must be the one being shown, which another site can't read.
-pub async fn post_confirm(Json(body): Json<ConfirmBody>) -> Response {
-    if body.fingerprint.len() > 200 {
-        return err(StatusCode::BAD_REQUEST, "That isn't a fingerprint".into());
-    }
-    match blocking(move || crate::confirm_pairing(&body.fingerprint)).await {
-        Ok(Ok(())) => get_status().await,
-        Ok(Err(e)) => err(StatusCode::CONFLICT, e),
         Err(r) => r,
     }
 }

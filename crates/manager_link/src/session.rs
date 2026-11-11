@@ -1,9 +1,12 @@
 //! One connection to Manager: TCP, TLS with the pin, WebSocket upgrade, the
 //! mutual handshake (contract 3), then the request loop (contract 4).
 //!
-//! Before the first pairing, `read_fingerprint` only reads Manager's
-//! certificate fingerprint for the owner to confirm; a handshake always
-//! needs a pin, so no proof ever goes to a certificate nobody confirmed.
+//! Key mode always runs pinned to the saved fingerprint. Pair mode runs
+//! pinned too when a fingerprint is saved; on a first pairing it accepts
+//! whatever certificate is served, which is safe because the proof is keyed
+//! by P (the web password and the one-time pairing code) and covers the
+//! fingerprint seen, so a server with another certificate can neither
+//! complete nor relay the handshake.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,12 +61,12 @@ pub struct Attempt {
     pub host: String,
     pub port: u16,
     pub mode: Mode,
-    /// K in pair mode, the link key in key mode.
+    /// P in pair mode, the link key in key mode.
     pub secret: Secret,
-    /// The pinned fingerprint: saved at pairing, or confirmed by the owner
-    /// before the first pairing. Always required: any other certificate
-    /// fails TLS before a proof is sent.
-    pub pin: String,
+    /// The pinned fingerprint saved at pairing: any other certificate fails
+    /// TLS before a proof is sent. Required in key mode. `None` only for a
+    /// first pairing, which accepts any certificate.
+    pub pin: Option<String>,
     pub device_id: String,
     pub name: String,
     pub version: String,
@@ -73,8 +76,9 @@ pub struct Attempt {
 pub enum LinkError {
     /// Manager refused us (`denied`); the reason it gave.
     Denied(String),
-    /// Manager speaks a newer protocol.
-    Version,
+    /// Manager speaks another protocol version: the `v` its hello carried,
+    /// or `None` when it refused ours with `denied`/`version`.
+    Version(Option<u64>),
     /// The certificate didn't match the pin (or Manager's own claim); the
     /// fingerprint seen.
     CertMismatch(String),
@@ -91,8 +95,13 @@ impl std::fmt::Display for LinkError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LinkError::Denied(why) => write!(f, "Sentry Manager refused the connection ({why})"),
-            LinkError::Version => f.write_str("Sentry Manager uses a newer link version"),
-            LinkError::CertMismatch(_) => f.write_str("Sentry Manager's certificate doesn't match the saved fingerprint"),
+            LinkError::Version(Some(v)) if *v < handshake::VERSION => {
+                f.write_str("Sentry Manager needs updating: update Sentry Manager to the newest version")
+            }
+            LinkError::Version(_) => {
+                f.write_str("Sentry Manager uses another link version: update Sentry USB to test.30 or later")
+            }
+            LinkError::CertMismatch(_) => f.write_str("the certificate presented isn't the expected Sentry Manager certificate"),
             LinkError::Timeout => f.write_str("Sentry Manager didn't answer in time"),
             LinkError::BadProof(_) => f.write_str("Sentry Manager couldn't prove it holds the key"),
             LinkError::Protocol(m) => write!(f, "unexpected message from Sentry Manager: {m}"),
@@ -163,11 +172,18 @@ async fn connect_inner(a: &Attempt) -> Result<(Ws, Established), LinkError> {
     let tcp = TcpStream::connect((a.host.as_str(), a.port)).await.map_err(io)?;
     let _ = tcp.set_nodelay(true);
     let local_ip = tcp.local_addr().ok().map(|s| s.ip().to_canonical().to_string());
-    if !is_hex64(&a.pin) {
-        return Err(io("no confirmed fingerprint"));
-    }
+    let pin = match (&a.pin, a.mode) {
+        (Some(p), _) if is_hex64(p) => Some(p.as_str()),
+        (Some(_), _) | (None, Mode::Key) => return Err(io("no saved fingerprint")),
+        // A first pairing: any certificate, bound into the proof below.
+        (None, Mode::Pair) => None,
+    };
     let seen: crate::tls::SeenSlot = Default::default();
-    let cfg = crate::tls::client_config(&a.pin, seen.clone()).map_err(io)?;
+    let cfg = match pin {
+        Some(p) => crate::tls::client_config(p, seen.clone()),
+        None => crate::tls::any_cert_config(seen.clone()),
+    }
+    .map_err(io)?;
     let server_name = rustls::pki_types::ServerName::try_from(a.host.clone())
         .map_err(|_| io("invalid host name"))?;
     let tls = tokio_rustls::TlsConnector::from(cfg)
@@ -190,7 +206,7 @@ async fn connect_inner(a: &Attempt) -> Result<(Ws, Established), LinkError> {
         .ok_or_else(|| io("no server certificate"))?;
     // The verifier already enforced the pin; checked again here because
     // everything below depends on it.
-    if !handshake::ct_eq(&fp, &a.pin) {
+    if pin.is_some_and(|p| !handshake::ct_eq(&fp, p)) {
         return Err(LinkError::CertMismatch(fp));
     }
 
@@ -207,18 +223,19 @@ async fn connect_inner(a: &Attempt) -> Result<(Ws, Established), LinkError> {
         // Manager may refuse at once (rate limit, no pairing slot).
         Some("denied") => {
             let why = hello.get("why").and_then(Value::as_str).unwrap_or("").chars().take(120).collect::<String>();
-            return Err(if why == "version" { LinkError::Version } else { LinkError::Denied(why) });
+            return Err(if why == "version" { LinkError::Version(None) } else { LinkError::Denied(why) });
         }
         _ => return Err(LinkError::Protocol("expected hello".into())),
     }
+    // Only v2: a v1 Manager would key pair mode with K alone.
     match hello.get("v").and_then(Value::as_u64) {
         Some(handshake::VERSION) => {}
-        Some(v) if v > handshake::VERSION => {
+        Some(v) => {
             let _ = send_json(&mut ws, json!({"t": "denied", "why": "version"})).await;
             let _ = ws.close(None).await;
-            return Err(LinkError::Version);
+            return Err(LinkError::Version(Some(v)));
         }
-        _ => return Err(LinkError::Protocol("bad hello version".into())),
+        None => return Err(LinkError::Protocol("bad hello version".into())),
     }
     let manager_nonce = hello
         .get("nonce")
@@ -255,7 +272,7 @@ async fn connect_inner(a: &Attempt) -> Result<(Ws, Established), LinkError> {
         Some("denied") => {
             let why = answer.get("why").and_then(Value::as_str).unwrap_or("").chars().take(120).collect::<String>();
             let _ = ws.close(None).await;
-            return Err(if why == "version" { LinkError::Version } else { LinkError::Denied(why) });
+            return Err(if why == "version" { LinkError::Version(None) } else { LinkError::Denied(why) });
         }
         _ => return Err(LinkError::Protocol("expected ok or denied".into())),
     }
@@ -277,38 +294,6 @@ async fn connect_inner(a: &Attempt) -> Result<(Ws, Established), LinkError> {
         Mode::Key => None,
     };
     Ok((ws, Established { fp, link_key, local_ip }))
-}
-
-/// Reads the fingerprint of the certificate Manager's address presents:
-/// TCP, the TLS handshake (any certificate, signatures still checked), then
-/// close. No WebSocket upgrade, no `auth`, nothing derived from the web
-/// password: what answers learns only that a Sentry USB looked.
-pub async fn read_fingerprint(host: &str, port: u16) -> Result<String, LinkError> {
-    let inner = async {
-        let tcp = TcpStream::connect((host, port)).await.map_err(io)?;
-        let seen: crate::tls::SeenSlot = Default::default();
-        let cfg = crate::tls::probe_config(seen).map_err(io)?;
-        let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
-            .map_err(|_| io("invalid host name"))?;
-        let mut tls = tokio_rustls::TlsConnector::from(cfg)
-            .connect(server_name, tcp)
-            .await
-            .map_err(|e| LinkError::Io(format!("TLS: {e}")))?;
-        let fp = tls
-            .get_ref()
-            .1
-            .peer_certificates()
-            .and_then(|c| c.first())
-            .map(|c| crate::tls::sha256_hex(c.as_ref()))
-            .ok_or_else(|| io("no server certificate"))?;
-        // close_notify, then drop: nothing else is written.
-        let _ = tokio::io::AsyncWriteExt::shutdown(&mut tls).await;
-        Ok(fp)
-    };
-    match tokio::time::timeout(HANDSHAKE_TIMEOUT, inner).await {
-        Ok(r) => r,
-        Err(_) => Err(LinkError::Timeout),
-    }
 }
 
 /// Saves a fresh pairing: the link key and the fingerprint seen.

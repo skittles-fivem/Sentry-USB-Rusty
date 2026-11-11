@@ -2,12 +2,14 @@
 //!
 //! Manager's certificate is self-signed, so there is no CA to check.
 //! Instead the Pi pins the SHA-256 of the DER certificate:
-//! - Every handshake (pair or key mode) runs with a pin, and any other
+//! - Once paired, every handshake runs with the pin, and any other
 //!   certificate fails the TLS handshake, before a proof is sent.
-//! - Before the first pairing there is no pin yet. The Pi then only reads
-//!   the certificate's fingerprint with `probe_config` (TLS, then close: no
-//!   WebSocket, no proof), shows it, and pins it once the owner confirms it
-//!   matches the one Sentry Manager shows (contract 2).
+//! - A first pairing has no pin yet. It then accepts any certificate
+//!   (`any_cert_config`), only inside the pairing window the owner opens by
+//!   entering Manager's pairing code. The pair proof covers the fingerprint
+//!   seen and is keyed by P (web password and code), so another certificate
+//!   can't complete the handshake; the one that does is then pinned
+//!   (contract 2).
 //!
 //! The handshake signatures are always verified, so the peer really holds
 //! the key of the certificate it presented.
@@ -31,7 +33,7 @@ pub type SeenSlot = Arc<std::sync::Mutex<Option<String>>>;
 
 #[derive(Debug)]
 struct PinVerifier {
-    /// `None` only for `probe_config`, which never carries a proof.
+    /// `None` only for `any_cert_config` (a first pairing).
     pin: Option<String>,
     provider: Arc<CryptoProvider>,
     seen: SeenSlot,
@@ -51,7 +53,7 @@ impl ServerCertVerifier for PinVerifier {
         match &self.pin {
             Some(pin) if ct_eq(&fp, pin) => Ok(ServerCertVerified::assertion()),
             Some(_) => Err(rustls::Error::InvalidCertificate(rustls::CertificateError::ApplicationVerificationFailure)),
-            // Fingerprint read only: the connection is closed right after.
+            // A first pairing: the fingerprint seen goes into the proof.
             None => Ok(ServerCertVerified::assertion()),
         }
     }
@@ -85,10 +87,10 @@ pub fn client_config(pin: &str, seen: SeenSlot) -> anyhow::Result<Arc<rustls::Cl
     config(Some(pin.to_string()), seen)
 }
 
-/// A client config that accepts any certificate, only to read its
-/// fingerprint (`session::read_fingerprint`). Nothing but the TLS handshake
-/// ever runs over it.
-pub fn probe_config(seen: SeenSlot) -> anyhow::Result<Arc<rustls::ClientConfig>> {
+/// A client config that accepts any certificate (signatures still checked),
+/// for a first pairing only: the pair proof is bound to the fingerprint
+/// seen, which `seen` records.
+pub fn any_cert_config(seen: SeenSlot) -> anyhow::Result<Arc<rustls::ClientConfig>> {
     config(None, seen)
 }
 

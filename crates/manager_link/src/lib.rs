@@ -5,16 +5,17 @@
 //! allowlisted part of the Pi's API router. Contract:
 //! `docs/sentry-manager-link.md`.
 //!
-//! Pairing (first connection) is only attempted inside a pairing window the
-//! owner opens on the Pi (turning the link on, or "Pair"), for 15 minutes.
-//! Outside it the Pi only ever connects in key mode, so nothing a network
-//! or a fake Manager does can make it fall back to pairing.
+//! Pairing (first connection) is only attempted inside a 15-minute pairing
+//! window the owner opens on the Pi by entering Manager's address and the
+//! one-time pairing code Manager shows, then pressing Pair
+//! (`start_pairing`). Outside it the Pi only ever connects in key mode, so
+//! nothing a network or a fake Manager does can make it fall back to
+//! pairing.
 //!
-//! Before the first pairing the Pi has no pin. It then only reads the
-//! certificate fingerprint at Manager's address (no proof), shows it, and
-//! pins it once the owner confirms it matches the one Manager shows
-//! (`confirm_pairing`). Only then does it send a pairing proof, and only to
-//! a server with that certificate.
+//! The pair-mode secret is P = HMAC(K, "pair-code|" + code): the code is
+//! held in memory only, for the window's life, and never stored or logged.
+//! A first pairing accepts whatever certificate is served; the proof covers
+//! the fingerprint seen, and the one that pairs is pinned.
 
 pub mod allowlist;
 pub mod audit;
@@ -32,7 +33,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use tokio::sync::{watch, Notify};
 
-use handshake::Secret;
+use handshake::{PairingCode, Secret};
 use session::{LinkError, Mode};
 
 pub use secrets::OFFICIAL_UPDATE_REPO;
@@ -54,6 +55,18 @@ enum Phase {
     Retrying,
 }
 
+/// Why the last pairing stopped without pairing. Cleared by Pair and Unpair.
+#[derive(Debug, Clone, PartialEq)]
+enum PairFailure {
+    /// Manager refused the proof: the code or the web password is wrong
+    /// (one message for both, so neither is revealed).
+    WrongCode,
+    /// The window ran out here, or Manager had no pairing slot open.
+    Expired,
+    /// The other side speaks another link version.
+    Version(String),
+}
+
 #[derive(Debug, Clone, Default)]
 struct Runtime {
     phase: Option<Phase>,
@@ -62,32 +75,23 @@ struct Runtime {
     /// The last refusal was "not paired" (Manager doesn't know our key).
     not_paired: bool,
     cert_mismatch: bool,
-    version_mismatch: bool,
+    /// The version message, when Manager speaks another link version.
+    version_mismatch: Option<String>,
     last_connected: Option<i64>,
     next_retry: Option<Instant>,
-    /// The fingerprint read at Manager's address, waiting for the owner to
-    /// confirm it (first pairing only).
-    candidate: Option<Candidate>,
-    /// The fingerprint the owner confirmed, pinned for pairing. In memory
-    /// only: the link file gets a pin only once pairing succeeds.
-    confirmed: Option<Candidate>,
-    /// Why the fingerprint couldn't be read.
-    check_error: Option<String>,
-    /// A confirmed fingerprint was not the one presented when pairing: the
-    /// fingerprint that was confirmed. Cleared by confirming again.
-    fp_changed: Option<String>,
+    pair_failure: Option<PairFailure>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-struct Candidate {
-    fp: String,
-    /// `host:port` it was read from.
-    address: String,
+/// An open pairing window: when it closes, and the code the owner entered.
+/// Memory only; dropping it wipes the code.
+struct PairWindow {
+    until: Instant,
+    code: PairingCode,
 }
 
 pub struct Link {
     runtime: Mutex<Runtime>,
-    pairing_until: Mutex<Option<Instant>>,
+    pairing: Mutex<Option<PairWindow>>,
     wake: Notify,
     /// Bumped to end the current connection (unpair, settings change).
     stop_tx: watch::Sender<u64>,
@@ -99,7 +103,7 @@ fn link() -> &'static Link {
     static LINK: OnceLock<Link> = OnceLock::new();
     LINK.get_or_init(|| Link {
         runtime: Mutex::new(Runtime::default()),
-        pairing_until: Mutex::new(None),
+        pairing: Mutex::new(None),
         wake: Notify::new(),
         stop_tx: watch::channel(0).0,
         started: OnceLock::new(),
@@ -123,44 +127,61 @@ impl Link {
         f(&mut lock(&self.runtime));
     }
 
+    /// The window is open. One that just ran out is dropped (with its code)
+    /// and reported as expired.
     fn pairing_open(&self) -> bool {
-        let mut until = lock(&self.pairing_until);
-        match *until {
-            Some(t) if Instant::now() < t => true,
-            Some(_) => {
-                *until = None;
-                false
+        let expired = {
+            let mut w = lock(&self.pairing);
+            match &*w {
+                Some(p) if Instant::now() < p.until => return true,
+                Some(_) => {
+                    *w = None;
+                    true
+                }
+                None => false,
             }
-            None => false,
+        };
+        if expired {
+            audit::record("info", "pairing_closed", "Pairing window expired", json!({}));
+            self.set(|r| {
+                r.pair_failure.get_or_insert(PairFailure::Expired);
+            });
         }
+        false
     }
 
     fn pairing_left(&self) -> Option<Duration> {
-        lock(&self.pairing_until).and_then(|t| t.checked_duration_since(Instant::now()))
+        lock(&self.pairing).as_ref().and_then(|p| p.until.checked_duration_since(Instant::now()))
     }
 
-    fn open_pairing(&self) {
-        self.open_pairing_for(PAIRING_WINDOW);
+    /// P for the open window's code, or `None` when no window is open.
+    fn pair_secret(&self, k: &Secret) -> Option<Secret> {
+        lock(&self.pairing).as_ref().map(|p| handshake::derive_pair_secret(k, &p.code))
     }
 
-    fn open_pairing_for(&self, window: Duration) {
+    fn open_pairing_for(&self, window: Duration, code: PairingCode, address: &str) {
         let window = window.min(PAIRING_WINDOW);
-        *lock(&self.pairing_until) = Some(Instant::now() + window);
+        *lock(&self.pairing) = Some(PairWindow { until: Instant::now() + window, code });
         let msg = match window.as_secs() {
             60 => "Pairing window opened for 1 minute".to_string(),
             s if s % 60 == 0 => format!("Pairing window opened for {} minutes", s / 60),
             s => format!("Pairing window opened for {s} seconds"),
         };
-        audit::record("info", "pairing_open", &msg, json!({}));
+        // The code is never logged: only that a window opened, and where to.
+        audit::record("info", "pairing_open", &msg, json!({"address": address}));
         self.set(|r| {
             r.not_paired = false;
             r.last_error = None;
+            r.pair_failure = None;
+            r.version_mismatch = None;
+            r.cert_mismatch = false;
         });
         self.kick(true);
     }
 
+    /// Closes the window and forgets its code.
     fn close_pairing(&self) {
-        *lock(&self.pairing_until) = None;
+        *lock(&self.pairing) = None;
     }
 
     /// Re-reads settings now; with `restart`, also drops the current link.
@@ -298,59 +319,17 @@ async fn run(router: axum::Router) {
         };
 
         let target = format!("{host}:{port}");
-        let pin = stored.pin().map(str::to_string).or_else(|| {
-            lock(&l.runtime).confirmed.as_ref().filter(|c| c.address == target).map(|c| c.fp.clone())
-        });
-        // First pairing: read the fingerprint for the owner to confirm, and
-        // send nothing else until they have.
-        let Some(pin) = pin else {
-            let have = lock(&l.runtime).candidate.as_ref().is_some_and(|c| c.address == target);
-            if have {
-                l.set(|r| {
-                    r.phase = Some(Phase::Idle);
-                    r.next_retry = None;
-                });
-                wait(Duration::from_secs(30)).await;
-                continue;
-            }
-            l.set(|r| r.phase = Some(Phase::Connecting));
-            match session::read_fingerprint(&host, port).await {
-                Ok(fp) => {
-                    audit::record("info", "fingerprint_read", "Read Sentry Manager's fingerprint for you to check",
-                        json!({"address": target, "fingerprint": fp}));
-                    l.set(|r| {
-                        // Back to the fingerprint confirmed before: no change to flag.
-                        if r.fp_changed.as_deref() == Some(fp.as_str()) {
-                            r.fp_changed = None;
-                        }
-                        r.candidate = Some(Candidate { fp, address: target.clone() });
-                        r.check_error = None;
-                        r.phase = Some(Phase::Idle);
-                        r.next_retry = None;
-                    });
-                    backoff = BACKOFF_START;
-                    continue;
-                }
-                Err(e) => {
-                    audit::record("info", "attempt_failed", "Couldn't read Sentry Manager's fingerprint",
-                        json!({"address": target, "mode": "check", "error": e.to_string()}));
-                    let d = jitter(backoff.min(PAIRING_BACKOFF_MAX));
-                    l.set(|r| {
-                        r.check_error = Some(e.to_string());
-                        r.phase = Some(Phase::Retrying);
-                        r.next_retry = Some(Instant::now() + d);
-                    });
-                    wait(d).await;
-                    backoff = (backoff * 2).min(PAIRING_BACKOFF_MAX);
-                    continue;
-                }
-            }
-        };
-
+        // Pair mode keeps a saved pin (pairing again only works with the
+        // same Manager); a first pairing has none and accepts any
+        // certificate, bound into the proof.
+        let pin = stored.pin().map(str::to_string);
         let secret = match mode {
             Mode::Pair => {
                 let pass = active.get("WEB_PASSWORD").cloned().unwrap_or_default();
-                kcache.get(&settings.web_username, &pass).await
+                let k = kcache.get(&settings.web_username, &pass).await;
+                // The window can close while K is derived.
+                let Some(p) = l.pair_secret(&k) else { continue };
+                p
             }
             Mode::Key => stored.link_key().expect("paired"),
         };
@@ -384,7 +363,7 @@ async fn run(router: axum::Router) {
                         continue;
                     }
                     l.close_pairing();
-                    l.set(|r| r.confirmed = None);
+                    l.set(|r| r.pair_failure = None);
                     tracing::info!("[manager-link] paired with Sentry Manager, fingerprint {}", est.fp);
                     audit::record("info", "paired", "Paired with Sentry Manager",
                         json!({"address": target, "fingerprint": est.fp}));
@@ -398,7 +377,7 @@ async fn run(router: axum::Router) {
                     r.last_error = None;
                     r.not_paired = false;
                     r.cert_mismatch = false;
-                    r.version_mismatch = false;
+                    r.version_mismatch = None;
                     r.last_connected = Some(now_unix());
                 });
                 tracing::info!("[manager-link] connected to {}:{}", attempt.host, attempt.port);
@@ -418,10 +397,10 @@ async fn run(router: axum::Router) {
                 match &e {
                     LinkError::CertMismatch(seen) => {
                         audit::record("warn", "fingerprint_mismatch",
-                            if stored.paired() {
+                            if attempt.pin.is_some() {
                                 "Possible fake Sentry Manager: the certificate doesn't match the paired one"
                             } else {
-                                "The certificate doesn't match the fingerprint you confirmed; nothing was sent"
+                                "Possible man in the middle: the certificate isn't the one Sentry Manager named; no proof was sent"
                             },
                             json!({"address": target, "mode": mode_name, "seen": seen, "expected": attempt.pin}));
                         audit::queue_alert("fingerprint", seen, &target);
@@ -435,39 +414,44 @@ async fn run(router: axum::Router) {
                     other => audit::record("info", "attempt_failed", "Connection attempt failed",
                         json!({"address": target, "mode": mode_name, "error": other.to_string()})),
                 }
-                // Not paired yet, and the certificate isn't the one the owner
-                // confirmed: drop that pin and show the one now presented,
-                // flagged, to be checked again. Nothing was sent to it.
-                if let (LinkError::CertMismatch(seen), None) = (&e, stored.pin()) {
-                    let was_confirmed = {
-                        let mut r = lock(&l.runtime);
-                        let hit = r.confirmed.as_ref().is_some_and(|c| c.fp == attempt.pin);
-                        if hit {
-                            r.confirmed = None;
-                        }
-                        hit
-                    };
-                    if was_confirmed {
-                        l.set(|r| {
-                            r.candidate = Some(Candidate { fp: seen.clone(), address: target.clone() });
-                            r.fp_changed = Some(attempt.pin.clone());
-                            r.check_error = None;
-                            r.cert_mismatch = false;
-                            r.last_error = Some(e.to_string());
-                            r.phase = Some(Phase::Idle);
-                            r.next_retry = None;
-                        });
-                        backoff = BACKOFF_START;
-                        continue;
-                    }
+                // A pairing Manager refused: retrying with the same code
+                // would only use up Manager's tries, so the window closes
+                // and the owner is told in plain words.
+                let failure = match (&e, mode) {
+                    (LinkError::Version(_), _) => Some(PairFailure::Version(e.to_string())),
+                    (LinkError::Denied(why), Mode::Pair) => match why.as_str() {
+                        "rate limited" | "timeout" => None,
+                        "no pairing open" | "no slot" | "expired" => Some(PairFailure::Expired),
+                        _ => Some(PairFailure::WrongCode),
+                    },
+                    _ => None,
+                };
+                if let (Some(f), Mode::Pair) = (&failure, mode) {
+                    l.close_pairing();
+                    audit::record("info", "pairing_closed", match f {
+                        PairFailure::WrongCode => "Pairing failed: wrong pairing code or password",
+                        PairFailure::Expired => "Pairing failed: Sentry Manager's pairing window has closed",
+                        PairFailure::Version(_) => "Pairing failed: Sentry Manager uses another link version",
+                    }, json!({"address": target}));
                 }
                 l.set(|r| {
                     r.phase = Some(Phase::Retrying);
                     r.last_error = Some(e.to_string());
                     r.not_paired = matches!(e, LinkError::Denied(_) | LinkError::BadProof(_)) && mode == Mode::Key;
                     r.cert_mismatch = matches!(e, LinkError::CertMismatch(_));
-                    r.version_mismatch = e == LinkError::Version;
+                    r.version_mismatch = matches!(e, LinkError::Version(_)).then(|| e.to_string());
+                    if mode == Mode::Pair && failure.is_some() {
+                        r.pair_failure = failure.clone();
+                    }
                 });
+                if mode == Mode::Pair && failure.is_some() {
+                    l.set(|r| {
+                        r.phase = Some(Phase::Idle);
+                        r.next_retry = None;
+                    });
+                    backoff = BACKOFF_START;
+                    continue;
+                }
             }
         }
         let cap = if mode == Mode::Pair { PAIRING_BACKOFF_MAX } else { BACKOFF_MAX };
@@ -478,76 +462,65 @@ async fn run(router: axum::Router) {
     }
 }
 
-/// The status page's view of the link (`GET /api/manager-link`).
+/// The status page's view of the link (`GET /api/manager-link`). Never
+/// carries the pairing code, K, P or the link key.
 pub fn status_json() -> Value {
     let l = link();
     let active = store::read_config();
     let settings = store::Settings::from_config(&active);
     let stored = store::load().unwrap_or_default();
-    let rt = lock(&l.runtime).clone();
     let pairing = l.pairing_open();
+    let rt = lock(&l.runtime).clone();
     let left = l.pairing_left().map(|d| d.as_secs()).unwrap_or(0);
     let paired = stored.paired();
     let effective = settings.effective_address();
     let next_retry = rt.next_retry.and_then(|t| t.checked_duration_since(Instant::now())).map(|d| d.as_secs());
     let target = effective.as_deref().and_then(|a| store::split_host_port(a).ok()).map(|(h, p)| format!("{h}:{p}"));
-    // Shown only while it is for the address in use and nothing is pinned.
-    let confirmed = rt.confirmed.as_ref().filter(|c| Some(&c.address) == target.as_ref()).map(|c| c.fp.as_str());
-    let pin = stored.pin().or(confirmed);
-    let candidate = rt
-        .candidate
-        .as_ref()
-        .filter(|c| pairing && pin.is_none() && Some(&c.address) == target.as_ref());
-    let needs_check = settings.enabled && pairing && pin.is_none() && settings.web_password_set;
+    let pin = stored.pin();
+    let retry_in = match next_retry {
+        Some(s) => format!("Trying again in {s} s."),
+        None => "Trying again shortly.".into(),
+    };
 
-    let pairing_msg = format!(
-        "Waiting for Sentry Manager ({} min left). In Manager, open Settings → Sentry USB → Add a Sentry USB, \
-         and enter this Sentry USB's web username and password.",
-        left.div_ceil(60).max(1)
-    );
     let (state, message): (&str, String) = if !settings.enabled {
         ("off", "Off. Turn this on to let Sentry Manager on your NAS see and manage this Sentry USB.".into())
-    } else if effective.is_none() {
-        ("needs_address", "Enter Sentry Manager's address: the computer it runs on, with port 10000 (for example 192.168.1.5:10000).".into())
     } else if !paired && !settings.web_password_set {
         ("needs_password", "Set a web password first. Sentry Manager pairs using this Sentry USB's web username and password.".into())
-    } else if rt.version_mismatch {
-        ("update_needed", "Sentry Manager is newer than this Sentry USB. Update Sentry USB to connect.".into())
-    } else if rt.cert_mismatch {
-        ("cert_changed", "Sentry Manager's certificate changed, so this Sentry USB won't connect. If you reinstalled or replaced Manager, press Unpair, then pair again. If not, someone may be pretending to be Manager.".into())
-    } else if needs_check && candidate.is_some() {
-        ("confirm_fingerprint", if rt.fp_changed.is_some() {
-            "The fingerprint changed after you confirmed it, so nothing was sent. This is the one presented now. \
-             Check it matches the fingerprint on Sentry Manager's Sentry USB page. If you didn't just reinstall \
-             Sentry Manager, don't pair: something else may be answering at its address.".into()
-        } else {
-            "Check this matches the fingerprint on Sentry Manager's Sentry USB page.".into()
-        })
-    } else if needs_check && rt.check_error.is_some() {
-        ("check_failed", format!(
-            "Can't read Sentry Manager's fingerprint at {} yet: {}. If you haven't yet, add this Sentry USB in \
-             Sentry Manager (Settings → Sentry USB → Add a Sentry USB); its fingerprint then shows here. {}",
-            target.as_deref().unwrap_or("its address"),
-            rt.check_error.as_deref().unwrap_or(""),
-            match next_retry { Some(s) => format!("Trying again in {s} s."), None => "Trying again shortly.".into() },
-        ))
-    } else if needs_check {
-        ("checking", "Reading Sentry Manager's fingerprint…".into())
     } else if pairing && rt.phase != Some(Phase::Connected) {
-        ("pairing", pairing_msg)
+        let head = format!(
+            "Pairing with Sentry Manager at {} ({} min left)…",
+            target.as_deref().unwrap_or("its address"),
+            left.div_ceil(60).max(1)
+        );
+        ("pairing", match (&rt.last_error, rt.phase.as_ref()) {
+            (Some(e), Some(Phase::Retrying)) => format!("{head} Can't reach it yet: {e}. Check the address. {retry_in}"),
+            _ => head,
+        })
+    } else if let (false, Some(f)) = (paired, &rt.pair_failure) {
+        ("pair_failed", match f {
+            PairFailure::WrongCode => "Wrong pairing code or password. Check the web username and password you \
+                entered in Sentry Manager, press Start pairing there for a new code, then enter it here and press Pair.".into(),
+            PairFailure::Expired => "Pairing window expired. Press Start pairing in Sentry Manager for a new code, \
+                then enter it here and press Pair.".into(),
+            PairFailure::Version(m) => format!("{m}."),
+        })
+    } else if let Some(m) = &rt.version_mismatch {
+        ("update_needed", format!("{m}."))
+    } else if rt.cert_mismatch && paired {
+        ("cert_changed", "Sentry Manager's certificate changed, so this Sentry USB won't connect. If you reinstalled or replaced Manager, press Unpair, then pair again. If not, someone may be pretending to be Manager.".into())
     } else if !paired {
-        ("pairing_expired", "Not paired. Press Pair, then add this Sentry USB in Sentry Manager within 15 minutes.".into())
+        ("needs_pairing", "Not paired. In Sentry Manager, open Settings → Sentry USB → Add a Sentry USB and press \
+            Start pairing. Then enter Sentry Manager's address and the pairing code it shows, and press Pair.".into())
+    } else if effective.is_none() {
+        ("needs_address", "Enter Sentry Manager's address: the computer it runs on, with port 10000 (for example 192.168.1.5:10000).".into())
     } else if rt.phase == Some(Phase::Connected) {
         ("connected", "Connected to Sentry Manager.".into())
     } else if rt.not_paired {
-        ("not_paired", "Sentry Manager doesn't recognize this Sentry USB any more (it may have been removed there). Press Pair, then add it again in Manager. Retrying automatically.".into())
+        ("not_paired", "Sentry Manager doesn't recognize this Sentry USB any more (it may have been removed there). To pair again, press Start pairing in Sentry Manager, then enter the new code here and press Pair. Retrying automatically.".into())
     } else if rt.phase == Some(Phase::Connecting) || rt.phase.is_none() {
         ("connecting", "Connecting to Sentry Manager…".into())
     } else {
-        ("retrying", match next_retry {
-            Some(s) => format!("Can't reach Sentry Manager right now. This is normal while the car is away from home. Trying again in {s} s."),
-            None => "Can't reach Sentry Manager right now. This is normal while the car is away from home. Trying again shortly.".into(),
-        })
+        ("retrying", format!("Can't reach Sentry Manager right now. This is normal while the car is away from home. {retry_in}"))
     };
 
     json!({
@@ -558,23 +531,9 @@ pub fn status_json() -> Value {
         "paired": paired,
         "pairing": pairing,
         "pairing_seconds_left": if pairing { left } else { 0 },
-        // The paired fingerprint, or the one confirmed for pairing.
+        // The pinned fingerprint, for reference: nothing has to be compared.
         "fingerprint": pin,
         "fingerprint_display": pin.map(store::fingerprint_display),
-        "fingerprint_confirmed": stored.pin().is_none() && confirmed.is_some(),
-        // The fingerprint to confirm before the first pairing: first and
-        // last groups apart, so the page can show them large.
-        "check": candidate.map(|c| {
-            let d = store::fingerprint_display(&c.fp);
-            let groups: Vec<&str> = d.split(' ').collect();
-            json!({
-                "fingerprint": c.fp, "display": d, "address": c.address,
-                "first": groups.first(), "middle": groups[1..groups.len().saturating_sub(1)].join(" "),
-                "last": groups.last(),
-            })
-        }),
-        "check_error": if needs_check { rt.check_error.clone() } else { None },
-        "fingerprint_changed": needs_check && rt.fp_changed.is_some(),
         "device_id": stored.device_id,
         "state": state,
         "message": message,
@@ -585,38 +544,35 @@ pub fn status_json() -> Value {
     })
 }
 
-/// Saves on/off and the address. Turning the link on while unpaired opens
-/// a pairing window.
-pub fn save_settings(enabled: bool, address: &str) -> Result<(), String> {
-    let address = if address.trim().is_empty() { String::new() } else { store::normalize_address(address)? };
+/// Writes on/off and the address to sentryusb.conf. Returns whether the
+/// link was on before, and the address before.
+fn write_settings(enabled: bool, address: &str) -> Result<(bool, String), String> {
     let path = sentryusb_config::find_config_path();
     let (mut active, _) = sentryusb_config::parse_file(path).map_err(|_| "Could not read the settings".to_string())?;
     let was_enabled = store::Settings::from_config(&active).enabled;
     let old_address = active.get(store::ADDRESS_KEY).cloned().unwrap_or_default();
+    if was_enabled == enabled && old_address == address {
+        return Ok((was_enabled, old_address));
+    }
     active.insert(store::ENABLED_KEY.into(), if enabled { "true" } else { "false" }.into());
     if address.is_empty() {
         active.remove(store::ADDRESS_KEY);
     } else {
-        active.insert(store::ADDRESS_KEY.into(), address.clone());
+        active.insert(store::ADDRESS_KEY.into(), address.into());
     }
     if std::env::var_os("SENTRYUSB_MANAGER_LINK_FILE").is_none() {
         let _ = std::process::Command::new("/root/bin/remountfs_rw").status();
     }
     sentryusb_config::write_file(path, &active).map_err(|_| "Could not save the settings".to_string())?;
+    Ok((was_enabled, old_address))
+}
+
+/// Saves on/off and the address. Pairing only starts with Pair
+/// (`start_pairing`); turning the link off closes a pairing window.
+pub fn save_settings(enabled: bool, address: &str) -> Result<(), String> {
+    let address = if address.trim().is_empty() { String::new() } else { store::normalize_address(address)? };
+    let (was_enabled, old_address) = write_settings(enabled, &address)?;
     let l = link();
-    let paired = store::load().map(|s| s.paired()).unwrap_or(false);
-    if old_address != address && !paired {
-        // A confirmed fingerprint belongs to the old address.
-        l.set(|r| {
-            r.confirmed = None;
-            r.candidate = None;
-            r.check_error = None;
-            r.fp_changed = None;
-        });
-    }
-    if enabled && !was_enabled && !paired {
-        l.open_pairing();
-    }
     if !enabled {
         l.close_pairing();
     }
@@ -624,16 +580,18 @@ pub fn save_settings(enabled: bool, address: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Opens (or re-opens) the 15-minute pairing window. A pin already saved
-/// stays in force, so re-pairing only works with the same Manager.
-pub fn start_pairing() -> Result<(), String> {
-    start_pairing_for(PAIRING_WINDOW)
+/// Pair: saves Manager's address (when given) and opens the 15-minute
+/// pairing window with the code Manager shows. The code stays in memory
+/// only, until the window closes. A pin already saved stays in force, so
+/// pairing again only works with the same Manager.
+pub fn start_pairing(address: &str, code: &str) -> Result<(), String> {
+    start_pairing_for(address, code, PAIRING_WINDOW)
 }
 
 /// `start_pairing` with a shorter window (capped at 15 minutes). For the
 /// off-Pi test harness (`examples/link_harness.rs`); the Pi's own routes
 /// always use the full window.
-pub fn start_pairing_for(window: Duration) -> Result<(), String> {
+pub fn start_pairing_for(address: &str, code: &str, window: Duration) -> Result<(), String> {
     let settings = store::Settings::from_config(&store::read_config());
     if !settings.web_password_set {
         return Err("Set a web username and password first".into());
@@ -641,79 +599,15 @@ pub fn start_pairing_for(window: Duration) -> Result<(), String> {
     if !settings.enabled {
         return Err("Turn on \"Managed by Sentry Manager\" first".into());
     }
-    let l = link();
-    // Not paired and nothing confirmed: read the fingerprint afresh.
-    if store::load().map(|s| s.pin().is_none()).unwrap_or(true) {
-        l.set(|r| {
-            if r.confirmed.is_none() {
-                r.candidate = None;
-                r.check_error = None;
-            }
-        });
-    }
-    l.open_pairing_for(window);
-    Ok(())
-}
-
-/// Hex fingerprint from what a person or page sent: case, spaces and
-/// colons don't matter.
-fn parse_fingerprint(input: &str) -> Option<String> {
-    let fp: String = input.chars().filter(|c| !matches!(c, ' ' | ':')).collect::<String>().to_ascii_lowercase();
-    handshake::is_hex64(&fp).then_some(fp)
-}
-
-/// The owner checked the fingerprint shown against Sentry Manager's and
-/// pressed "It matches, pair": pins it, and the pairing handshake starts.
-/// `fingerprint` is the one the page showed, so a fingerprint that changed
-/// after the page loaded is refused instead of pinned unseen.
-pub fn confirm_pairing(fingerprint: &str) -> Result<(), String> {
-    let fp = parse_fingerprint(fingerprint).ok_or_else(|| "That isn't a fingerprint".to_string())?;
-    let l = link();
-    if !l.pairing_open() {
-        return Err("The pairing window has closed. Press Pair to start again.".into());
-    }
-    let s = store::load().map_err(|_| "Could not read the link file".to_string())?;
-    if let Some(pin) = s.pin() {
-        return if handshake::ct_eq(pin, &fp) {
-            Ok(())
-        } else {
-            Err("A different fingerprint is already confirmed. Press Unpair to start over.".into())
-        };
-    }
-    let target = store::Settings::from_config(&store::read_config())
-        .effective_address()
-        .and_then(|a| store::split_host_port(&a).ok())
-        .map(|(h, p)| format!("{h}:{p}"));
-    let (candidate, confirmed) = {
-        let r = lock(&l.runtime);
-        (r.candidate.clone(), r.confirmed.clone())
+    let address = match address.trim() {
+        "" => settings.effective_address().ok_or_else(|| {
+            "Enter Sentry Manager's address: the computer it runs on, with port 10000 (for example 192.168.1.5:10000)".to_string()
+        })?,
+        a => store::normalize_address(a)?,
     };
-    if let Some(c) = confirmed.filter(|c| Some(&c.address) == target.as_ref()) {
-        return if handshake::ct_eq(&c.fp, &fp) {
-            Ok(())
-        } else {
-            Err("A different fingerprint is already confirmed. Press Unpair to start over.".into())
-        };
-    }
-    let candidate = candidate.filter(|c| Some(&c.address) == target.as_ref());
-    match candidate {
-        None => return Err("Sentry Manager's fingerprint hasn't been read yet. Wait a moment and try again.".into()),
-        Some(c) if !handshake::ct_eq(&c.fp, &fp) => {
-            return Err("The fingerprint changed since this page showed it. Check the new one before pairing.".into())
-        }
-        Some(_) => {}
-    }
-    let address = target.clone().unwrap_or_default();
-    l.set(|r| {
-        r.confirmed = Some(Candidate { fp: fp.clone(), address });
-        r.candidate = None;
-        r.check_error = None;
-        r.fp_changed = None;
-        r.last_error = None;
-    });
-    audit::record("info", "fingerprint_confirmed", "You confirmed Sentry Manager's fingerprint; pairing with it",
-        json!({"address": target, "fingerprint": fp}));
-    l.kick(false);
+    let code = PairingCode::parse(code).map_err(str::to_string)?;
+    write_settings(true, &address)?;
+    link().open_pairing_for(window, code, &address);
     Ok(())
 }
 
@@ -732,10 +626,8 @@ pub fn unpair() -> Result<(), String> {
         r.cert_mismatch = false;
         r.last_error = None;
         r.phase = Some(Phase::Idle);
-        r.confirmed = None;
-        r.candidate = None;
-        r.check_error = None;
-        r.fp_changed = None;
+        r.pair_failure = None;
+        r.version_mismatch = None;
     });
     l.kick(true);
     tracing::info!("[manager-link] unpaired on the Sentry USB");

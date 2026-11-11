@@ -8,6 +8,8 @@
 #
 # Environment:
 #   E2E_PASSWORD        the "Pi" web password you also type into Manager (required unless --self-test)
+#   E2E_CODE            the pairing code Manager shows after Start pairing, e.g. K7QP-M2XD-9WRT
+#                       (asked for when not set; --self-test uses K7QP-M2XD-9WRT). Never logged.
 #   E2E_USER            the web username (default admin)
 #   E2E_STATE_DIR       where the fake Pi keeps its files (default: a new temp dir)
 #   MANAGER_API         Manager's admin URL, e.g. https://nas.local:9000. With it, step 5
@@ -18,10 +20,12 @@
 #   E2E_YES=1           don't wait for Enter at the Manager-side steps
 #
 # What it does, in order (each step says what to do in Manager first):
-#   1. pairing with a wrong password: Manager says "denied", nothing is saved
-#   2. pairing with the right password: the fingerprint is read with no proof
-#      sent, confirmed (the harness presses "It matches, pair"), then the link
-#      key and that fingerprint are saved (0600)
+#   1. pairing with a wrong password, then with a wrong code: Manager says
+#      "denied", the Pi stops at once with one message for both, nothing is saved
+#      (two of Manager's five tries per slot)
+#   2. pairing with the right password and code: no fingerprint step, the link
+#      key and the fingerprint seen are saved (0600), and the code is nowhere
+#      in the Pi's files or events
 #   3. status push: right after connecting, then every 30 s
 #   4. key-mode reconnect: off/on, and a fresh process on the same files
 #   5. every allowlisted route through Manager's proxy (MANAGER_API), and a refused one
@@ -40,11 +44,12 @@ if [[ "${1:-}" == "--self-test" ]]; then
     port="${E2E_FAKE_PORT:-18443}"
     manager="127.0.0.1:$port"
     E2E_PASSWORD="${E2E_PASSWORD:-correct horse battery staple}"
+    E2E_CODE="${E2E_CODE:-K7QP-M2XD-9WRT}"
     E2E_YES=1
 elif [[ $# -eq 1 ]]; then
     manager="$1"
 else
-    sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'
     exit 2
 fi
 user="${E2E_USER:-admin}"
@@ -52,6 +57,22 @@ user="${E2E_USER:-admin}"
 export E2E_PASSWORD
 E2E_WRONG_PASSWORD="wrong-${RANDOM}${RANDOM}"
 export E2E_WRONG_PASSWORD
+# normalize_code CODE: as both sides do (uppercase, no spaces or dashes, O->0, I/L->1).
+normalize_code() { printf '%s' "$1" | tr a-z A-Z | tr -d ' -' | tr OIL 011; }
+set_code() { # set_code CODE: the right code and a wrong one (its last character changed)
+    E2E_CODE="$1"
+    local n
+    n=$(normalize_code "$E2E_CODE")
+    [[ "$n" =~ ^[0-9A-HJKMNP-TV-Z]{12}$ ]] || { echo "that isn't a valid pairing code" >&2; exit 2; }
+    E2E_CODE_NORM="$n"
+    if [[ "${n:11:1}" == 0 ]]; then E2E_WRONG_CODE="${n:0:11}1"; else E2E_WRONG_CODE="${n:0:11}0"; fi
+    export E2E_CODE E2E_WRONG_CODE
+}
+if [[ -z "${E2E_CODE:-}" ]]; then
+    echo "In Manager: Settings -> Sentry USB -> Add a Sentry USB, username '$user' and the RIGHT password (E2E_PASSWORD), then Start pairing."
+    read -r -p "Pairing code Manager shows: " E2E_CODE </dev/tty
+fi
+set_code "$E2E_CODE"
 
 need() { command -v "$1" >/dev/null || { echo "needs $1" >&2; exit 2; }; }
 need cargo; need jq; need curl
@@ -118,12 +139,12 @@ wait_push() { # wait_push MARK SECONDS
 }
 
 harness_pid=""
-start_harness() { # start_harness PASSWORD-VAR PAIR-WINDOW [extra args]
-    local pw="$1" win="$2"
-    shift 2
+start_harness() { # start_harness PASSWORD-VAR CODE-VAR PAIR-WINDOW [extra args]
+    local pw="$1" code="$2" win="$3"
+    shift 3
     stop_harness
     exec 9<>"$fifo"
-    "$bin/link_harness" --manager "$manager" --user "$user" --password-env "$pw" \
+    "$bin/link_harness" --manager "$manager" --user "$user" --password-env "$pw" --code-env "$code" \
         --pair-window "$win" --state-dir "$state/pi" "$@" <&9 >>"$events" 2>>"$state/harness.stderr" &
     harness_pid=$!
     pids+=("$harness_pid")
@@ -139,46 +160,60 @@ stop_harness() {
 cmd() { echo "$*" >&9; }
 
 if ((self_test)); then
-    "$bin/fake_manager" --port "$port" --user "$user" --password "$E2E_PASSWORD" >"$state/manager.jsonl" 2>&1 &
+    "$bin/fake_manager" --port "$port" --user "$user" --password "$E2E_PASSWORD" --code "$E2E_CODE" >"$state/manager.jsonl" 2>&1 &
     pids+=("$!")
     sleep 1
 fi
 echo "state: $state  (events: $events)"
 
 # -------------------------------------------------------------------------
-step "1. pairing with the wrong password"
-ask "In Manager: Settings -> Sentry USB -> Add a Sentry USB, username '$user' and the RIGHT password (E2E_PASSWORD)."
-m=$(mark)
-start_harness E2E_WRONG_PASSWORD 60
-if wait_ev "$m" 40 '.event=="attempt_failed" and .mode=="pair"'; then ok "Manager refused the wrong password"; else bad "no refused pairing attempt"; fi
-if no_ev "$m" 1 '.event=="paired"'; then ok "not paired"; else bad "paired with the wrong password"; fi
-stop_harness
-if [[ ! -s "$state/pi/manager-link.json" ]] || jq -e '.link_key == null and .pin == null' "$state/pi/manager-link.json" >/dev/null; then
-    ok "nothing saved"
-else
-    bad "a key or pin was saved"
-fi
-echo "  (Manager's security log should show the failed pairing proofs; at most 10 a minute are allowed)"
+step "1. pairing with a wrong password, then a wrong code"
+ask "In Manager: a pairing slot must be open for username '$user' and the RIGHT password (E2E_PASSWORD), showing the code you gave."
+nothing_saved() {
+    if [[ ! -s "$state/pi/manager-link.json" ]] || jq -e '.link_key == null and .pin == null' "$state/pi/manager-link.json" >/dev/null; then
+        ok "nothing saved"
+    else
+        bad "a key or pin was saved"
+    fi
+}
+msgs=()
+for wrong in "E2E_WRONG_PASSWORD E2E_CODE" "E2E_PASSWORD E2E_WRONG_CODE"; do
+    read -r pw_var code_var <<<"$wrong"
+    m=$(mark)
+    start_harness "$pw_var" "$code_var" 60
+    if wait_ev "$m" 40 '.event=="attempt_failed" and .mode=="pair"'; then ok "Manager refused ($pw_var, $code_var)"; else bad "no refused pairing attempt ($pw_var, $code_var)"; fi
+    if wait_ev "$m" 10 '.event=="state" and .state=="pair_failed"'; then ok "the Pi stopped pairing"; else bad "no pair_failed state"; fi
+    msgs+=("$(since "$m" | jq -r 'select(.event=="state" and .state=="pair_failed") | .message' | head -1)")
+    n=$(since "$m" | jq -s '[.[] | select(.event=="attempt_failed" and .mode=="pair")] | length')
+    sleep 3
+    n2=$(since "$m" | jq -s '[.[] | select(.event=="attempt_failed" and .mode=="pair")] | length')
+    ((n == 1 && n2 == 1)) && ok "one try, no retries" || bad "$n2 pairing tries"
+    if no_ev "$m" 1 '.event=="paired"'; then ok "not paired"; else bad "paired with a wrong password or code"; fi
+    stop_harness
+    nothing_saved
+done
+[[ "${msgs[0]}" == "${msgs[1]}" && "${msgs[0]}" == "Wrong pairing code or password"* ]] && ok "the same message for both: ${msgs[0]%%.*}" || bad "messages differ: ${msgs[*]}"
+echo "  (Manager's security log should show two failed pairing proofs; its slot allows five)"
 
 # -------------------------------------------------------------------------
-step "2. pairing with the right password"
-ask "Manager's pairing slot must still be open (re-add the Sentry USB if it closed)."
+step "2. pairing with the right password and code"
+ask "Manager's pairing slot must still be open (if it closed, start again: a new slot has a new code)."
 m=$(mark)
-start_harness E2E_PASSWORD 300
+start_harness E2E_PASSWORD E2E_CODE 300
 if wait_ev "$m" 60 '.event=="paired"'; then ok "paired"; else bad "not paired"; fi
-order=$(since "$m" | jq -r 'select(.event=="fingerprint_read" or .event=="fingerprint_confirmed" or (.event=="connected" and .mode=="pair")) | .event' | awk '!s[$0]++' | paste -sd, -)
-[[ "$order" == fingerprint_read,fingerprint_confirmed,connected ]] && ok "fingerprint read, then confirmed, then the pair handshake" || bad "pairing order: $order"
-first=$(since "$m" | jq -r 'select(.src=="pi" and (.mode=="pair" or .event=="fingerprint_confirmed")) | .event' | head -1)
-[[ "$first" == fingerprint_confirmed ]] && ok "no pair-mode attempt before the confirm" || bad "pair-mode $first before the confirm"
+order=$(since "$m" | jq -r 'select(.event=="pairing_open" or (.event=="connected" and .mode=="pair") or .event=="paired") | .event' | awk '!s[$0]++' | paste -sd, -)
+[[ "$order" == pairing_open,paired,connected ]] && ok "Pair opened the window, then paired and connected" || bad "pairing order: $order"
+since "$m" | jq -e 'select(.event=="fingerprint_read" or .event=="fingerprint_confirmed")' >/dev/null && bad "a fingerprint step ran" || ok "no fingerprint step"
 if wait_ev "$m" 10 '.event=="connected" and .mode=="pair"'; then ok "connected in pair mode"; else bad "no pair-mode connection"; fi
 id=$(jq -r 'select(.event=="ready") | .device_id' "$events" | tail -1)
 fp=$(jq -r '.pin' "$state/pi/manager-link.json")
 mode=$(stat -c %a "$state/pi/manager-link.json")
 [[ "$mode" == 600 ]] && ok "link file is 0600" || bad "link file mode $mode"
 jq -e '.link_key | test("^[0-9a-f]{64}$")' "$state/pi/manager-link.json" >/dev/null && ok "link key saved" || bad "no link key"
+if grep -rqiF -e "$E2E_CODE" -e "$E2E_CODE_NORM" "$state" --exclude=manager.jsonl; then bad "the pairing code is in the Pi's files or events"; else ok "the pairing code is nowhere in the Pi's files or events"; fi
 echo "  Pi id $id"
-echo "  Pinned fingerprint: $(echo "$fp" | tr a-f A-F | sed 's/..../& /g')"
-ask "Compare that fingerprint with the one Manager shows for its device port, and check the Sentry USB is listed as paired and online."
+echo "  Pinned fingerprint (for reference): $(echo "$fp" | tr a-f A-F | sed 's/..../& /g')"
+ask "Check the Sentry USB is listed as paired and online in Manager."
 
 # -------------------------------------------------------------------------
 step "3. status push"
@@ -193,11 +228,11 @@ m=$(mark)
 cmd reconnect
 if wait_ev "$m" 30 '.event=="connected" and .mode=="key"'; then ok "reconnected in key mode (off/on)"; else bad "no key-mode reconnect"; fi
 m=$(mark)
-start_harness E2E_WRONG_PASSWORD 0
+start_harness E2E_WRONG_PASSWORD E2E_WRONG_CODE 0
 if wait_ev "$m" 30 '.event=="connected" and .mode=="key"'; then ok "new process, same files, wrong web password: key mode still connects"; else bad "restart did not connect in key mode"; fi
 if no_ev "$m" 1 '.event=="pairing_open"'; then ok "no pairing window opened"; else bad "pairing window opened"; fi
 m=$(mark)
-start_harness E2E_PASSWORD 0
+start_harness E2E_PASSWORD E2E_CODE 0
 wait_ev "$m" 30 '.event=="connected" and .mode=="key"' || bad "restart with the right password did not connect"
 
 # -------------------------------------------------------------------------
@@ -269,11 +304,16 @@ if wait_ev "$m" 10 '.event=="unpaired"'; then ok "unpaired on the Pi"; else bad 
 jq -e '.link_key == null and .pin == null' "$state/pi/manager-link.json" >/dev/null && ok "key and pin forgotten" || bad "key or pin still saved"
 if no_ev "$m" 20 '.event=="connected"'; then ok "no reconnect without a pairing window"; else bad "reconnected after unpair"; fi
 if ((self_test)); then
+    m=$(mark)
+    cmd "pair $E2E_CODE 300"
+    if wait_ev "$m" 60 '.event=="paired"'; then ok "paired again with a code typed on stdin"; else bad "did not pair again"; fi
     echo "  (fake_manager has no admin API: Manager-side unpair not checked)"
 else
-    ask "In Manager the Sentry USB should now fail its next handshake as 'not paired'. Delete it there, then Add a Sentry USB again with the right password."
+    ask "In Manager the Sentry USB should now fail its next handshake as 'not paired'. Delete it there, then Add a Sentry USB again with the right password and Start pairing."
+    read -r -p "     New pairing code Manager shows: " code2 </dev/tty
+    set_code "$code2"
     m=$(mark)
-    cmd pair 300
+    cmd "pair $E2E_CODE 300"
     if wait_ev "$m" 60 '.event=="paired"'; then ok "paired again"; else bad "did not pair again"; fi
     ask "Now Unpair (delete) the Sentry USB in Manager."
     m=$(mark)
@@ -281,6 +321,7 @@ else
     if wait_ev "$m" 60 '.event=="state" and .state=="not_paired"'; then ok "Pi shows not_paired (key-mode handshake denied)"; else bad "Pi does not show not_paired"; fi
 fi
 
+if grep -rqiF -e "$E2E_CODE" -e "$E2E_CODE_NORM" "$state" --exclude=manager.jsonl; then bad "a pairing code is in the Pi's files or events"; else ok "no pairing code in the Pi's files or events"; fi
 cmd quit || true
 echo
 echo "== $pass passed, $fail failed  (events: $events)"
