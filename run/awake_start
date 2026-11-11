@@ -1,5 +1,51 @@
 #!/bin/bash -eu
 
+# Keep-awake webhook: resolve its host once and pin curl to that address
+# (--resolve), refusing an address that is this Pi itself (loopback,
+# unspecified, link-local). The Pi's own API trusts loopback without a login,
+# so a webhook host name that resolves to 127.0.0.1 must never be called.
+# Prints "host:port:address" for --resolve, or nothing for an IP literal;
+# fails for an unusable URL or a refused address.
+function keep_awake_webhook_pin () {
+  local url="$1" scheme rest hostport host port addr
+  scheme="${url%%://*}"
+  scheme="${scheme,,}"
+  case "$scheme" in
+    http) port=80 ;;
+    https) port=443 ;;
+    *) return 1 ;;
+  esac
+  rest="${url#*://}"
+  hostport="${rest%%[/?#]*}"
+  case "$hostport" in *@*) return 1 ;; esac
+  if [[ "$hostport" == \[* ]]; then
+    host="${hostport#[}"; host="${host%%]*}"
+    [[ "$hostport" == *"]:"* ]] && port="${hostport##*]:}"
+  else
+    host="${hostport%%:*}"
+    [[ "$hostport" == *:* ]] && port="${hostport##*:}"
+  fi
+  [[ -n "$host" && "$port" =~ ^[0-9]{1,5}$ ]] || return 1
+  host="${host,,}"
+  if [[ "$host" =~ ^[0-9.]+$ || "$host" == *:* ]]; then
+    addr="$host"
+  else
+    addr=$(getent ahosts "$host" 2>/dev/null | awk 'NR==1 {print $1}')
+    [[ -n "$addr" ]] || return 1
+  fi
+  addr="${addr,,}"
+  case "$addr" in
+    127.*|0.*|169.254.*|::|::1|0:0:0:0:0:0:0:1|fe8*|fe9*|fea*|feb*|::ffff:127.*|::ffff:0.*|::ffff:169.254.*) return 1 ;;
+  esac
+  # a numeric host that is not a plain dotted quad (decimal or hex forms) is refused
+  if [[ "$host" =~ ^[0-9.]+$ && ! "$host" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then return 1; fi
+  if [[ "$host" != "$addr" ]]; then
+    if [[ "$addr" == *:* ]]; then echo "$host:$port:[$addr]"; else echo "$host:$port:$addr"; fi
+  fi
+  return 0
+}
+
+
 if [[ ( -z "${TESLAFI_API_TOKEN:+x}" ) && ( -z "${TESSIE_API_TOKEN:+x}" ) && ( -z "${TESLA_BLE_VIN:+x}" ) && ( -z "${KEEP_AWAKE_WEBHOOK_URL:+x}" ) ]]
 then
   log "Not configured to keep car awake."
@@ -360,10 +406,17 @@ else
       elif [[ -n "${KEEP_AWAKE_WEBHOOK_URL:+x}" ]]
       # Use webhook to send nudge message
       then
-        http_response=$(curl -s --connect-timeout 10 --max-time 30 -w "%{http_code}" POST \
+        if webhook_pin=$(keep_awake_webhook_pin "$KEEP_AWAKE_WEBHOOK_URL"); then
+          webhook_resolve=()
+          [[ -n "$webhook_pin" ]] && webhook_resolve=(--resolve "$webhook_pin")
+          http_response=$(curl -s --connect-timeout 10 --max-time 30 -w "%{http_code}" "${webhook_resolve[@]}" POST \
           -d "{\"awake_command\":\"nudge\"}" \
           -H "Content-Type: application/json" \
-          "$KEEP_AWAKE_WEBHOOK_URL")
+          "$KEEP_AWAKE_WEBHOOK_URL") || http_response=000
+        else
+          log "Awake Webhook: refused KEEP_AWAKE_WEBHOOK_URL: it must be http(s) and must not point at this Sentry USB itself."
+          http_response=000
+        fi
 
         # Extract HTTP status code
         http_status="${http_response: -3}"
@@ -555,10 +608,17 @@ else
       elif [[ -n "${KEEP_AWAKE_WEBHOOK_URL:+x}" ]]
       # Use webhook to send start command
       then
-        http_response=$(curl -s --connect-timeout 10 --max-time 30 -w "%{http_code}" POST \
+        if webhook_pin=$(keep_awake_webhook_pin "$KEEP_AWAKE_WEBHOOK_URL"); then
+          webhook_resolve=()
+          [[ -n "$webhook_pin" ]] && webhook_resolve=(--resolve "$webhook_pin")
+          http_response=$(curl -s --connect-timeout 10 --max-time 30 -w "%{http_code}" "${webhook_resolve[@]}" POST \
           -d "{\"awake_command\":\"start\"}" \
           -H "Content-Type: application/json" \
-          "$KEEP_AWAKE_WEBHOOK_URL")
+          "$KEEP_AWAKE_WEBHOOK_URL") || http_response=000
+        else
+          log "Awake Webhook: refused KEEP_AWAKE_WEBHOOK_URL: it must be http(s) and must not point at this Sentry USB itself."
+          http_response=000
+        fi
 
         log "Awake Webhook: Command sent \"start\""
 
