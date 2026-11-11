@@ -12,6 +12,8 @@ fn err(status: StatusCode, msg: String) -> Response {
     (status, Json(json!({"error": msg}))).into_response()
 }
 
+// An axum handler helper: the error is the Response the handler returns as is.
+#[allow(clippy::result_large_err)]
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, Response> {
     tokio::task::spawn_blocking(f)
         .await
