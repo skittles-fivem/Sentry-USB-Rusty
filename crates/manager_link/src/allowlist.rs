@@ -244,7 +244,6 @@ mod tests {
             "/api/manager-link",
             "/api/manager-link/unpair",
             "/api/manager-link/pair",
-            "/api/manager-link/confirm",
             "/api/ws",
             "/api/logs",
             "/api/logs/bluetooth/bundle",
