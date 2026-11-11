@@ -1,5 +1,9 @@
 //! One connection to Manager: TCP, TLS with the pin, WebSocket upgrade, the
 //! mutual handshake (contract 3), then the request loop (contract 4).
+//!
+//! Before the first pairing, `read_fingerprint` only reads Manager's
+//! certificate fingerprint for the owner to confirm; a handshake always
+//! needs a pin, so no proof ever goes to a certificate nobody confirmed.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,8 +56,10 @@ pub struct Attempt {
     pub mode: Mode,
     /// K in pair mode, the link key in key mode.
     pub secret: Secret,
-    /// The saved fingerprint; `None` only when pairing for the first time.
-    pub pin: Option<String>,
+    /// The pinned fingerprint: saved at pairing, or confirmed by the owner
+    /// before the first pairing. Always required: any other certificate
+    /// fails TLS before a proof is sent.
+    pub pin: String,
     pub device_id: String,
     pub name: String,
     pub version: String,
@@ -153,8 +159,11 @@ async fn connect_inner(a: &Attempt) -> Result<(Ws, Established), LinkError> {
     let tcp = TcpStream::connect((a.host.as_str(), a.port)).await.map_err(io)?;
     let _ = tcp.set_nodelay(true);
     let local_ip = tcp.local_addr().ok().map(|s| s.ip().to_canonical().to_string());
+    if !is_hex64(&a.pin) {
+        return Err(io("no confirmed fingerprint"));
+    }
     let seen: crate::tls::SeenSlot = Default::default();
-    let cfg = crate::tls::client_config(a.pin.clone(), seen.clone()).map_err(io)?;
+    let cfg = crate::tls::client_config(&a.pin, seen.clone()).map_err(io)?;
     let server_name = rustls::pki_types::ServerName::try_from(a.host.clone())
         .map_err(|_| io("invalid host name"))?;
     let tls = tokio_rustls::TlsConnector::from(cfg)
@@ -162,7 +171,7 @@ async fn connect_inner(a: &Attempt) -> Result<(Ws, Established), LinkError> {
         .await
         .map_err(|e| {
             let text = e.to_string();
-            if a.pin.is_some() && text.contains("ApplicationVerificationFailure") {
+            if text.contains("ApplicationVerificationFailure") {
                 LinkError::CertMismatch(seen.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default())
             } else {
                 LinkError::Io(format!("TLS: {text}"))
@@ -177,10 +186,8 @@ async fn connect_inner(a: &Attempt) -> Result<(Ws, Established), LinkError> {
         .ok_or_else(|| io("no server certificate"))?;
     // The verifier already enforced the pin; checked again here because
     // everything below depends on it.
-    if let Some(pin) = &a.pin {
-        if !handshake::ct_eq(&fp, pin) {
-            return Err(LinkError::CertMismatch(fp));
-        }
+    if !handshake::ct_eq(&fp, &a.pin) {
+        return Err(LinkError::CertMismatch(fp));
     }
 
     let host = if a.host.contains(':') { format!("[{}]", a.host) } else { a.host.clone() };
@@ -266,6 +273,38 @@ async fn connect_inner(a: &Attempt) -> Result<(Ws, Established), LinkError> {
         Mode::Key => None,
     };
     Ok((ws, Established { fp, link_key, local_ip }))
+}
+
+/// Reads the fingerprint of the certificate Manager's address presents:
+/// TCP, the TLS handshake (any certificate, signatures still checked), then
+/// close. No WebSocket upgrade, no `auth`, nothing derived from the web
+/// password: what answers learns only that a Sentry USB looked.
+pub async fn read_fingerprint(host: &str, port: u16) -> Result<String, LinkError> {
+    let inner = async {
+        let tcp = TcpStream::connect((host, port)).await.map_err(io)?;
+        let seen: crate::tls::SeenSlot = Default::default();
+        let cfg = crate::tls::probe_config(seen).map_err(io)?;
+        let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+            .map_err(|_| io("invalid host name"))?;
+        let mut tls = tokio_rustls::TlsConnector::from(cfg)
+            .connect(server_name, tcp)
+            .await
+            .map_err(|e| LinkError::Io(format!("TLS: {e}")))?;
+        let fp = tls
+            .get_ref()
+            .1
+            .peer_certificates()
+            .and_then(|c| c.first())
+            .map(|c| crate::tls::sha256_hex(c.as_ref()))
+            .ok_or_else(|| io("no server certificate"))?;
+        // close_notify, then drop: nothing else is written.
+        let _ = tokio::io::AsyncWriteExt::shutdown(&mut tls).await;
+        Ok(fp)
+    };
+    match tokio::time::timeout(HANDSHAKE_TIMEOUT, inner).await {
+        Ok(r) => r,
+        Err(_) => Err(LinkError::Timeout),
+    }
 }
 
 /// Saves a fresh pairing: the link key and the fingerprint seen.

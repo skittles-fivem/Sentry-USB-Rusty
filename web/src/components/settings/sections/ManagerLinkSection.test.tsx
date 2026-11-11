@@ -107,3 +107,42 @@ test('a fingerprint mismatch is shown prominently with the fingerprint seen', as
     assert.ok(r.container.textContent.includes('GET /api/status → 200'))
   } finally { await r.cleanup() }
 })
+
+test('before the first pairing it shows the fingerprint to check and pairs on one tap', async () => {
+  const fp = '61ecb6872005d76f9c85b9abee8c635c413381103bf5df251ec263fc331d6c27'
+  const display = '61EC B687 2005 D76F 9C85 B9AB EE8C 635C 4133 8110 3BF5 DF25 1EC2 63FC 331D 6C27'
+  const check = { fingerprint: fp, display, address: 'nas.local:10000', first: '61EC', middle: display.slice(5, -5), last: '6C27' }
+  const confirm = { ...base, enabled: true, pairing: true, state: 'confirm_fingerprint' as const, message: "Check this matches the fingerprint on Sentry Manager's Sentry USB page.", check }
+  const r = await render(confirm, () => ({ ...confirm, check: null, state: 'pairing', fingerprint: fp, fingerprint_display: display, message: 'Waiting for Sentry Manager (15 min left).' }))
+  try {
+    assert.ok(r.container.textContent.includes("Check this matches the fingerprint on Sentry Manager's Sentry USB page"))
+    const big = [...r.container.querySelectorAll('span.text-2xl')].map(e => e.textContent)
+    assert.deepEqual(big, ['61EC', '6C27'], 'first and last groups are large')
+    assert.ok(r.container.textContent.includes('B687 2005'))
+    assert.equal(r.writes.length, 0, 'nothing confirmed until the tap')
+    const pair = [...r.container.querySelectorAll('button')].find(b => b.textContent === 'It matches, pair')!
+    await act(async () => pair.click())
+    assert.deepEqual(r.writes[0], { method: 'POST', url: '/api/manager-link/confirm', body: { fingerprint: fp } })
+    assert.ok(r.container.textContent.includes('Waiting to pair'))
+    assert.ok(!r.container.textContent.includes('It matches, pair'))
+  } finally { await r.cleanup() }
+})
+
+test('a fingerprint that changed after confirming is flagged, and a failed read says so', async () => {
+  const fp = 'ab'.repeat(32)
+  const display = 'ABAB '.repeat(16).trim()
+  const check = { fingerprint: fp, display, address: 'nas.local:10000', first: 'ABAB', middle: 'ABAB '.repeat(14).trim(), last: 'ABAB' }
+  const r = await render({ ...base, enabled: true, pairing: true, state: 'confirm_fingerprint', fingerprint_changed: true, check,
+    message: 'The fingerprint changed after you confirmed it, so nothing was sent.' })
+  try {
+    assert.ok(r.container.textContent.includes('changed after you confirmed it'))
+    assert.ok(r.container.textContent.includes('It matches, pair'))
+  } finally { await r.cleanup() }
+  const f = await render({ ...base, enabled: true, pairing: true, state: 'check_failed', check_error: 'connection refused',
+    message: "Can't read Sentry Manager's fingerprint at nas.local:10000 yet: connection refused." })
+  try {
+    assert.ok(f.container.textContent.includes("Can't reach Manager"))
+    assert.ok(f.container.textContent.includes('Last error: connection refused'))
+    assert.ok(!f.container.textContent.includes('It matches, pair'))
+  } finally { await f.cleanup() }
+})

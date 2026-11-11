@@ -1,7 +1,9 @@
-//! The whole client: settings in a config file, the pairing window, pairing
-//! against a fake Manager, the saved 0600 file, status, and unpairing.
+//! The whole client: settings in a config file, the pairing window, the
+//! fingerprint check before the first pairing, pairing against a fake
+//! Manager, the saved 0600 file, status, and unpairing.
 //! Its own test binary because it sets process-wide environment variables.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -75,13 +77,18 @@ async fn flip_the_switch_pair_and_unpair() {
     let link_key = Secret::from_bytes([0x42; 32]);
     let mfp = sentryusb_manager_link::tls::sha256_hex(MANAGER_CERT);
     let acc = acceptor();
+    // Flipped to make the same address present another certificate.
+    let impostor = Arc::new(AtomicBool::new(false));
+    let other_acc = acceptor_for(OTHER_CERT, OTHER_KEY);
     let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
     {
         let mfp = mfp.clone();
+        let impostor = impostor.clone();
         tokio::spawn(async move {
             loop {
                 let (tcp, _) = listener.accept().await.unwrap();
-                let (acc, k, lk, mfp, seen) = (acc.clone(), k.clone(), link_key.clone(), mfp.clone(), seen_tx.clone());
+                let acc = if impostor.load(Ordering::SeqCst) { other_acc.clone() } else { acc.clone() };
+                let (k, lk, mfp, seen) = (k.clone(), link_key.clone(), mfp.clone(), seen_tx.clone());
                 tokio::spawn(async move {
                     let Ok(tls) = acc.accept(tcp).await else { return };
                     let Ok(mut ws) = tokio_tungstenite::accept_async(tls).await else { return };
@@ -121,8 +128,27 @@ async fn flip_the_switch_pair_and_unpair() {
     assert_eq!(s["default_address"], "127.0.0.1:10000");
     assert_eq!(s["web_password_set"], true);
 
-    // The one switch (plus the test's port instead of 10000).
+    // The one switch (plus the test's port instead of 10000). With no pin
+    // yet, the Pi only reads the fingerprint and waits for the owner.
     sentryusb_manager_link::save_settings(true, &format!("127.0.0.1:{port}")).unwrap();
+    let s = wait_for("confirm_fingerprint").await;
+    assert_eq!(s["check"]["fingerprint"], mfp);
+    let display = s["check"]["display"].as_str().unwrap().to_string();
+    assert_eq!(s["check"]["first"], display[..4]);
+    assert_eq!(s["check"]["last"], display[display.len() - 4..]);
+    assert_eq!(s["fingerprint"], Value::Null, "nothing pinned yet");
+    assert!(s["message"].as_str().unwrap().contains("Check this matches the fingerprint on Sentry Manager's Sentry USB page"));
+    assert!(
+        tokio::time::timeout(Duration::from_secs(3), seen_rx.recv()).await.is_err(),
+        "no proof before the owner confirms"
+    );
+    // Only the fingerprint being shown is accepted.
+    let other_fp = sentryusb_manager_link::tls::sha256_hex(OTHER_CERT);
+    let e = sentryusb_manager_link::confirm_pairing(&other_fp).unwrap_err();
+    assert!(e.contains("changed"), "{e}");
+    assert!(sentryusb_manager_link::confirm_pairing("1234").is_err());
+    // "It matches, pair" (the grouped form works too).
+    sentryusb_manager_link::confirm_pairing(&display).unwrap();
     let first = tokio::time::timeout(Duration::from_secs(20), seen_rx.recv()).await.unwrap().unwrap();
     assert_eq!(first["mode"], "pair");
     // After the handshake: net first, then status; the refused request.
@@ -167,7 +193,6 @@ async fn flip_the_switch_pair_and_unpair() {
     sentryusb_manager_link::save_settings(true, &format!("127.0.0.1:{fake_port}")).unwrap();
     let s = wait_for("cert_changed").await;
     assert!(s["message"].as_str().unwrap().contains("certificate changed"));
-    let other_fp = sentryusb_manager_link::tls::sha256_hex(OTHER_CERT);
     let log = sentryusb_manager_link::log_json(200);
     let warn = &log["warnings"][0];
     assert_eq!(warn["kind"], "fingerprint_mismatch");
@@ -195,7 +220,7 @@ async fn flip_the_switch_pair_and_unpair() {
     // The log has the whole story, newest first, without secrets.
     let log = sentryusb_manager_link::log_json(200);
     let kinds: Vec<&str> = log["entries"].as_array().unwrap().iter().map(|e| e["kind"].as_str().unwrap()).collect();
-    for k in ["pairing_open", "paired", "connected", "network", "refused", "fingerprint_mismatch", "alert_sent"] {
+    for k in ["pairing_open", "fingerprint_read", "fingerprint_confirmed", "paired", "connected", "network", "refused", "fingerprint_mismatch", "alert_sent"] {
         assert!(kinds.contains(&k), "{k} missing from {kinds:?}");
     }
     let text = std::fs::read_to_string(dir.path().join("sentryusb-manager-link.log")).unwrap();
@@ -214,8 +239,44 @@ async fn flip_the_switch_pair_and_unpair() {
         "an unpaired Pi must not reconnect without a new pairing window"
     );
 
-    // Pair again: the window opens and the Pi pairs once more.
+    // Pair again: the fingerprint is read afresh and must be confirmed.
     sentryusb_manager_link::start_pairing().unwrap();
+    let s = wait_for("confirm_fingerprint").await;
+    assert_eq!(s["check"]["fingerprint"], mfp);
+    assert_eq!(s["fingerprint_changed"], false);
+    // The certificate changes between the read and the pairing: nothing is
+    // sent, and the new one is shown, flagged, to be checked again.
+    impostor.store(true, Ordering::SeqCst);
+    sentryusb_manager_link::confirm_pairing(&mfp).unwrap();
+    let mut s = wait_for("confirm_fingerprint").await;
+    for _ in 0..100 {
+        if s["fingerprint_changed"] == true {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        s = sentryusb_manager_link::status_json();
+    }
+    assert_eq!(s["fingerprint_changed"], true, "{s}");
+    assert_eq!(s["check"]["fingerprint"], other_fp);
+    assert!(s["message"].as_str().unwrap().contains("changed after you confirmed it"));
+    assert_eq!(s["fingerprint"], Value::Null, "the confirmed pin is dropped");
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), seen_rx.recv()).await.is_err(),
+        "the other certificate got no proof"
+    );
+    // Back to the real certificate; Pair reads it again.
+    impostor.store(false, Ordering::SeqCst);
+    sentryusb_manager_link::start_pairing().unwrap();
+    let mut s = wait_for("confirm_fingerprint").await;
+    for _ in 0..100 {
+        if s["check"]["fingerprint"] == mfp.as_str() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        s = sentryusb_manager_link::status_json();
+    }
+    assert_eq!(s["check"]["fingerprint"], mfp);
+    sentryusb_manager_link::confirm_pairing(&mfp).unwrap();
     let again = loop {
         let f = tokio::time::timeout(Duration::from_secs(20), seen_rx.recv()).await.unwrap().unwrap();
         if f.get("mode").is_some() {

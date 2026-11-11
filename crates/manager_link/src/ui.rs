@@ -54,6 +54,30 @@ pub async fn post_pair() -> Response {
     }
 }
 
+#[derive(Deserialize)]
+pub struct ConfirmBody {
+    fingerprint: String,
+}
+
+/// POST /api/manager-link/confirm `{"fingerprint": "<the one shown>"}`: the
+/// owner checked it matches Sentry Manager's, so pin it and pair.
+///
+/// Like pair and unpair it needs the web login, whose cookie is
+/// `SameSite=Strict`, so another site can't send it. It also takes only a
+/// JSON body (`Content-Type: application/json`, which a plain form can't
+/// send cross-site without a CORS preflight the Pi never allows), and the
+/// fingerprint must be the one being shown, which another site can't read.
+pub async fn post_confirm(Json(body): Json<ConfirmBody>) -> Response {
+    if body.fingerprint.len() > 200 {
+        return err(StatusCode::BAD_REQUEST, "That isn't a fingerprint".into());
+    }
+    match blocking(move || crate::confirm_pairing(&body.fingerprint)).await {
+        Ok(Ok(())) => get_status().await,
+        Ok(Err(e)) => err(StatusCode::CONFLICT, e),
+        Err(r) => r,
+    }
+}
+
 /// POST /api/manager-link/unpair: forgets the key and the fingerprint.
 pub async fn post_unpair() -> Response {
     match blocking(crate::unpair).await {

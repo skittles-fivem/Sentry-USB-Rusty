@@ -19,7 +19,9 @@
 #
 # What it does, in order (each step says what to do in Manager first):
 #   1. pairing with a wrong password: Manager says "denied", nothing is saved
-#   2. pairing with the right password: link key and Manager's fingerprint saved (0600)
+#   2. pairing with the right password: the fingerprint is read with no proof
+#      sent, confirmed (the harness presses "It matches, pair"), then the link
+#      key and that fingerprint are saved (0600)
 #   3. status push: right after connecting, then every 30 s
 #   4. key-mode reconnect: off/on, and a fresh process on the same files
 #   5. every allowlisted route through Manager's proxy (MANAGER_API), and a refused one
@@ -164,6 +166,10 @@ ask "Manager's pairing slot must still be open (re-add the Sentry USB if it clos
 m=$(mark)
 start_harness E2E_PASSWORD 300
 if wait_ev "$m" 60 '.event=="paired"'; then ok "paired"; else bad "not paired"; fi
+order=$(since "$m" | jq -r 'select(.event=="fingerprint_read" or .event=="fingerprint_confirmed" or (.event=="connected" and .mode=="pair")) | .event' | awk '!s[$0]++' | paste -sd, -)
+[[ "$order" == fingerprint_read,fingerprint_confirmed,connected ]] && ok "fingerprint read, then confirmed, then the pair handshake" || bad "pairing order: $order"
+first=$(since "$m" | jq -r 'select(.src=="pi" and (.mode=="pair" or .event=="fingerprint_confirmed")) | .event' | head -1)
+[[ "$first" == fingerprint_confirmed ]] && ok "no pair-mode attempt before the confirm" || bad "pair-mode $first before the confirm"
 if wait_ev "$m" 10 '.event=="connected" and .mode=="pair"'; then ok "connected in pair mode"; else bad "no pair-mode connection"; fi
 id=$(jq -r 'select(.event=="ready") | .device_id' "$events" | tail -1)
 fp=$(jq -r '.pin' "$state/pi/manager-link.json")

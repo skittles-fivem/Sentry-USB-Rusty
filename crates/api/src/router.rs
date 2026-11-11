@@ -344,6 +344,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/manager-link/log", get(sentryusb_manager_link::ui::get_log))
         .route("/api/manager-link/pair", post(sentryusb_manager_link::ui::post_pair))
+        .route("/api/manager-link/confirm", post(sentryusb_manager_link::ui::post_confirm))
         .route("/api/manager-link/unpair", post(sentryusb_manager_link::ui::post_unpair));
 
     api.with_state(state)

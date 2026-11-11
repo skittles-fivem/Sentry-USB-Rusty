@@ -35,8 +35,10 @@ The **Pi connects out to Manager**; Manager never connects to the Pi:
 **Endpoint:** `wss://<manager host>:10000/api/sentryusb/link`, WebSocket over
 TLS. TLS 1.2 is the minimum, and 1.3 is preferred.
 
-The Pi pins Manager's certificate by its SHA-256 fingerprint (section 2). A
-Pi with no fingerprint saved accepts the certificate only during pairing.
+The Pi pins Manager's certificate by its SHA-256 fingerprint (section 2).
+Every handshake, pairing included, runs with a pin. A Pi with no fingerprint
+saved only reads the certificate's fingerprint (TLS, then close) and pins it
+once the owner confirms it on the Pi (section 2, step 3).
 
 ## 2. Pairing: the Pi's username and password, never stored by Manager
 
@@ -58,7 +60,33 @@ sends it over the link.
    - Manager keeps K **in memory only**, for at most 15 minutes, and forgets
      the password at once.
    - While this pairing slot is open, the device port is open.
-3. **The Pi connects** to the device port, and both sides prove they hold K
+3. **The owner confirms Manager's fingerprint on the Pi** (first pairing
+   only, when the Pi has no fingerprint saved):
+   - The Pi makes a TLS connection to Manager's address only to read the
+     certificate's SHA-256 fingerprint, then closes it: no WebSocket upgrade,
+     no `auth`, no proof. Manager sees a TLS connection that ends after the
+     TLS handshake, and needs nothing new for it.
+   - The Pi's Sentry Manager settings show that fingerprint with "Check this
+     matches the fingerprint on Sentry Manager's Sentry USB page", the first
+     and last groups of four shown large, and an "It matches, pair" button.
+   - Only after that tap does the Pi pin the fingerprint (in memory, for this
+     pairing) and run the pair handshake. A server with any other
+     certificate fails TLS against the pin before anything is sent, so it
+     never gets a proof to guess the web password against offline.
+   - The confirm route (`POST /api/manager-link/confirm`
+     `{"fingerprint":"<the one shown>"}`) is behind the Pi's web login, like
+     Pair and Unpair, and takes only a JSON body. It is refused if the
+     fingerprint sent isn't the one being shown (it changed after the page
+     loaded), or the pairing window has closed.
+   - If the fingerprint can't be read (Manager's device port isn't open yet,
+     a wrong address), the page says so with the reason and keeps trying
+     every 5 to 15 seconds.
+   - If the certificate presented when pairing isn't the confirmed one, the
+     Pi sends nothing, drops that pin, and shows the new fingerprint flagged
+     "changed after you confirmed it", to be checked again.
+   - The confirmed fingerprint is not written to the link file; only a
+     successful pairing saves a pin.
+4. **The Pi connects** to the device port, and both sides prove they hold K
    (section 3).
    - The Pi only tries pair mode during a 15-minute pairing window that the
      owner opens on the Pi: turning the link on, or pressing "Pair". Outside
@@ -73,9 +101,10 @@ sends it over the link.
    - On success, Manager generates a random 32-byte **link key**.
    - Manager sends it inside the TLS channel, and both sides save it.
    - Manager forgets K.
-   - The Pi saves Manager's certificate fingerprint and shows it in its UI, and
-     Manager shows its own fingerprint, so you can compare the two.
-4. **Afterwards, every connection uses the link key** and never the password.
+   - The Pi saves Manager's certificate fingerprint (the confirmed one) and
+     shows it in its UI, and Manager shows its own fingerprint, so you can
+     compare the two.
+5. **Afterwards, every connection uses the link key** and never the password.
    - Changing the Pi's web password doesn't unpair it.
    - "Unpair" on either side deletes the key on that side, and the other side's
      next handshake fails.
@@ -406,14 +435,19 @@ On the Pi: JSON lines in `/mutable/sentryusb-manager-link.log`, rotated to
 `.log.1` at 512 KiB (so both stay within 1 MB). Manager can read it over the
 link as `GET /api/logs/manager-link`. Each line is
 `{"at":<unix>,"level":"info"|"warn","kind":"...","msg":"...",...}` with kinds
-`pairing_open`, `paired`, `unpaired`, `connected`, `disconnected`,
-`attempt_failed`, `fingerprint_mismatch` (warn), `bad_proof` (warn), `network`,
-`request`, `refused` (warn) and `alert_sent`. Text from the network is
+`pairing_open`, `fingerprint_read` (the fingerprint read before the first
+pairing, with `address` and `fingerprint`), `fingerprint_confirmed` (the owner
+pressed "It matches, pair"), `paired`, `unpaired`, `connected`,
+`disconnected`, `attempt_failed` (`mode` is `pair`, `key`, or `check` for a
+fingerprint read that failed), `fingerprint_mismatch` (warn; also when the
+certificate at pairing isn't the confirmed one), `bad_proof` (warn),
+`network`, `request`, `refused` (warn) and `alert_sent`. Text from the network is
 clipped to 200 characters with control characters removed. No key, K,
 password or request body is ever logged.
 
 - **What it records:**
-  - every connection attempt to Manager
+  - every connection attempt to Manager, fingerprint reads included
+  - the fingerprint read before the first pairing, and the owner's confirm
   - a certificate fingerprint mismatch: a possible fake Manager, logged as a
     warning and shown prominently with the fingerprint seen
   - a Manager proof that failed

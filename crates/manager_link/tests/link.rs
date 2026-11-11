@@ -1,7 +1,8 @@
 //! End-to-end tests against a small local TLS WebSocket server that plays
 //! Sentry Manager.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -81,7 +82,7 @@ async fn send(ws: &mut ServerWs, v: Value) {
     ws.send(Message::text(v.to_string())).await.unwrap();
 }
 
-fn attempt(port: u16, mode: Mode, secret: Secret, pin: Option<String>) -> Attempt {
+fn attempt(port: u16, mode: Mode, secret: Secret, pin: String) -> Attempt {
     Attempt {
         host: "127.0.0.1".into(),
         port,
@@ -153,7 +154,8 @@ async fn pairing_then_requests_end_to_end() {
     })
     .await;
 
-    let (ws, est) = session::connect(&attempt(port, Mode::Pair, k, None)).await.expect("pairing");
+    // The owner confirmed Manager's fingerprint: pairing runs pinned to it.
+    let (ws, est) = session::connect(&attempt(port, Mode::Pair, k, mfp.clone())).await.expect("pairing");
     assert_eq!(est.fp, mfp);
     assert_eq!(est.link_key.as_ref().unwrap().to_hex(), link_key.to_hex());
     let (_tx, stop) = tokio::sync::watch::channel(0u64);
@@ -177,7 +179,7 @@ async fn key_mode_with_the_pin_connects() {
         move |mut ws| async move { honest_handshake(&mut ws, &lk, &mfp, None).await }
     })
     .await;
-    let (_, est) = session::connect(&attempt(port, Mode::Key, lk, Some(mfp))).await.expect("key mode");
+    let (_, est) = session::connect(&attempt(port, Mode::Key, lk, mfp)).await.expect("key mode");
     assert!(est.link_key.is_none());
     assert_eq!(mgr.await.unwrap()["mode"], "key");
 }
@@ -189,7 +191,7 @@ async fn another_certificate_fails_the_pin() {
         let _ = ws.next().await;
     })
     .await;
-    let r = session::connect(&attempt(port, Mode::Key, Secret::from_bytes([1; 32]), Some(fp(MANAGER_CERT)))).await;
+    let r = session::connect(&attempt(port, Mode::Key, Secret::from_bytes([1; 32]), fp(MANAGER_CERT))).await;
     assert!(matches!(r.err(), Some(LinkError::CertMismatch(seen)) if seen == fp(OTHER_CERT)));
 }
 
@@ -202,47 +204,120 @@ async fn a_pinned_pi_does_not_pair_with_a_fake_manager_either() {
         let _ = ws.next().await;
     })
     .await;
-    let r = session::connect(&attempt(port, Mode::Pair, k, Some(fp(MANAGER_CERT)))).await;
+    let r = session::connect(&attempt(port, Mode::Pair, k, fp(MANAGER_CERT))).await;
     assert!(matches!(r.err(), Some(LinkError::CertMismatch(seen)) if seen == fp(OTHER_CERT)));
 }
 
+/// What a fake Manager saw: TLS handshakes completed, WebSocket upgrades,
+/// and every `auth` frame (each carries a proof).
+#[derive(Default)]
+struct Seen {
+    tls: AtomicUsize,
+    upgrades: AtomicUsize,
+    auths: Mutex<Vec<Value>>,
+}
+
+/// A Manager on a random port that accepts any number of connections and
+/// records what each sends. It knows K and plays the handshake honestly
+/// over `claimed_fp`, so a proof is all it would need to guess the
+/// password offline.
+async fn recording_manager(cert: &'static [u8], key: &'static [u8], claimed_fp: String) -> (u16, Arc<Seen>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let acc = acceptor(cert, key);
+    let seen = Arc::new(Seen::default());
+    let k = handshake::derive_pairing_key(USER, PASS);
+    tokio::spawn({
+        let seen = seen.clone();
+        async move {
+            loop {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let (acc, seen, k, claimed) = (acc.clone(), seen.clone(), k.clone(), claimed_fp.clone());
+                tokio::spawn(async move {
+                    let Ok(tls) = acc.accept(tcp).await else { return };
+                    seen.tls.fetch_add(1, Ordering::SeqCst);
+                    let Ok(mut ws) = tokio_tungstenite::accept_async(tls).await else { return };
+                    seen.upgrades.fetch_add(1, Ordering::SeqCst);
+                    let mn = handshake::random_hex32().unwrap();
+                    send(&mut ws, json!({"t":"hello","v":1,"nonce":mn,"fp":claimed})).await;
+                    let Some(Ok(Message::Text(t))) = ws.next().await else { return };
+                    let auth: Value = serde_json::from_str(t.as_str()).unwrap();
+                    seen.auths.lock().unwrap().push(auth.clone());
+                    let pn = auth["nonce"].as_str().unwrap_or("");
+                    let proof = handshake::mgr_proof(&k, &mn, pn, &claimed, DEVICE);
+                    send(&mut ws, json!({"t":"ok","proof":proof,"linkKey":"33".repeat(32)})).await;
+                });
+            }
+        }
+    });
+    (port, seen)
+}
+
 #[tokio::test]
-async fn man_in_the_middle_during_first_pairing_fails() {
-    // The attacker's certificate is OTHER, but it relays to (or is) a
-    // Manager that knows K and computes proofs over its own fingerprint.
+async fn reading_the_fingerprint_sends_no_proof() {
+    // Before the owner confirms anything, the Pi only reads the certificate.
+    let (port, seen) = recording_manager(OTHER_CERT, OTHER_KEY, fp(OTHER_CERT)).await;
+    let got = session::read_fingerprint("127.0.0.1", port).await.expect("fingerprint");
+    assert_eq!(got, fp(OTHER_CERT));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(seen.tls.load(Ordering::SeqCst), 1, "one TLS handshake");
+    assert_eq!(seen.upgrades.load(Ordering::SeqCst), 0, "no WebSocket upgrade");
+    assert!(seen.auths.lock().unwrap().is_empty(), "no auth, so no proof");
+}
+
+#[tokio::test]
+async fn a_handshake_never_runs_without_a_confirmed_pin() {
+    let (port, seen) = recording_manager(MANAGER_CERT, MANAGER_KEY, fp(MANAGER_CERT)).await;
+    let k = handshake::derive_pairing_key(USER, PASS);
+    for pin in ["", "not a fingerprint"] {
+        let r = session::connect(&attempt(port, Mode::Pair, k.clone(), pin.into())).await;
+        assert!(matches!(r.err(), Some(LinkError::Io(_))));
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(seen.tls.load(Ordering::SeqCst), 0, "not even TLS");
+    assert!(seen.auths.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_server_with_another_certificate_than_the_confirmed_one_gets_no_proof() {
+    // The owner confirmed the real Manager's fingerprint; an impostor that
+    // knows K (so it could check guesses) answers at the address, claiming
+    // the real fingerprint or its own. The pin refuses it during TLS.
     let k = handshake::derive_pairing_key(USER, PASS);
     let real_fp = fp(MANAGER_CERT);
-    // a) It claims the real Manager's fingerprint in hello.
-    let (port, _m) = manager(OTHER_CERT, OTHER_KEY, {
-        let (k, real_fp) = (k.clone(), real_fp.clone());
-        move |mut ws| async move { honest_handshake(&mut ws, &k, &real_fp, Some(&Secret::from_bytes([3; 32]))).await }
-    })
-    .await;
-    let r = session::connect(&attempt(port, Mode::Pair, k.clone(), None)).await;
-    assert!(matches!(r.err(), Some(LinkError::CertMismatch(seen)) if seen == fp(OTHER_CERT)));
+    for claimed in [real_fp.clone(), fp(OTHER_CERT)] {
+        let (port, seen) = recording_manager(OTHER_CERT, OTHER_KEY, claimed).await;
+        let r = session::connect(&attempt(port, Mode::Pair, k.clone(), real_fp.clone())).await;
+        assert!(matches!(r.err(), Some(LinkError::CertMismatch(s)) if s == fp(OTHER_CERT)));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(seen.upgrades.load(Ordering::SeqCst), 0, "no WebSocket upgrade");
+        assert!(seen.auths.lock().unwrap().is_empty(), "no proof sent to the impostor");
+    }
+}
 
-    // b) It states its own fingerprint, but the real Manager's proof (over
-    //    the real fingerprint) doesn't verify for the one the Pi saw.
-    let (port, m) = manager(OTHER_CERT, OTHER_KEY, {
-        let (k, real_fp) = (k.clone(), real_fp.clone());
-        move |mut ws| async move {
-            let mn = handshake::random_hex32().unwrap();
-            send(&mut ws, json!({"t":"hello","v":1,"nonce":mn,"fp":fp(OTHER_CERT)})).await;
-            let auth = recv(&mut ws).await;
-            let pn = auth["nonce"].as_str().unwrap();
-            // What the real Manager would check: fails, since the Pi used
-            // the attacker's fingerprint.
-            let real_check = handshake::pi_proof(&k, &mn, pn, &real_fp, DEVICE);
-            let pi_ok_for_real = auth["proof"].as_str() == Some(real_check.as_str());
-            let proof = handshake::mgr_proof(&k, &mn, pn, &real_fp, DEVICE);
-            send(&mut ws, json!({"t":"ok","proof":proof,"linkKey":"00".repeat(32)})).await;
-            pi_ok_for_real
-        }
-    })
-    .await;
-    let r = session::connect(&attempt(port, Mode::Pair, k, None)).await;
-    assert!(matches!(r.err(), Some(LinkError::BadProof(_))));
-    assert!(!m.await.unwrap(), "the real Manager would have accepted a relayed proof");
+#[tokio::test]
+async fn a_confirmed_pin_pairs() {
+    let (port, seen) = recording_manager(MANAGER_CERT, MANAGER_KEY, fp(MANAGER_CERT)).await;
+    let confirmed = session::read_fingerprint("127.0.0.1", port).await.unwrap();
+    let k = handshake::derive_pairing_key(USER, PASS);
+    let (_ws, est) = session::connect(&attempt(port, Mode::Pair, k, confirmed)).await.expect("pairs");
+    assert_eq!(est.fp, fp(MANAGER_CERT));
+    assert_eq!(est.link_key.unwrap().to_hex(), "33".repeat(32));
+    let auths = seen.auths.lock().unwrap();
+    assert_eq!(auths.len(), 1);
+    assert_eq!(auths[0]["mode"], "pair");
+}
+
+#[tokio::test]
+async fn a_confirmed_server_claiming_another_fingerprint_fails() {
+    // TLS terminated with the confirmed certificate, but hello names
+    // another: someone else's handshake is relayed. Refused before auth.
+    let (port, seen) = recording_manager(MANAGER_CERT, MANAGER_KEY, fp(OTHER_CERT)).await;
+    let k = handshake::derive_pairing_key(USER, PASS);
+    let r = session::connect(&attempt(port, Mode::Pair, k, fp(MANAGER_CERT))).await;
+    assert!(matches!(r.err(), Some(LinkError::CertMismatch(_))));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(seen.auths.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -263,7 +338,7 @@ async fn a_manager_without_the_key_is_rejected() {
     })
     .await;
     let k = handshake::derive_pairing_key(USER, PASS);
-    assert!(matches!(session::connect(&attempt(port, Mode::Pair, k, None)).await.err(), Some(LinkError::BadProof(_))));
+    assert!(matches!(session::connect(&attempt(port, Mode::Pair, k, mfp)).await.err(), Some(LinkError::BadProof(_))));
 }
 
 #[tokio::test]
@@ -284,7 +359,7 @@ async fn a_replayed_ok_is_rejected() {
         }
     })
     .await;
-    let r = session::connect(&attempt(port, Mode::Key, lk, Some(mfp))).await;
+    let r = session::connect(&attempt(port, Mode::Key, lk, mfp)).await;
     assert!(matches!(r.err(), Some(LinkError::BadProof(_))));
 }
 
@@ -300,7 +375,7 @@ async fn a_denied_answer_and_a_newer_version_are_reported() {
         }
     })
     .await;
-    let r = session::connect(&attempt(port, Mode::Key, Secret::from_bytes([1; 32]), Some(mfp.clone()))).await;
+    let r = session::connect(&attempt(port, Mode::Key, Secret::from_bytes([1; 32]), mfp.clone())).await;
     assert_eq!(r.err(), Some(LinkError::Denied("not paired".into())));
 
     let (port, m) = manager(MANAGER_CERT, MANAGER_KEY, {
@@ -311,7 +386,7 @@ async fn a_denied_answer_and_a_newer_version_are_reported() {
         }
     })
     .await;
-    let r = session::connect(&attempt(port, Mode::Key, Secret::from_bytes([1; 32]), Some(mfp))).await;
+    let r = session::connect(&attempt(port, Mode::Key, Secret::from_bytes([1; 32]), mfp)).await;
     assert_eq!(r.err(), Some(LinkError::Version));
     assert_eq!(m.await.unwrap(), json!({"t":"denied","why":"version"}));
 }
@@ -332,7 +407,7 @@ async fn garbage_and_oversized_handshake_frames_end_the_attempt() {
             let _ = ws.next().await;
         })
         .await;
-        let r = session::connect(&attempt(port, Mode::Key, Secret::from_bytes([1; 32]), Some(mfp.clone()))).await;
+        let r = session::connect(&attempt(port, Mode::Key, Secret::from_bytes([1; 32]), mfp.clone())).await;
         assert!(matches!(r.err(), Some(LinkError::Protocol(_))));
     }
 
@@ -342,7 +417,7 @@ async fn garbage_and_oversized_handshake_frames_end_the_attempt() {
         let _ = ws.next().await;
     })
     .await;
-    let r = session::connect(&attempt(port, Mode::Key, Secret::from_bytes([1; 32]), Some(mfp))).await;
+    let r = session::connect(&attempt(port, Mode::Key, Secret::from_bytes([1; 32]), mfp)).await;
     let e = r.err();
     assert!(matches!(e, Some(LinkError::Io(_))), "{e:?}");
 }
@@ -356,7 +431,7 @@ async fn a_silent_manager_times_the_handshake_out() {
     })
     .await;
     let t0 = std::time::Instant::now();
-    let r = session::connect(&attempt(port, Mode::Key, Secret::from_bytes([1; 32]), Some(fp(MANAGER_CERT)))).await;
+    let r = session::connect(&attempt(port, Mode::Key, Secret::from_bytes([1; 32]), fp(MANAGER_CERT))).await;
     assert_eq!(r.err(), Some(LinkError::Timeout));
     assert!(t0.elapsed() < session::HANDSHAKE_TIMEOUT + Duration::from_secs(2));
 }
@@ -369,6 +444,6 @@ async fn a_tcp_peer_that_never_speaks_tls_times_out() {
         let (_s, _) = listener.accept().await.unwrap();
         tokio::time::sleep(Duration::from_secs(30)).await;
     });
-    let r = session::connect(&attempt(port, Mode::Key, Secret::from_bytes([1; 32]), Some(fp(MANAGER_CERT)))).await;
+    let r = session::connect(&attempt(port, Mode::Key, Secret::from_bytes([1; 32]), fp(MANAGER_CERT))).await;
     assert_eq!(r.err(), Some(LinkError::Timeout));
 }

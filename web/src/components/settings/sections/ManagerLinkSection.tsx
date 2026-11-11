@@ -17,13 +17,29 @@ export interface ManagerLinkStatus {
   pairing_seconds_left: number
   fingerprint: string | null
   fingerprint_display: string | null
+  /** Before the first pairing: the fingerprint read at Manager's address,
+   * for the owner to compare with Manager's before anything is sent. */
+  check?: FingerprintCheck | null
+  check_error?: string | null
+  /** The confirmed fingerprint wasn't the one presented when pairing. */
+  fingerprint_changed?: boolean
   state:
     | "off" | "needs_address" | "needs_password" | "update_needed" | "cert_changed"
+    | "checking" | "check_failed" | "confirm_fingerprint"
     | "pairing" | "pairing_expired" | "connected" | "not_paired" | "connecting" | "retrying"
   message: string
   connected: boolean
   last_error: string | null
   last_connected: number | null
+}
+
+export interface FingerprintCheck {
+  fingerprint: string
+  display: string
+  address: string
+  first: string
+  middle: string
+  last: string
 }
 
 const STATE_LABEL: Record<ManagerLinkStatus["state"], { label: string; tone: string }> = {
@@ -32,6 +48,9 @@ const STATE_LABEL: Record<ManagerLinkStatus["state"], { label: string; tone: str
   needs_password: { label: "Not set up", tone: "text-amber-300" },
   update_needed: { label: "Update needed", tone: "text-amber-300" },
   cert_changed: { label: "Certificate changed", tone: "text-rose-300" },
+  checking: { label: "Checking…", tone: "text-blue-300" },
+  check_failed: { label: "Can't reach Manager", tone: "text-amber-300" },
+  confirm_fingerprint: { label: "Check fingerprint", tone: "text-amber-300" },
   pairing: { label: "Waiting to pair", tone: "text-blue-300" },
   pairing_expired: { label: "Not paired", tone: "text-amber-300" },
   connected: { label: "Connected", tone: "text-emerald-300" },
@@ -196,7 +215,10 @@ export function ManagerLinkSection() {
       />
 
       {s && s.enabled && <>
-        <p role="status" className="text-sm text-slate-300">{s.message}</p>
+        {/* The fingerprint box below carries the same words. */}
+        {!(s.state === "confirm_fingerprint" && !s.fingerprint_changed) && (
+          <p role="status" className={"text-sm " + (s.fingerprint_changed ? "text-rose-200" : "text-slate-300")}>{s.message}</p>
+        )}
 
         {s.state === "needs_password" && (
           <a href={WEB_PASSWORD_LINK} className="self-start rounded-lg bg-blue-500/15 px-3 py-1.5 text-xs font-medium text-blue-400 transition-colors hover:bg-blue-500/25">
@@ -238,6 +260,28 @@ export function ManagerLinkSection() {
                 : "Enter your NAS's address, for example nas.local:10000."}
           </p>
         </div>
+
+        {s.state === "confirm_fingerprint" && s.check && (
+          <div className={"flex flex-col gap-2 rounded-lg border p-3 " + (s.fingerprint_changed ? "border-rose-500/40 bg-rose-500/10" : "border-amber-500/30 bg-amber-500/5")}>
+            <p className="text-sm font-semibold text-slate-100">Check this matches the fingerprint on Sentry Manager's Sentry USB page</p>
+            <p className="font-mono text-slate-200" aria-label={`Fingerprint ${s.check.display}`}>
+              <span className="text-2xl font-bold tracking-wider text-white">{s.check.first}</span>
+              <span className="mx-2 break-words text-xs text-slate-400">{s.check.middle}</span>
+              <span className="text-2xl font-bold tracking-wider text-white">{s.check.last}</span>
+            </p>
+            <p className="t-xs">Compare at least the large first and last groups. Read from {s.check.address}.</p>
+            <button type="button" disabled={busy}
+              onClick={() => void call("POST", "/api/manager-link/confirm", { fingerprint: s.check!.fingerprint })}
+              className="self-start rounded-lg bg-emerald-500/20 px-4 py-2 text-sm font-semibold text-emerald-200 transition-colors hover:bg-emerald-500/30 disabled:opacity-50">
+              It matches, pair
+            </button>
+            <p className="t-xs">If it doesn't match, don't pair: something else is answering at that address. Nothing has been sent to it.</p>
+          </div>
+        )}
+
+        {s.state === "check_failed" && s.check_error && (
+          <p className="t-xs">Last error: {s.check_error}</p>
+        )}
 
         {s.fingerprint_display && (
           <div className="flex flex-col gap-1">
