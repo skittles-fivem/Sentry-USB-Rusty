@@ -13,6 +13,7 @@ pub mod ifttt;
 pub mod matrix;
 pub mod ntfy;
 pub mod pushover;
+pub mod resolve;
 pub mod sentry_connect;
 pub mod signal;
 pub mod slack;
@@ -226,6 +227,9 @@ fn notify_client() -> &'static reqwest::Client {
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .connect_timeout(std::time::Duration::from_secs(10))
+            // Host names whose DNS answer is this machine or link-local are
+            // refused too, not just literal addresses (resolve.rs).
+            .dns_resolver(std::sync::Arc::new(resolve::NoLocalResolver))
             .redirect(reqwest::redirect::Policy::custom(|attempt| {
                 if attempt.previous().len() >= 5 {
                     attempt.error("too many redirects")
@@ -270,6 +274,7 @@ fn mobile_push_client() -> &'static reqwest::Client {
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .connect_timeout(std::time::Duration::from_secs(10))
+            .dns_resolver(std::sync::Arc::new(resolve::NoLocalResolver))
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("reqwest Client::build failed (TLS init?)")
@@ -621,5 +626,41 @@ mod redirect_tests {
         for u in ["https://discord.com/api", "http://192.168.1.5:8080/"] {
             assert!(!redirect_target_is_local(&reqwest::Url::parse(u).unwrap()), "{u}");
         }
+    }
+}
+
+#[cfg(test)]
+mod resolver_tests {
+    #[tokio::test]
+    async fn a_webhook_host_resolving_to_loopback_never_connects() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://localhost:{port}/api/system/reboot");
+        let r = super::webhook::send(super::notify_client(), &url, "t", "m").await;
+        assert!(r.is_err(), "the request must fail");
+        let e = format!("{:#}", r.unwrap_err());
+        assert!(e.contains("resolves only to this device"), "{e}");
+        assert!(listener.accept().is_err(), "nothing connected to the Pi itself");
+    }
+
+    #[tokio::test]
+    async fn a_literal_lan_address_still_works() {
+        // Literal addresses don't go through DNS; private LAN ones must keep
+        // working (Home Assistant on 192.168.x and the like). 127.0.0.1 is
+        // the reachable stand-in here: literals are checked by the URL
+        // rules, not the resolver.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf).await;
+            s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await.unwrap();
+        });
+        let url = format!("http://127.0.0.1:{port}/hook");
+        super::webhook::send(super::notify_client(), &url, "t", "m").await.expect("literal address");
+        server.await.unwrap();
     }
 }

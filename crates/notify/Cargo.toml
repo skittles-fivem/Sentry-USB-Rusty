@@ -15,13 +15,14 @@ ring = "0.17"
 hex = "0.4"
 urlencoding = "2"
 url = "2"
+# DNS lookups for the filtering resolver (resolve.rs); reqwest already uses tokio.
+tokio = { workspace = true }
 
 chrono = { workspace = true }
 
 sentryusb-config = { path = "../config", package = "sentryusb-config" }
 
 [dev-dependencies]
-tokio = { workspace = true }
 
 [lints]
 workspace = true
