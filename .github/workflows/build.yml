@@ -380,6 +380,7 @@ jobs:
           bash test/mounted-archive-ownership.test.sh
           bash test/diagnostics-capture.test.sh
           bash test/ap-profile.test.sh
+          bash test/keep-awake-webhook-pin.test.sh
           python3 test/networkd-ap.test.py
           python3 test/ble-auth.test.py
           python3 test/avahi-service.test.py
