@@ -14,31 +14,17 @@ export interface ManagerLinkStatus {
   paired: boolean
   pairing: boolean
   pairing_seconds_left: number
+  /** The pinned fingerprint, for reference only: nothing has to be compared. */
   fingerprint: string | null
   fingerprint_display: string | null
-  /** Before the first pairing: the fingerprint read at Manager's address,
-   * for the owner to compare with Manager's before anything is sent. */
-  check?: FingerprintCheck | null
-  check_error?: string | null
-  /** The confirmed fingerprint wasn't the one presented when pairing. */
-  fingerprint_changed?: boolean
   state:
     | "off" | "needs_address" | "needs_password" | "update_needed" | "cert_changed"
-    | "checking" | "check_failed" | "confirm_fingerprint"
-    | "pairing" | "pairing_expired" | "connected" | "not_paired" | "connecting" | "retrying"
+    | "needs_pairing" | "pairing" | "pair_failed"
+    | "connected" | "not_paired" | "connecting" | "retrying"
   message: string
   connected: boolean
   last_error: string | null
   last_connected: number | null
-}
-
-export interface FingerprintCheck {
-  fingerprint: string
-  display: string
-  address: string
-  first: string
-  middle: string
-  last: string
 }
 
 const STATE_LABEL: Record<ManagerLinkStatus["state"], { label: string; tone: string }> = {
@@ -47,11 +33,9 @@ const STATE_LABEL: Record<ManagerLinkStatus["state"], { label: string; tone: str
   needs_password: { label: "Not set up", tone: "text-amber-300" },
   update_needed: { label: "Update needed", tone: "text-amber-300" },
   cert_changed: { label: "Certificate changed", tone: "text-rose-300" },
-  checking: { label: "Checking…", tone: "text-blue-300" },
-  check_failed: { label: "Can't reach Manager", tone: "text-amber-300" },
-  confirm_fingerprint: { label: "Check fingerprint", tone: "text-amber-300" },
-  pairing: { label: "Waiting to pair", tone: "text-blue-300" },
-  pairing_expired: { label: "Not paired", tone: "text-amber-300" },
+  needs_pairing: { label: "Not paired", tone: "text-amber-300" },
+  pairing: { label: "Pairing…", tone: "text-blue-300" },
+  pair_failed: { label: "Pairing failed", tone: "text-rose-300" },
   connected: { label: "Connected", tone: "text-emerald-300" },
   not_paired: { label: "Not paired", tone: "text-amber-300" },
   connecting: { label: "Connecting…", tone: "text-blue-300" },
@@ -115,6 +99,8 @@ export function ManagerLinkSection() {
   const [status, setStatus] = useState<ManagerLinkStatus | null>(null)
   // What the user is typing; null shows the saved address.
   const [draft, setDraft] = useState<string | null>(null)
+  // The pairing code as typed. Only ever sent with Pair, then cleared.
+  const [code, setCode] = useState("")
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [confirmUnpair, setConfirmUnpair] = useState(false)
@@ -191,6 +177,13 @@ export function ManagerLinkSection() {
   const address = draft ?? s?.address ?? ""
   const addressChanged = !!s && draft !== null && draft.trim() !== s.address
   const lastSeen = s && !s.connected ? ago(s.last_connected) : null
+  // The code field shows while not paired (or Manager forgot this Pi).
+  const canPair = !!s && s.web_password_set && !s.pairing && (!s.paired || s.state === "not_paired")
+
+  async function pair() {
+    const ok = await call("POST", "/api/manager-link/pair", { address: address.trim(), code })
+    if (ok) { setCode(""); setDraft(null) }
+  }
 
   return (
     <PrefCard
@@ -201,7 +194,7 @@ export function ManagerLinkSection() {
       help={<InfoButton title="Sentry Manager">
         <p>Sentry Manager runs on your NAS. When this is on, this Sentry USB connects out to Manager whenever it's on your home network, so you can see its status, change settings, read logs and install updates from Manager.</p>
         <p>Nothing on this Sentry USB is opened to the network. The link is encrypted, and both sides prove who they are on every connection.</p>
-        <p>Pairing uses this Sentry USB's web username and password once. Manager never stores the password; afterwards both sides use a random key.</p>
+        <p>Pairing uses this Sentry USB's web username and password once, together with a one-time pairing code that Manager shows and you type here. The code never crosses the network. Manager never stores the password; afterwards both sides use a random key.</p>
         <p>Over the link, Manager can't open a terminal, read or change files, see passwords, change the web login, resize drives, or switch updates to another source.</p>
       </InfoButton>}
     >
@@ -214,10 +207,7 @@ export function ManagerLinkSection() {
       />
 
       {s && s.enabled && <>
-        {/* The fingerprint box below carries the same words. */}
-        {!(s.state === "confirm_fingerprint" && !s.fingerprint_changed) && (
-          <p role="status" className={"text-sm " + (s.fingerprint_changed ? "text-rose-200" : "text-slate-300")}>{s.message}</p>
-        )}
+        <p role="status" className={"text-sm " + (s.state === "pair_failed" || s.state === "cert_changed" ? "text-rose-200" : "text-slate-300")}>{s.message}</p>
 
         {s.state === "needs_password" && (
           <a href={WEB_PASSWORD_LINK} className="self-start rounded-lg bg-blue-500/15 px-3 py-1.5 text-xs font-medium text-blue-400 transition-colors hover:bg-blue-500/25">
@@ -229,6 +219,10 @@ export function ManagerLinkSection() {
           <p className="t-xs">Last error: {s.last_error}{lastSeen ? ` · last connected ${lastSeen}` : ""}</p>
         )}
 
+        {s.paired && s.address && (
+          <p className="text-sm text-slate-200">Paired with Sentry Manager at <span className="font-mono">{s.address}</span></p>
+        )}
+
         <div className="flex flex-col gap-1">
           <label htmlFor="manager-address" className="t-md">Manager address</label>
           <div className="flex items-center gap-2">
@@ -236,6 +230,7 @@ export function ManagerLinkSection() {
               id="manager-address"
               type="text"
               inputMode="url"
+              autoComplete="off"
               spellCheck={false}
               value={address}
               disabled={busy}
@@ -243,7 +238,7 @@ export function ManagerLinkSection() {
               onChange={e => setDraft(e.target.value)}
               className="min-w-0 flex-1 rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 font-mono text-xs text-slate-100 outline-none transition focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/25 disabled:opacity-50"
             />
-            {addressChanged && (
+            {addressChanged && !canPair && (
               <button type="button" disabled={busy}
                 onClick={() => void call("PUT", "/api/manager-link", { enabled: s.enabled, address: address.trim() }).then(ok => { if (ok) setDraft(null) })}
                 className="shrink-0 rounded-lg bg-blue-500/15 px-3 py-1.5 text-[11px] font-medium text-blue-300 hover:bg-blue-500/25 disabled:opacity-50">
@@ -252,50 +247,49 @@ export function ManagerLinkSection() {
             )}
           </div>
           <p className="t-xs">
-            The address of the computer running Sentry Manager, with port 10000, for example 192.168.1.5:10000 or nas.local:10000.
+            The computer running Sentry Manager, with port 10000, for example 192.168.1.5:10000 or nas.local:10000.
           </p>
         </div>
 
-        {s.state === "confirm_fingerprint" && s.check && (
-          <div className={"flex flex-col gap-2 rounded-lg border p-3 " + (s.fingerprint_changed ? "border-rose-500/40 bg-rose-500/10" : "border-amber-500/30 bg-amber-500/5")}>
-            <p className="text-sm font-semibold text-slate-100">Check this matches the fingerprint on Sentry Manager's Sentry USB page</p>
-            <p className="font-mono text-slate-200" aria-label={`Fingerprint ${s.check.display}`}>
-              <span className="text-2xl font-bold tracking-wider text-white">{s.check.first}</span>
-              <span className="mx-2 break-words text-xs text-slate-400">{s.check.middle}</span>
-              <span className="text-2xl font-bold tracking-wider text-white">{s.check.last}</span>
+        {canPair && (
+          <form className="flex flex-col gap-1" onSubmit={e => { e.preventDefault(); void pair() }}>
+            <label htmlFor="manager-code" className="t-md">Pairing code</label>
+            <div className="flex items-center gap-2">
+              <input
+                id="manager-code"
+                type="text"
+                autoComplete="off"
+                autoCapitalize="characters"
+                spellCheck={false}
+                maxLength={32}
+                value={code}
+                disabled={busy}
+                placeholder="K7QP-M2XD-9WRT"
+                onChange={e => setCode(e.target.value)}
+                className="min-w-0 flex-1 rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 font-mono text-sm uppercase tracking-wider text-slate-100 outline-none transition focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/25 disabled:opacity-50"
+              />
+              <button type="submit" disabled={busy || !code.trim() || !address.trim()}
+                className="shrink-0 rounded-lg bg-emerald-500/20 px-4 py-1.5 text-sm font-semibold text-emerald-200 transition-colors hover:bg-emerald-500/30 disabled:opacity-50">
+                Pair
+              </button>
+            </div>
+            <p className="t-xs">
+              In Sentry Manager, open Settings → Sentry USB → Add a Sentry USB, enter this Sentry USB's web username and password, and press Start pairing. Type the code it shows here; dashes and lower case are fine.
             </p>
-            <p className="t-xs">Compare at least the large first and last groups. Read from {s.check.address}.</p>
-            <button type="button" disabled={busy}
-              onClick={() => void call("POST", "/api/manager-link/confirm", { fingerprint: s.check!.fingerprint })}
-              className="self-start rounded-lg bg-emerald-500/20 px-4 py-2 text-sm font-semibold text-emerald-200 transition-colors hover:bg-emerald-500/30 disabled:opacity-50">
-              It matches, pair
-            </button>
-            <p className="t-xs">If it doesn't match, don't pair: something else is answering at that address. Nothing has been sent to it.</p>
-          </div>
-        )}
-
-        {s.state === "check_failed" && s.check_error && (
-          <p className="t-xs">Last error: {s.check_error}</p>
+          </form>
         )}
 
         {s.fingerprint_display && (
           <div className="flex flex-col gap-1">
-            <span className="t-md">Manager's fingerprint</span>
-            <code className="break-words rounded-lg border border-white/10 bg-white/5 px-3 py-2 font-mono text-xs leading-relaxed text-slate-200">
+            <span className="t-xs">Sentry Manager's fingerprint, for reference</span>
+            <code className="break-words font-mono text-[11px] leading-relaxed text-slate-400">
               {s.fingerprint_display}
             </code>
-            <p className="t-xs">Check that Sentry Manager shows the same fingerprint for this Sentry USB.</p>
           </div>
         )}
 
-        <div className="flex flex-wrap gap-2">
-          {s.web_password_set && !s.pairing && (s.state === "pairing_expired" || s.state === "not_paired" || s.state === "retrying" || s.state === "connected") && (
-            <button type="button" disabled={busy} onClick={() => void call("POST", "/api/manager-link/pair")}
-              className="rounded-lg bg-blue-500/15 px-3 py-1.5 text-xs font-medium text-blue-400 transition-colors hover:bg-blue-500/25 disabled:opacity-50">
-              {s.paired ? "Pair again" : "Pair"}
-            </button>
-          )}
-          {(s.paired || s.fingerprint) && (
+        {s.paired && (
+          <div className="flex flex-wrap gap-2">
             <button type="button" disabled={busy}
               onClick={() => {
                 if (!confirmUnpair) { setConfirmUnpair(true); return }
@@ -305,8 +299,8 @@ export function ManagerLinkSection() {
               className="rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-1.5 text-xs font-medium text-rose-300 transition-colors hover:bg-rose-500/20 disabled:opacity-50">
               {confirmUnpair ? "Confirm unpair" : "Unpair"}
             </button>
-          )}
-        </div>
+          </div>
+        )}
       </>}
 
       {log && log.warnings.length > 0 && (
