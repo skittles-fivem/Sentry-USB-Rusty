@@ -20,7 +20,8 @@ The **Pi connects out to Manager**; Manager never connects to the Pi:
 - The Pi is only home now and then, gets a new address from DHCP, and has no
   HTTPS of its own. Its web UI is plain HTTP, and the owner's rule is
   "passwords only over HTTPS".
-- The Pi already knows where the NAS is, from its archive server setting.
+- The owner enters Manager's address on the Pi once; nothing is filled in
+  automatically, because Manager need not run on the archive server.
 - No port is opened on the Pi, and the Pi's own web login is never used over
   the network by Manager.
 
@@ -49,8 +50,8 @@ sends it over the link.
 
 1. **On the Pi, under Settings → Sentry Manager:**
    - Turn on "Managed by Sentry Manager".
-   - Enter Manager's address. It defaults to the archive server's host, port
-     10000.
+   - Enter Manager's address: the computer it runs on, with port 10000.
+     Nothing is filled in automatically and the network is never scanned.
    - A Pi with no web password set cannot pair; the UI says to set one first.
 2. **In Manager, under Settings → Sentry USB → Add a Sentry USB:**
    - Enter a name, plus the Pi's web username and password.

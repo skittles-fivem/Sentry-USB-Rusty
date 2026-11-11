@@ -130,9 +130,10 @@ async fn flip_the_switch_pair_and_unpair() {
         .route("/api/status", axum::routing::get(|| async { axum::Json(json!({"ok": true})) }));
     sentryusb_manager_link::spawn(router, "v-test".into());
 
-    // Off by default; the address is filled in from the archive server.
+    // Off by default, and no address is filled in from the archive server.
     let s = wait_for("off").await;
-    assert_eq!(s["default_address"], "127.0.0.1:10000");
+    assert!(s.get("default_address").is_none());
+    assert!(s["effective_address"].is_null());
     assert_eq!(s["web_password_set"], true);
 
     // The one switch (plus the test's port instead of 10000). With no pin

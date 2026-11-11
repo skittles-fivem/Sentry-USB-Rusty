@@ -5,7 +5,7 @@ import { Window } from 'happy-dom'
 import { ManagerLinkSection, WEB_PASSWORD_LINK, type ManagerLinkStatus } from './ManagerLinkSection.tsx'
 
 const base: ManagerLinkStatus = {
-  enabled: false, address: '', default_address: 'nas.local:10000', effective_address: 'nas.local:10000',
+  enabled: false, address: 'nas.local:10000', effective_address: 'nas.local:10000',
   web_password_set: true, paired: false, pairing: false, pairing_seconds_left: 0,
   fingerprint: null, fingerprint_display: null, state: 'off', message: 'Off.', connected: false,
   last_error: null, last_connected: null,
@@ -55,10 +55,11 @@ test('one switch turns the link on with the automatic address', async () => {
     const toggle = r.container.querySelector('input[type="checkbox"]') as unknown as HTMLInputElement
     assert.equal(toggle.checked, false)
     await act(async () => toggle.click())
-    assert.deepEqual(r.writes[0], { method: 'PUT', url: '/api/manager-link', body: { enabled: true, address: '' } })
+    assert.deepEqual(r.writes[0], { method: 'PUT', url: '/api/manager-link', body: { enabled: true, address: 'nas.local:10000' } })
     assert.ok(r.container.textContent.includes('Waiting for Sentry Manager'))
     assert.ok(r.container.textContent.includes('Waiting to pair'))
-    assert.ok(r.container.textContent.includes('Automatic: nas.local:10000'))
+    assert.ok(r.container.textContent.includes('with port 10000'))
+    assert.ok(!r.container.textContent.includes('Automatic'), 'nothing is filled in automatically')
   } finally { await r.cleanup() }
 })
 

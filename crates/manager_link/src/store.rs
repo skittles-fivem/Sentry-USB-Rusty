@@ -6,7 +6,7 @@
 //!   the web UI shows and exports.
 //! - On/off and Manager's address: sentryusb.conf, as
 //!   `SENTRY_MANAGER_ENABLED` and `SENTRY_MANAGER_ADDRESS` (empty means
-//!   "the archive server's host, port 10000").
+//!   not set up: nothing is filled in automatically).
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -146,10 +146,10 @@ fn remount_rw() {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Settings {
     pub enabled: bool,
-    /// What the user typed; empty means the default.
+    /// Manager's address as the user typed it; empty means not set up.
+    /// Nothing is filled in automatically: setups differ (Manager need not
+    /// run on the archive server).
     pub address: String,
-    /// The archive server's host with port 10000, if one is set up.
-    pub default_address: Option<String>,
     pub web_username: String,
     pub web_password_set: bool,
 }
@@ -160,16 +160,15 @@ impl Settings {
         Settings {
             enabled: matches!(get(ENABLED_KEY).to_ascii_lowercase().as_str(), "true" | "yes" | "1" | "on"),
             address: get(ADDRESS_KEY),
-            default_address: default_address(active),
             web_username: active.get("WEB_USERNAME").cloned().unwrap_or_default(),
             web_password_set: !get("WEB_USERNAME").is_empty()
                 && active.get("WEB_PASSWORD").is_some_and(|p| !p.is_empty()),
         }
     }
 
-    /// The address to connect to: what the user typed, else the default.
+    /// The address to connect to: what the user typed, or none.
     pub fn effective_address(&self) -> Option<String> {
-        if self.address.is_empty() { self.default_address.clone() } else { Some(self.address.clone()) }
+        if self.address.is_empty() { None } else { Some(self.address.clone()) }
     }
 }
 
@@ -178,22 +177,6 @@ pub fn read_config() -> HashMap<String, String> {
     sentryusb_config::parse_file(sentryusb_config::find_config_path())
         .map(|(a, _)| a)
         .unwrap_or_default()
-}
-
-/// The archive server's host on port 10000. rclone remotes are not hosts.
-pub fn default_address(active: &HashMap<String, String>) -> Option<String> {
-    let system = active.get("ARCHIVE_SYSTEM").map(|s| s.trim()).unwrap_or("");
-    if system == "rclone" || system == "none" {
-        return None;
-    }
-    let server = active
-        .get("ARCHIVE_SERVER")
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| active.get("RSYNC_SERVER"))
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())?;
-    let (host, _) = split_host_port(server).ok()?;
-    Some(join_host_port(&host, DEFAULT_PORT))
 }
 
 fn join_host_port(host: &str, port: u16) -> String {
@@ -276,16 +259,12 @@ mod tests {
     }
 
     #[test]
-    fn default_address_comes_from_the_archive_server() {
-        assert_eq!(default_address(&cfg(&[("ARCHIVE_SERVER", "nas.local")])).as_deref(), Some("nas.local:10000"));
-        assert_eq!(default_address(&cfg(&[("ARCHIVE_SERVER", "192.168.1.5")])).as_deref(), Some("192.168.1.5:10000"));
-        assert_eq!(
-            default_address(&cfg(&[("ARCHIVE_SYSTEM", "rsync"), ("RSYNC_SERVER", "NAS")])).as_deref(),
-            Some("nas:10000")
-        );
-        assert_eq!(default_address(&cfg(&[("ARCHIVE_SYSTEM", "rclone"), ("ARCHIVE_SERVER", "x")])), None);
-        assert_eq!(default_address(&cfg(&[])), None);
-        assert_eq!(default_address(&cfg(&[("ARCHIVE_SERVER", "fd00::5")])).as_deref(), Some("[fd00::5]:10000"));
+    fn no_address_is_filled_in_automatically() {
+        // the archive server is not taken as Manager's address: setups differ
+        let s = Settings::from_config(&cfg(&[("ARCHIVE_SERVER", "nas.local"), ("SENTRY_MANAGER_ENABLED", "true")]));
+        assert_eq!(s.effective_address(), None);
+        let s = Settings::from_config(&cfg(&[("ARCHIVE_SERVER", "nas.local"), ("SENTRY_MANAGER_ADDRESS", "192.168.1.9:10000")]));
+        assert_eq!(s.effective_address().as_deref(), Some("192.168.1.9:10000"));
     }
 
     #[test]
@@ -307,7 +286,7 @@ mod tests {
             ("WEB_PASSWORD", "pw"),
         ]));
         assert!(s.enabled && s.web_password_set);
-        assert_eq!(s.effective_address().as_deref(), Some("nas:10000"));
+        assert_eq!(s.effective_address(), None, "the archive server is never taken as the address");
         let s = Settings::from_config(&cfg(&[("WEB_USERNAME", "admin")]));
         assert!(!s.enabled && !s.web_password_set);
     }

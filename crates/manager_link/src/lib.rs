@@ -508,7 +508,7 @@ pub fn status_json() -> Value {
     let (state, message): (&str, String) = if !settings.enabled {
         ("off", "Off. Turn this on to let Sentry Manager on your NAS see and manage this Sentry USB.".into())
     } else if effective.is_none() {
-        ("needs_address", "Enter Sentry Manager's address. It couldn't be filled in automatically because no archive server is set up.".into())
+        ("needs_address", "Enter Sentry Manager's address: the computer it runs on, with port 10000 (for example 192.168.1.5:10000).".into())
     } else if !paired && !settings.web_password_set {
         ("needs_password", "Set a web password first. Sentry Manager pairs using this Sentry USB's web username and password.".into())
     } else if rt.version_mismatch {
@@ -553,7 +553,6 @@ pub fn status_json() -> Value {
     json!({
         "enabled": settings.enabled,
         "address": settings.address,
-        "default_address": settings.default_address,
         "effective_address": effective,
         "web_password_set": settings.web_password_set,
         "paired": paired,

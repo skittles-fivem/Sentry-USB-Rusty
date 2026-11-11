@@ -9,7 +9,6 @@ import { groupFingerprint } from "./managerLink"
 export interface ManagerLinkStatus {
   enabled: boolean
   address: string
-  default_address: string | null
   effective_address: string | null
   web_password_set: boolean
   paired: boolean
@@ -240,7 +239,7 @@ export function ManagerLinkSection() {
               spellCheck={false}
               value={address}
               disabled={busy}
-              placeholder={s.default_address ?? "nas.local:10000"}
+              placeholder="192.168.1.5:10000"
               onChange={e => setDraft(e.target.value)}
               className="min-w-0 flex-1 rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 font-mono text-xs text-slate-100 outline-none transition focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/25 disabled:opacity-50"
             />
@@ -253,11 +252,7 @@ export function ManagerLinkSection() {
             )}
           </div>
           <p className="t-xs">
-            {s.address
-              ? "Leave empty to use your archive server's address."
-              : s.default_address
-                ? `Automatic: ${s.default_address} (your archive server, port 10000).`
-                : "Enter your NAS's address, for example nas.local:10000."}
+            The address of the computer running Sentry Manager, with port 10000, for example 192.168.1.5:10000 or nas.local:10000.
           </p>
         </div>
 
