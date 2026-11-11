@@ -36,6 +36,8 @@ pub struct Server {
     slots: Arc<Semaphore>,
     /// Fired after a successful write so fresh status goes out at once.
     pub changed: Arc<Notify>,
+    /// The car object last sent, without its reading times (car::signature).
+    last_car: Mutex<Option<Value>>,
 }
 
 fn text(v: Value) -> Message {
@@ -59,6 +61,7 @@ impl Server {
             in_flight: Mutex::new(HashMap::new()),
             slots: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
             changed: Arc::new(Notify::new()),
+            last_car: Mutex::new(None),
         })
     }
 
@@ -110,8 +113,9 @@ impl Server {
     }
 
     /// `GET /api/status`, in-process.
-    pub async fn status_body(&self) -> Option<Value> {
-        let req = Request::get("/api/status").body(Body::empty()).expect("static request");
+    /// One GET against the router, its JSON answer (None on any failure).
+    async fn get_json(&self, path: &str) -> Option<Value> {
+        let req = Request::get(path).body(Body::empty()).ok()?;
         let Ok(Ok(resp)) = tokio::time::timeout(HANDLER_TIMEOUT, self.router.clone().oneshot(req)).await else {
             return None;
         };
@@ -120,6 +124,53 @@ impl Server {
         }
         let bytes = axum::body::to_bytes(resp.into_body(), CHUNK).await.ok()?;
         serde_json::from_slice::<Value>(&bytes).ok()
+    }
+
+    /// GET /api/status plus the `car` object (contract 4, "The car") when
+    /// any car reading is known. Remembers the car sent, for car_changed.
+    pub async fn status_body(&self) -> Option<Value> {
+        let mut body = self.get_json("/api/status").await?;
+        let car = self.car_body().await;
+        if let (Some(obj), Some(car)) = (body.as_object_mut(), car.as_ref()) {
+            obj.insert("car".into(), car.clone());
+        }
+        if let Ok(mut last) = self.last_car.lock() {
+            *last = car.as_ref().map(crate::car::signature);
+        }
+        Some(body)
+    }
+
+    /// The car object from the Pi's own telemetry answers and settings.
+    pub async fn car_body(&self) -> Option<Value> {
+        let sample = self.get_json("/api/system/ble-latest-sample").await?;
+        let charge = self.get_json("/api/charging/current").await;
+        let last_drive_end = self
+            .get_json("/api/drives/stats")
+            .await
+            .and_then(|s| s.get("latest_drive_end").and_then(Value::as_str).and_then(crate::car::parse_local_time));
+        let config = tokio::task::spawn_blocking(|| {
+            sentryusb_config::parse_file(sentryusb_config::find_config_path()).map(|(active, _)| active).unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        crate::car::build(&crate::car::Inputs {
+            sample: Some(&sample),
+            charge: charge.as_ref(),
+            last_drive_end,
+            config: &config,
+            now,
+        })
+    }
+
+    /// True when the car's readings differ from the last status sent
+    /// (a newer reading of the same values is not a change).
+    pub async fn car_changed(&self) -> bool {
+        let now = self.car_body().await.as_ref().map(crate::car::signature);
+        self.last_car.lock().map(|last| *last != now).unwrap_or(false)
     }
 
     /// Sends `{"t":"status","body":<GET /api/status>}`.
@@ -508,5 +559,38 @@ mod tests {
         assert!(t.as_str().contains("429"));
         // A duplicate id of a running request is ignored.
         s.abort_all();
+    }
+
+    #[tokio::test]
+    async fn status_carries_the_car_and_tells_a_change() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static PCT: AtomicU64 = AtomicU64::new(80);
+        let r = axum::Router::new()
+            .route("/api/status", get(|| async { axum::Json(json!({"uptime": "5"})) }))
+            .route(
+                "/api/system/ble-latest-sample",
+                get(|| async {
+                    axum::Json(json!({"ts": 1, "battery_pct": PCT.load(Ordering::SeqCst) as f64,
+                        "location_name": "Home", "field_secs_ago": {"battery_pct": 3}}))
+                }),
+            );
+        let s = Server::new(r);
+        let body = s.status_body().await.unwrap();
+        assert_eq!(body["uptime"], "5");
+        assert_eq!(body["car"]["battery"]["pct"], 80.0);
+        assert!(body["car"].get("location_name").is_none() && !body.to_string().contains("Home"));
+        // the same values read again are no change; a new value is
+        assert!(!s.car_changed().await);
+        PCT.store(79, Ordering::SeqCst);
+        assert!(s.car_changed().await);
+        s.status_body().await.unwrap();
+        assert!(!s.car_changed().await);
+
+        // no car data: no car key, and the status still goes out
+        let r = axum::Router::new()
+            .route("/api/status", get(|| async { axum::Json(json!({"uptime": "5"})) }))
+            .route("/api/system/ble-latest-sample", get(|| async { axum::Json(json!({"ts": null})) }));
+        let body = Server::new(r).status_body().await.unwrap();
+        assert!(body.get("car").is_none());
     }
 }

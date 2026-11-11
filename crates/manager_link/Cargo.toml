@@ -20,6 +20,7 @@ futures-util = "0.3"
 ring = "0.17"
 hex = "0.4"
 base64 = "0.22"
+chrono = { workspace = true }
 # rustls on ring, the same stack reqwest uses here; no OpenSSL.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }

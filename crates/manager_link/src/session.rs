@@ -28,6 +28,9 @@ use crate::store;
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Ping and status-push interval.
 pub const PING_INTERVAL: Duration = Duration::from_secs(30);
+/// How often the car's readings are checked; a change is pushed at once,
+/// so this is also the most often a car change sends status.
+pub const CAR_CHECK_INTERVAL: Duration = Duration::from_secs(15);
 /// A connection silent this long is closed.
 pub const SILENCE_TIMEOUT: Duration = Duration::from_secs(90);
 /// A single outgoing frame that can't be written in this time ends the link.
@@ -371,6 +374,8 @@ pub async fn run(
     }
     let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + PING_INTERVAL, PING_INTERVAL);
     let mut silence = Box::pin(tokio::time::sleep(SILENCE_TIMEOUT));
+    let mut car_check = tokio::time::interval_at(tokio::time::Instant::now() + CAR_CHECK_INTERVAL, CAR_CHECK_INTERVAL);
+    car_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let changed = server.changed.clone();
     let reason = loop {
         tokio::select! {
@@ -403,6 +408,11 @@ pub async fn run(
             }
             _ = changed.notified() => {
                 server.push_status(&tx).await;
+            }
+            _ = car_check.tick() => {
+                if server.car_changed().await {
+                    server.push_status(&tx).await;
+                }
             }
             _ = &mut silence => break "no answer from Sentry Manager for 90 seconds".into(),
             _ = stop.changed() => {

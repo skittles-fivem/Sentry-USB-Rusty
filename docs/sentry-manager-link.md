@@ -258,10 +258,61 @@ Test vectors are in Appendix A.
 **Status pushed by the Pi, without being asked:**
 
 - Every 30 seconds while connected, and at once after a change, the Pi sends
-  `{"t":"status","body":<the same JSON as GET /api/status>}`. "A change" is
-  any successful non-GET request over the link.
+  `{"t":"status","body":<the same JSON as GET /api/status, plus "car">}`.
+  "A change" is any successful non-GET request over the link, or a change in
+  the car's readings (below).
 - Manager keeps the last one, with its time, so the page shows status
   instantly and a "last seen" time when the Pi is away.
+
+### The car (`car` in the status body)
+
+Sentry USB test.31 and later add a `car` object: the car's battery,
+temperatures, tires and whether it is parked, from the Tesla BLE telemetry the
+Pi already reads (the same readings as its own dashboard's car card). It is
+only what the Pi has: there is no new request to the car, and never the car's
+place, position, odometer or VIN.
+
+```json
+"car": {
+  "battery":  {"pct": 89, "charging": false, "at": 1762800000},
+  "interior": {"c": 9.4, "at": 1762800000},
+  "exterior": {"c": 7.8, "at": 1762799940},
+  "tires": {
+    "fl": {"kpa": 290.3, "at": 1762792800}, "fr": {"kpa": 289.6, "at": 1762792800},
+    "rl": {"kpa": 288.9, "at": 1762771200}, "rr": {"kpa": 291.6, "at": 1762771200},
+    "state": "optimal"
+  },
+  "drive": {"state": "parked", "since": 1762791000, "at": 1762799990},
+  "units": {"temp": "F", "pressure": "psi"}
+}
+```
+
+| Field | Type, unit, range | Notes |
+|---|---|---|
+| `battery.pct` | number, %, 0 to 100 | state of charge |
+| `battery.charging` | boolean, optional | true while charging; left out when the Pi doesn't know |
+| `interior.c`, `exterior.c` | number, °C, -60 to 100 inside, -70 to 70 outside | one decimal |
+| `tires.fl`, `.fr`, `.rl`, `.rr` | `{kpa}`: number, kPa, 0 to 1000 | front left, front right, rear left, rear right; one decimal (the Pi reads psi: kPa = psi × 6.894757) |
+| `tires.state` | `"optimal"`, `"check"` or `"unsafe"`, optional | the worst tire against the owner's bands on the Pi (`TIRE_PSI_BANDS`, default 28, 36, 45, 50 psi), as the Pi's dashboard shows it ("Optimal", "Check tires", "Unsafe") |
+| `drive.state` | `"parked"` or `"driving"` | driving: a gear reading at most 2 minutes old says D, R or N; parked: it says P, or there is none and a drive has ended |
+| `drive.since` | integer, Unix seconds, optional | parked: when the last drive ended |
+| `units.temp`, `units.pressure` | `"F"`/`"C"`, `"psi"`/`"bar"` | how the Pi's own dashboard shows them (its TEMPERATURE_UNIT and PRESSURE_UNIT); display only, the values above stay °C and kPa |
+| `at` (in each reading) | integer, Unix seconds, optional | when that reading was taken; for a tire, when the car last heard its sensor (parked, the sensors sleep and the car keeps the last pressure) |
+
+- **Everything is optional.** A reading the Pi doesn't have is left out, and a
+  Pi with no reading at all (no Tesla BLE set up) sends no `car`.
+- **How often:** with every status push (30 s), and the Pi checks the readings
+  every 15 s and pushes status at once when a value changed (a newer reading
+  of the same value is not a change). So a car change sends at most one
+  extra status every 15 s.
+- **Manager checks it** (server/sentryUsbCar.js): only the keys above are
+  kept, each with its type and range; a reading with a wrong type, an
+  out-of-range value or a bad time (before 2017, or more than a day ahead
+  of Manager's clock) is dropped, the others are kept; a `car` with no valid
+  reading left is not kept. It is stored with the rest of the status and
+  shown on the Status tab's Car card to every signed-in account, watch-only
+  ones included. Manager has no unit settings of its own, so the card uses
+  `units`, else °F and psi.
 
 ## 5. The allowlist (Pi side, deny by default)
 
@@ -397,6 +448,13 @@ normal link the next time the Pi connects, using the same allowlisted routes.
   and re-runs setup if asked. A change made on the Pi meanwhile to another
   field is not overwritten. If the same field was changed on the Pi too,
   Manager skips that field and reports it.
+- **Never a password:** password changes need the Sentry USB online. A queued
+  change refuses every secret field (the list Manager masks, section 5) and
+  every field whose secret must be sent with it (5a: a new SSID needs
+  WIFIPASS, a new archive server SHARE_PASSWORD). A mix saved while the Pi is
+  away queues the other fields and leaves those untouched on the page, with
+  "Password changes need the Sentry USB online. Save them while it's
+  connected." Nothing secret is stored in the queue.
 - **Order and timing:**
   - Actions run in the order queued, one at a time, after the handshake and
     the first status push.
@@ -569,3 +627,160 @@ alphabet) and `K7QP_M2XD_9WRT` are invalid.
 **Fingerprint display:** both UIs show fingerprints as 16 groups of 4
 uppercase hex digits, for example
 `61EC B687 2005 D76F 9C85 B9AB EE8C 635C 4133 8110 3BF5 DF25 1EC2 63FC 331D 6C27`.
+
+## Sentry Manager's side: details both sides must match
+
+What Manager does where the sections above leave a choice (server/sentryUsbLink.js,
+server/sentryUsbQueue.js, server/sentryUsbAudit.js, web/sentryUsbLink.js).
+
+**Using it.** Every interface has a **Sentry USB** page (in the navigation next
+to Health): the guided "Add a Sentry USB" steps, the pairing code (large, in
+three groups, with a copy button and the countdown) and the reason when pairing
+fails ("Wrong pairing code or password", the same for both; "Pairing window
+expired"; "The Sentry USB needs updating"), the device list (online, or away with when it was last
+seen), and per device the tabs Status, Settings, Diagnostics, Logs, Updates,
+Actions, Snapshots, Backups, Waiting for the Pi, Security log, and Name and unpair.
+While a Pi is away, Update, Reboot, Sync, Diagnostics and Backup become
+"when home" buttons, and Settings offers "Save and apply when home".
+
+**Encodings.** Appendix A's vectors, P and the normalization cases
+included, are checked by Manager's `test/sentryUsbLink.test.js`.
+
+- `fp` is the SHA-256 of the DER certificate the device port served on *that*
+  TLS connection, as **64 lowercase hex digits, no colons**. People see it as
+  16 groups of 4 upper-case hex digits (Appendix A), in four rows.
+- `nonce`s are 64 lowercase hex digits. Manager refuses a Pi nonce equal to its own.
+- `proof` is 64 lowercase hex digits; the HMAC key `S` is the raw 32 bytes
+  (P in pair mode, or the link key decoded from hex), and the message is UTF-8.
+- K: password and `"sentryusb-link|" + username` as UTF-8 bytes, exactly as
+  typed: nothing is trimmed or normalized.
+- `id`: Manager accepts 8 to 128 characters of `A-Z a-z 0-9 _ -` (the Pi's are
+  32 lowercase hex). Its request ids are 24 lowercase hex digits.
+- The link key is 32 random bytes, never all zero.
+- An `end` frame with `"error"` fails that request (502).
+- `v` must be a number; anything else is `bad message`.
+
+**`denied` reasons** (the `why` Manager sends): `not paired` (key mode: unknown
+id or wrong key), `wrong password` (pair mode: the proof did not match P, so a wrong
+pairing code or a wrong password, which are not told apart; it also covers a
+man in the middle with another certificate; the name stays as in v1), `no pairing open`,
+`version`, `timeout` (no `auth` within 10 s), `bad message`. After `denied`
+Manager closes with WebSocket code 1008.
+
+**Close codes.** 4000 replaced by a newer connection for the same id; 4001
+unpaired (from either side: a Pi unpaired on itself closes with 4001, and
+Manager then forgets it, its queue too, logs it and raises a notice); 1001 silent for 90 s or Manager shutting down; 1008 denied or a
+protocol violation; 1009 a frame over the limit; 1002 an unmasked or malformed
+frame; 1003 a binary frame; 1007 text that is not UTF-8.
+
+**Liveness.** Manager sends a WebSocket **ping control frame** every 30 s and
+closes a connection it has heard nothing from (no frame at all) for 90 s. It
+answers pings with pongs, and also answers a JSON `{"t":"ping"}` with
+`{"t":"pong"}`.
+
+**Limits.** Before the handshake a frame may be at most 16 KiB; after it 2 MiB
+(a 1 MiB chunk in base64 inside JSON fits). Sizes are checked from the frame
+header, before the payload is read. A chunk decoding to more than 1 MiB, chunks
+out of order, or a second handshake closes the link (1008); more than 20 frames
+answering request ids Manager never sent close it too. An answer over 64 MiB
+fails that request (502). Statuses over 256 KiB are ignored. At most 6
+connections per address and 256 in all on the device port (shared with the CAN
+Bridge), and a connection that sends nothing for 15 s is closed. After 10
+failed handshakes in a minute an address gets HTTP 429 on the upgrade.
+
+**Pairing slot.** One slot at a time (a new one replaces it, with a new code).
+It closes after the first success, after 15 minutes, or after 5 wrong proofs
+(any address), and forgets P and the code. A `version` refusal while it is open
+is shown on the page and does not count as a wrong proof.
+Pairing an id that is already paired replaces its key (the admin typed that
+Pi's password).
+
+**Requests.** `query` is passed raw, with the Pi's rule: only
+`A-Z a-z 0-9 . _ ~ = & + , : -` and whole `%XX` escapes, at most 2048 characters; `body` is the browser's JSON
+(or `null` for GET). The Pi's `type` is reduced to one of `application/json`,
+`text/plain`, `application/zip`, `application/gzip`, `application/x-tar`,
+`application/octet-stream` before it reaches a browser. A Pi `401` reaches the
+browser as `502` (it is not Manager's sign-in).
+
+**Section 6, in detail.** In `GET /api/sentryusb` the address a Pi connects
+from and the networks it reports are shown to admins only, and the slot's
+`pairing.code` is there only for the admin who opened the slot (as in the
+answer to `POST /api/sentryusb/pair`). Of the proxied reads, the Pi's logs,
+diagnostics, setup and notification settings, update source, keep-accessory
+config and backups list are for admins only (as Manager's own logs are); the
+other reads are allowed for any signed-in account.
+
+**Manager's own routes, beyond section 6:**
+
+| Route | Who | What |
+|---|---|---|
+| `GET /api/sentryusb/:id/last-config` | admin | the last setup config read from it (masked), for editing while away |
+| `GET/POST /api/sentryusb/:id/queue`, `DELETE /api/sentryusb/:id/queue/:qid` | read: signed in; write: admin | queued actions (6a) |
+| `GET /api/sentryusb/:id/files/:name` | admin | a fetched diagnostics report |
+| `GET /api/sentryusb/security`, `GET /api/sentryusb/security.csv`, `PUT /api/sentryusb/security/settings` | admin | the security log (6b) |
+| `PATCH /api/sentryusb/:id` | admin | also `{notifyNetwork, home: {ssid, gw}}` |
+
+Fresh password confirmation is needed for: pairing, unpairing, proxied
+`PUT /api/setup/config`, `POST /api/setup/run` and `PUT /api/system/update-source`,
+and queueing settings changes. Manager's allowlist matches the Pi's final one:
+no `GET /api/logs` (the page lists the Pi's fixed log names) and no
+`GET /api/system/backup/{date}` (backups are created, never fetched), and
+`/api/manager-link*` is refused.
+
+**Secrets in settings.** Manager also masks every field the Pi counts as a
+secret (its `is_secret_key`: `PASS`, `TOKEN`, `SECRET`, `…_KEY`, `…_KEY_ID`,
+`…WEBHOOK_URL`, `NTFY_URL`, `IFTTT_KEY`) in `GET /api/setup/config` before it
+reaches a browser or is kept. A Pi that sent
+any such value unmasked is marked `__unmasked: true`, and the page will not
+save its settings (an empty field would wipe the secret on a Pi that does not
+treat empty as "keep"). Masked fields may come as `"<KEY>__set": true` at the
+top level of the config object. The editor shows keys off the Pi's settable
+list (section 5a) as "on the Pi only" and never changes them; before saving or
+queueing it asks for the secret a changed destination needs (5a; queued, that
+field waits for the Pi to be online with its secret), and a `400`
+from the Pi that names a key outlines that field. Queueing checks the same two
+rules on the server.
+
+**Queued actions (6a).** Archive busy is read from the last status: any of
+`archiving`, `archive_running`, `archive_work_running`, `uploading`,
+`upload_running` true (or `"yes"`), or `archive.running`/`archive.active`.
+The Pi's status sends `archiving` (archive work running: copying,
+uploading, verifying), so update and reboot wait while it is true. Settings changes store `{from, to}` per field
+(`null` = commented out), never a secret: `POST …/queue` holds those back and
+answers `held` (the field names) and `note`; with nothing else left it is a
+`400` (`SECRET_ONLINE`). A queue saved by an older Manager has its secret values
+dropped at start-up. The PUT sends every active line, with secrets empty
+(keep), plus the changes, since the Pi's PUT replaces the whole config.
+The Updates tab sends `{"version": latest_version}` with Install when the tag
+is a plain version tag (else no body); the queued update posts no body (latest
+release). A queued backup is created on the Pi only (written to the archive
+share); it is not fetched. `trigger-sync` answering 409
+counts as done ("an archive was already running").
+
+**Security log (6b).** Kept in its own SQLite table (`sentryusb_audit`),
+180 days by default (7 to 3650), at most 20,000 rows. Failures, `net` and
+`open` rows with the same kind, address, Pi, detail and flags within an hour
+share a row (count, last time). A burst is 3 failed proofs (bad key or wrong
+password) from one address within 10 minutes. A possible hijack attempt raises
+a warning notification of kind `security`, which the notification rules
+cannot turn off; new address and outside home raise an `info` notice of kind
+`sentryusb`, which each Pi's Security log settings can turn off. Reads (GET)
+through the proxy are not logged there (the page polls); every change, every
+backup download and every queued action and its result are. Each row also goes
+to Manager's log (log search) and the newest 1000 to the support bundle as
+`sentryusb-security.csv`, with addresses replaced. CSV cells starting with
+`= + - @`, tab or CR get a leading `'`.
+
+**Where the key and the code are not.** No log line, support bundle,
+security log, database row or snapshot holds a pairing code (it lives only in
+the slot, in memory), and no API answer holds it except for the admin who
+opened the slot. No API answer, log line, support bundle, security
+log or database snapshot holds a link key: a snapshot drops the keys (a
+restored one shows the Pi unpaired) and the queue (a restored one would run
+actions again that already ran).
+
+**Where this differs from the first draft.** The Pi's final contract above
+replaced the draft: no log list, no backup download, the web login read-only
+over the link, settable keys only, update-source and update body rules, the
+Pi's pairing window, and the fingerprint shown in groups of 4. Manager follows
+all of it.

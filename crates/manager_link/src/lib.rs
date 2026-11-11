@@ -19,6 +19,7 @@
 
 pub mod allowlist;
 pub mod audit;
+pub mod car;
 pub mod handshake;
 pub mod secrets;
 pub mod serve;
