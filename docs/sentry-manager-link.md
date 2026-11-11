@@ -58,7 +58,7 @@ web password alone, so it could be cracked offline. The code has 60 random
 bits, is used once and never crosses the network. v1 is gone; no device ever
 paired with it.)
 
-1. **In Manager, under Settings → Sentry USB → Add a Sentry USB:**
+1. **In Manager, on the Sentry USB page (in the main navigation) → Add a Sentry USB:**
    - Enter a name, plus the Pi's web username and password, then press
      Start pairing.
    - These go to Manager over Manager's HTTPS, like every password.
@@ -633,8 +633,8 @@ uppercase hex digits, for example
 What Manager does where the sections above leave a choice (server/sentryUsbLink.js,
 server/sentryUsbQueue.js, server/sentryUsbAudit.js, web/sentryUsbLink.js).
 
-**Using it.** Every interface has a **Sentry USB** page (in the navigation next
-to Health): the guided "Add a Sentry USB" steps, the pairing code (large, in
+**Using it.** Every interface has a **Sentry USB** page, in the main navigation
+in the place Policies had (after Encoder; Policies moved further along): the guided "Add a Sentry USB" steps, the pairing code (large, in
 three groups, with a copy button and the countdown) and the reason when pairing
 fails ("Wrong pairing code or password", the same for both; "Pairing window
 expired"; "The Sentry USB needs updating"), the device list (online, or away with when it was last
