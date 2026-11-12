@@ -85,13 +85,19 @@ fn image_matches(file: &str, requested_kb: u64) -> bool {
     if requested_kb == 0 {
         return !Path::new(file).exists();
     }
-    if let Ok(meta) = std::fs::metadata(file) {
-        let current_kb = meta.len() / 1024;
-        let diff = (current_kb as i64 - requested_kb as i64).unsigned_abs();
-        diff < 10240
-    } else {
-        false
+    let Ok(meta) = std::fs::metadata(file) else { return false };
+    let within = |kb: u64| (kb as i64 - requested_kb as i64).unsigned_abs() < 10240;
+    if within(meta.len() / 1024) {
+        return true;
     }
+    // A cam image grown by CAM_REPORTED_SIZE is larger than its partition: it
+    // still matches when the partition inside is the requested size, so a setup
+    // re-run never wipes the footage over the reported size alone.
+    meta.len() / 1024 > requested_kb
+        && sentryusb_gadget::reported_size::partition_end(Path::new(file))
+            .ok()
+            .flatten()
+            .is_some_and(|end| within(end / 1024))
 }
 
 /// Create a single drive image file with a partition table and filesystem.
@@ -323,4 +329,39 @@ pub async fn create_disk_images(env: &SetupEnv, emitter: &SetupEmitter) -> Resul
 
     emitter.progress("Disk image creation complete.");
     Ok(true)
+}
+
+#[cfg(test)]
+mod reported_size_tests {
+    use super::image_matches;
+
+    /// A sparse image of `len` bytes whose MBR has one partition ending at `end`.
+    fn image(dir: &std::path::Path, len: u64, end: u64) -> String {
+        let mut mbr = [0u8; 512];
+        mbr[510] = 0x55;
+        mbr[511] = 0xAA;
+        mbr[446 + 4] = 0x07;
+        mbr[446 + 8..446 + 12].copy_from_slice(&2048u32.to_le_bytes());
+        mbr[446 + 12..446 + 16].copy_from_slice(&((end / 512) as u32 - 2048).to_le_bytes());
+        let path = dir.join("cam_disk.bin");
+        std::fs::write(&path, mbr).unwrap();
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(len).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn a_cam_image_grown_for_cam_reported_size_is_not_recreated() {
+        let dir = std::env::temp_dir().join(format!("sentryusb-reported-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let gib = 1u64 << 30;
+        let requested_kb = 4 * gib / 1024; // CAM_SIZE=4G
+        // as created: matches
+        assert!(image_matches(&image(&dir, 4 * gib, 4 * gib), requested_kb));
+        // grown to 2 TB around the same 4 GB partition: still matches (no wipe)
+        assert!(image_matches(&image(&dir, 2u64 << 40, 4 * gib), requested_kb));
+        // CAM_SIZE really changed (partition is 8 GB): recreated as before
+        assert!(!image_matches(&image(&dir, 2u64 << 40, 8 * gib), requested_kb));
+        assert!(!image_matches(&image(&dir, 8 * gib, 8 * gib), requested_kb));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

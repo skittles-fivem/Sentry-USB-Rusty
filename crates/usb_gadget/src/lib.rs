@@ -2,6 +2,7 @@
 
 pub mod cycle_lock;
 pub mod reflink;
+pub mod reported_size;
 pub mod snapshot;
 pub mod space;
 
@@ -119,6 +120,22 @@ pub fn validate_storage() -> Result<()> {
     validate_storage_at(&mounts, Path::new("/backingfiles"), require_cam)
 }
 
+/// Apply `CAM_REPORTED_SIZE` to the cam image (see `reported_size`). Failures
+/// are logged and never stop the drive from being presented.
+fn apply_cam_reported_size(gadget: &Path) {
+    let Ok((active, _)) = sentryusb_config::parse_file(sentryusb_config::find_config_path()) else { return };
+    let bound = fs::read_to_string(gadget.join("UDC")).is_ok_and(|s| !s.trim().is_empty());
+    let cam = Path::new(DISK_IMAGES[0].0);
+    if let Err(e) = reported_size::apply(
+        cam,
+        active.get("CAM_SIZE").map(String::as_str),
+        active.get(reported_size::KEY).map(String::as_str),
+        bound,
+    ) {
+        tracing::warn!("{}: {e:#}", reported_size::KEY);
+    }
+}
+
 fn camera_required(config: &sentryusb_config::SetupConfig) -> bool {
     let Some(raw) = config.get("CAM_SIZE").or_else(|| config.get("camsize")) else { return true; };
     let raw = raw.trim();
@@ -166,6 +183,10 @@ pub fn enable() -> Result<()> {
     validate_storage()?;
     let configfs = find_configfs_root()?;
     let gadget = configfs.join("usb_gadget").join(GADGET_NAME);
+
+    // CAM_REPORTED_SIZE: size the cam image before its LUN is (re)opened, which
+    // is when the car's view of the drive's capacity is fixed.
+    apply_cam_reported_size(&gadget);
 
     // Release the UDC from the legacy single-function gadget first.
     let _ = std::process::Command::new("modprobe")
