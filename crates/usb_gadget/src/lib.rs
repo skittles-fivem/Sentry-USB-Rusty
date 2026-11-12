@@ -126,14 +126,27 @@ fn apply_cam_reported_size(gadget: &Path) {
     let Ok((active, _)) = sentryusb_config::parse_file(sentryusb_config::find_config_path()) else { return };
     let bound = fs::read_to_string(gadget.join("UDC")).is_ok_and(|s| !s.trim().is_empty());
     let cam = Path::new(DISK_IMAGES[0].0);
-    if let Err(e) = reported_size::apply(
+    match reported_size::apply(
         cam,
         active.get("CAM_SIZE").map(String::as_str),
         active.get(reported_size::KEY).map(String::as_str),
         bound,
     ) {
-        tracing::warn!("{}: {e:#}", reported_size::KEY);
+        Ok(reported_size::Plan::Keep) => {}
+        // stdout too: the bash enable_gadget.sh path logs it to the archive log
+        Ok(p) => println!("{}: cam drive resized ({p:?})", reported_size::KEY),
+        Err(e) => tracing::warn!("{}: {e:#}", reported_size::KEY),
     }
+}
+
+/// `sentryusb gadget apply-reported-size`: the same step for the bash
+/// `enable_gadget.sh`, run before it builds the gadget. Never fails the caller.
+pub fn apply_cam_reported_size_now() -> Result<()> {
+    let gadget = find_configfs_root()
+        .map(|c| c.join("usb_gadget").join(GADGET_NAME))
+        .unwrap_or_else(|_| PathBuf::from("/nonexistent"));
+    apply_cam_reported_size(&gadget);
+    Ok(())
 }
 
 fn camera_required(config: &sentryusb_config::SetupConfig) -> bool {

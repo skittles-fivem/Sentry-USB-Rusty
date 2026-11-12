@@ -80,6 +80,9 @@ enum GadgetAction {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Size the cam image for CAM_REPORTED_SIZE before its LUN is opened
+    /// (called by the bash enable_gadget.sh; the Rust enable does it itself).
+    ApplyReportedSize,
 }
 
 #[derive(Subcommand)]
@@ -631,6 +634,9 @@ async fn run_gadget(action: GadgetAction) -> i32 {
         }
         GadgetAction::Disable { .. } => {
             tokio::task::spawn_blocking(sentryusb_gadget::disable).await
+        }
+        GadgetAction::ApplyReportedSize => {
+            tokio::task::spawn_blocking(sentryusb_gadget::apply_cam_reported_size_now).await
         }
     };
     match result {

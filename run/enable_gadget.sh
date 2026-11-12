@@ -49,6 +49,20 @@ then
   exit 1
 fi
 
+# CAM_REPORTED_SIZE: size the cam image before its LUN is opened, which is
+# when the car reads the drive's capacity (crates/usb_gadget/src/reported_size.rs).
+# The gadget does not exist here, so the car does not have the drive. Never
+# blocks presenting the drive.
+if command -v sentryusb >/dev/null 2>&1
+then
+  if reported=$(sentryusb gadget apply-reported-size 2>/dev/null)
+  then
+    printf '%s\n' "$reported" | grep -F CAM_REPORTED_SIZE || true
+  else
+    echo "warning: CAM_REPORTED_SIZE was not applied"
+  fi
+fi
+
 modprobe libcomposite
 
 mkdir -p "$gadget_root/configs/$cfg.1"
