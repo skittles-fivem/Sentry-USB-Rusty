@@ -28,8 +28,15 @@ use anyhow::{Context, Result};
 /// The config key.
 pub const KEY: &str = "CAM_REPORTED_SIZE";
 
-/// Largest size accepted (16 TiB): far beyond what any car checks for.
+/// Largest size accepted as input (16 TiB); see [`MAX_REPORTED`] for the cap.
 const MAX_BYTES: u64 = 16 << 40;
+
+/// Largest size actually used: just under 2 TiB. At 2^32 sectors or more the
+/// last LBA no longer fits READ CAPACITY(10) (it reads 0xFFFFFFFF, "use
+/// READ CAPACITY(16)") and an MBR partition can't describe the drive: a car
+/// given exactly 2T reported the filesystem as corrupted, while 1500G worked.
+/// Larger values are capped here (1 MiB under 2 TiB).
+pub const MAX_REPORTED: u64 = (2 << 40) - (1 << 20);
 
 /// Slack below which a size difference is left alone (sfdisk alignment).
 const SLACK_BYTES: u64 = 64 << 20;
@@ -52,7 +59,7 @@ pub fn parse_size_bytes(raw: &str) -> Option<u64> {
         return None;
     }
     let bytes = n * mult as f64;
-    (bytes >= 1.0 && bytes <= MAX_BYTES as f64).then_some(bytes as u64)
+    (bytes >= 1.0 && bytes <= MAX_BYTES as f64).then_some((bytes as u64).min(MAX_REPORTED))
 }
 
 /// End (in bytes) of the last partition in an MBR partition table, or `None`
@@ -174,10 +181,14 @@ mod tests {
 
     #[test]
     fn parses_sizes() {
-        assert_eq!(parse_size_bytes("2T"), Some(2 * T));
-        assert_eq!(parse_size_bytes("2TB"), Some(2 * T));
-        assert_eq!(parse_size_bytes("'2T'"), Some(2 * T));
+        // 2 TiB and above are capped just under it (READ CAPACITY(10) / MBR limit)
+        assert_eq!(parse_size_bytes("2T"), Some(MAX_REPORTED));
+        assert_eq!(parse_size_bytes("2TB"), Some(MAX_REPORTED));
+        assert_eq!(parse_size_bytes("'2T'"), Some(MAX_REPORTED));
+        assert_eq!(parse_size_bytes("16T"), Some(MAX_REPORTED));
+        assert!(MAX_REPORTED / 512 < 1 << 32, "fits a 32-bit sector count");
         assert_eq!(parse_size_bytes("1.5t"), Some(T + T / 2));
+        assert_eq!(parse_size_bytes("1500G"), Some(1500 * G));
         assert_eq!(parse_size_bytes("40G"), Some(40 * G));
         assert_eq!(parse_size_bytes("40GiB"), Some(40 * G));
         assert_eq!(parse_size_bytes("1024"), Some(1024));

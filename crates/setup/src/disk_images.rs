@@ -125,8 +125,11 @@ fn cam_matches(file: &str, cam_kb: u64, reported_kb: Option<u64>) -> bool {
     let Some(reported_kb) = reported_kb else { return image_matches(file, cam_kb) };
     let path = Path::new(file);
     let Ok(Some((start, end))) = sentryusb_gadget::exfat_reserve::first_partition(path) else { return false };
-    // the partition spans the image from 1 MiB, so compare its end to the size
-    (end / 1024).abs_diff(reported_kb) < 10240
+    // the partition spans the image from 1 MiB, so compare its end to the size.
+    // A drive of 2 TiB or more (made before the cap) is always rebuilt: the
+    // car reads it as corrupted.
+    end < 2 << 40
+        && (end / 1024).abs_diff(reported_kb) < 10240
         && sentryusb_gadget::exfat_reserve::has_placeholder(path, start).unwrap_or(false)
 }
 
