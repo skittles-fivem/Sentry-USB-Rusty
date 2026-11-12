@@ -2518,7 +2518,6 @@ version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
- "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -2607,7 +2606,6 @@ dependencies = [
  "sentryusb-cloud-uploader",
  "sentryusb-drives",
  "sentryusb-gadget",
- "sentryusb-manager-link",
  "sentryusb-setup",
  "sentryusb-shell",
  "sentryusb-status-led",
@@ -2640,7 +2638,6 @@ dependencies = [
  "sentryusb-config",
  "sentryusb-drives",
  "sentryusb-gadget",
- "sentryusb-manager-link",
  "sentryusb-notify",
  "sentryusb-setup",
  "sentryusb-shell",
@@ -2744,29 +2741,6 @@ dependencies = [
  "sentryusb-status-led",
  "tempfile",
  "tokio",
- "tracing",
-]
-
-[[package]]
-name = "sentryusb-manager-link"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "base64 0.22.1",
- "chrono",
- "futures-util",
- "hex",
- "ring",
- "rustls",
- "sentryusb-config",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-rustls",
- "tokio-tungstenite",
- "tower",
  "tracing",
 ]
 

@@ -253,9 +253,8 @@ pub async fn auth_middleware(
     // are set, and an unclaimed Pi serves nothing. Anything new that relays
     // remote requests to loopback (a tunnel, a reverse proxy) has to do the
     // same or this bypass becomes an open door.
-    // The Sentry Manager link (crates/manager_link) does not go through
-    // loopback or this middleware at all: it calls the router in-process,
-    // without ConnectInfo, and enforces its own deny-by-default allowlist.
+    // The device status writer (device_status.rs) calls the router
+    // in-process, without this middleware, for a few fixed read-only GETs.
     if is_loopback(&req) {
         return next.run(req).await;
     }

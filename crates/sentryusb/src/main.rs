@@ -286,8 +286,8 @@ async fn main() {
                 reason: std::sync::Arc::new(format!("{e:#}")),
             };
             let app = sentryusb_api::degraded::build_degraded_router(degraded);
-            // Manager can still read status and logs; the allowlist applies.
-            sentryusb_manager_link::spawn(app.clone(), sentryusb_api::update::current_version());
+            // The share's device-status file still reports storage and version.
+            sentryusb_api::device_status::spawn(app.clone());
             serve_with_common_layers(app, auth, args.port, args.dev, t0, led).await;
             return;
         }
@@ -414,9 +414,9 @@ async fn main() {
     let app = sentryusb_api::build_router(app_state.clone());
     phase!("router_built");
 
-    // Sentry Manager link: runs Manager's allowlisted requests in-process
-    // against this router (no auth layer; the link is its own gate).
-    sentryusb_manager_link::spawn(app.clone(), sentryusb_api::update::current_version());
+    // .sentryusb/device-status.json on the archive share: built from this
+    // router's own answers, in-process (fixed read-only GETs).
+    sentryusb_api::device_status::spawn(app.clone());
 
     serve_with_common_layers(app, auth, args.port, args.dev, t0, led).await;
 }

@@ -24,6 +24,8 @@ tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["io"] }
 # Direct SQLite access for telemetry sample handlers.
 rusqlite = { version = "0.41", features = ["bundled", "chrono", "blob"] }
+# In-process GETs against the router for .sentryusb/device-status.json.
+tower = { version = "0.5", features = ["util"] }
 
 sentryusb-config = { path = "../config", package = "sentryusb-config" }
 sentryusb-vehicle-profile = { path = "../vehicle_profile", package = "sentryusb-vehicle-profile" }
@@ -39,12 +41,9 @@ sentryusb-ble-health = { path = "../ble_health", package = "sentryusb-ble-health
 # the BLE key-validity check (keys::key_is_usable) uses the real loader
 # instead of a duplicated, weaker "file exists" test.
 sentryusb-tesla-ble = { path = "../tesla_ble", package = "sentryusb-tesla-ble" }
-# Settings → Sentry Manager routes for the link client.
-sentryusb-manager-link = { path = "../manager_link", package = "sentryusb-manager-link" }
 
 [dev-dependencies]
 tempfile = "3"
-tower = { version = "0.5", features = ["util"] }
 # Test-only ZIP reader for streaming-writer validation.
 zip = { version = "9", default-features = false, features = ["deflate"] }
 

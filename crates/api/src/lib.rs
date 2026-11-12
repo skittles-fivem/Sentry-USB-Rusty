@@ -51,6 +51,7 @@ pub mod climate;
 pub mod storage_repair;
 pub mod profile;
 pub mod wifi_firmware;
+pub mod device_status;
 
 pub use auth::{AuthState, init_auth};
 pub use router::build_router;
@@ -99,12 +100,6 @@ pub fn http_client() -> &'static reqwest::Client {
 #[cfg(test)]
 mod tests {
     use super::normalize_lon;
-
-    #[test]
-    fn manager_link_knows_the_official_update_repo() {
-        // The link only lets Manager reset the update source to this one.
-        assert_eq!(sentryusb_manager_link::OFFICIAL_UPDATE_REPO, crate::update::OFFICIAL_UPDATE_REPO);
-    }
 
     #[test]
     fn normalize_lon_wraps_world_copies() {

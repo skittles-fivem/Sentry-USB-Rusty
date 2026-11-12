@@ -103,6 +103,9 @@ pub fn build_degraded_router(state: DegradedState) -> Router {
         .route("/api/storage/health", get(crate::storage_repair::storage_health))
         .route("/api/storage/repair", get(crate::storage_repair::repair_status).post(crate::storage_repair::storage_repair))
         .route("/api/ws", get(crate::router::ws_handler))
+        // The share's device-status file (archiveloop asks for it each cycle).
+        .route("/api/system/device-status", get(crate::device_status::get_document))
+        .route("/api/system/device-status/write", post(crate::device_status::post_write))
         .route("/api/{*rest}", axum::routing::any(unavailable))
         .with_state(state)
 }

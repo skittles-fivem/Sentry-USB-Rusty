@@ -1,7 +1,7 @@
 //! DNS for notification requests that never lands on this machine.
 //!
-//! Notification and webhook URLs can be set from Sentry Manager over the
-//! link, and the Pi's API trusts loopback callers without a login. The URL
+//! Notification and webhook URLs come from settings, and the Pi's API
+//! trusts loopback callers without a login. The URL
 //! checks catch literal loopback and link-local addresses, but a host name
 //! whose DNS answer is 127.0.0.1 would still reach the Pi itself. This
 //! resolver drops loopback, unspecified and link-local answers (IPv4,

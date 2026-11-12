@@ -15,7 +15,6 @@ use crate::router::AppState;
 fn log_path(name: &str) -> Option<&'static str> {
     match name {
         "archiveloop" => Some("/mutable/archiveloop.log"),
-        "manager-link" => Some("/mutable/sentryusb-manager-link.log"),
         "setup" => Some("/sentryusb/sentryusb-setup.log"),
         "diagnostics" => Some("/tmp/diagnostics.txt"),
         "syslog" => Some("/var/log/syslog"),

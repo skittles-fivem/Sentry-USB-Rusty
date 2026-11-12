@@ -1,14 +1,14 @@
-//! The `car` object in the status push (contract 4, "The car"): battery,
+//! The `car` object in `.sentryusb/device-status.json`: battery,
 //! temperatures, tire pressures and parked or driving, from the Tesla BLE
 //! telemetry the Pi already keeps. Built from the same in-process answers the
 //! dashboard reads (`/api/system/ble-latest-sample`, `/api/charging/current`,
-//! `/api/drives/stats`) and the owner's unit and tire-band settings. Nothing
-//! else from the sample (place, position, odometer) is sent.
+//! `/api/drives/stats`) and the owner's tire-band setting. Nothing else from
+//! the sample (place, position, odometer, VIN) is written.
 //!
-//! On the wire: temperatures in °C, pressures in kPa, times in Unix seconds.
+//! In the file: temperatures in °C, pressures in kPa, times in Unix seconds.
 //! Unknown readings are left out; with nothing known there is no `car`.
 
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 
 use sentryusb_config::SetupConfig;
 
@@ -78,21 +78,6 @@ pub fn tire_state(psi: &[f64], b: Bands) -> Option<&'static str> {
         1 => "check",
         _ => "optimal",
     })
-}
-
-/// The units the Pi's own dashboard shows, resolved as web/src/lib/units.ts
-/// does: an unset PRESSURE_UNIT follows TEMPERATURE_UNIT (°F with psi, °C
-/// with bar); an unset TEMPERATURE_UNIT is °C.
-pub fn units(cfg: &SetupConfig) -> Value {
-    let temp_f = cfg
-        .get("TEMPERATURE_UNIT")
-        .map(|v| v == "F")
-        .unwrap_or(false);
-    let bar = cfg
-        .get("PRESSURE_UNIT")
-        .map(|v| v == "bar")
-        .unwrap_or(!temp_f);
-    json!({"temp": if temp_f { "F" } else { "C" }, "pressure": if bar { "bar" } else { "psi" }})
 }
 
 /// What the car object is built from.
@@ -210,7 +195,6 @@ pub fn build(i: &Inputs) -> Option<Value> {
     if car.is_empty() {
         return None;
     }
-    car.insert("units".into(), units(i.config));
     Some(Value::Object(car))
 }
 
@@ -291,12 +275,11 @@ mod tests {
                     "state": "optimal",
                 },
                 "drive": {"state": "parked", "since": NOW - 9000},
-                "units": {"temp": "F", "pressure": "psi"},
             })
         );
-        // never the place, position or odometer
+        // never the place, position, odometer, VIN or display units
         let text = car.to_string();
-        for k in ["location", "home", "odometer", "lat", "lon"] {
+        for k in ["location", "home", "odometer", "lat", "lon", "vin", "units"] {
             assert!(!text.contains(k), "{k} must not be sent");
         }
     }
@@ -336,7 +319,6 @@ mod tests {
             car,
             json!({
                 "tires": {"fl": {"kpa": 206.8, "at": NOW - 30}, "state": "check"},
-                "units": {"temp": "C", "pressure": "bar"},
             })
         );
     }
@@ -409,23 +391,6 @@ mod tests {
         ] {
             assert_eq!(parse_bands(Some(bad)), DEFAULT_BANDS, "{bad}");
         }
-    }
-
-    #[test]
-    fn units_follow_the_pi_dashboard() {
-        assert_eq!(units(&cfg(&[])), json!({"temp": "C", "pressure": "bar"}));
-        assert_eq!(
-            units(&cfg(&[("TEMPERATURE_UNIT", "F")])),
-            json!({"temp": "F", "pressure": "psi"})
-        );
-        assert_eq!(
-            units(&cfg(&[("TEMPERATURE_UNIT", "F"), ("PRESSURE_UNIT", "bar")])),
-            json!({"temp": "F", "pressure": "bar"})
-        );
-        assert_eq!(
-            units(&cfg(&[("PRESSURE_UNIT", "psi")])),
-            json!({"temp": "C", "pressure": "psi"})
-        );
     }
 
     #[test]
