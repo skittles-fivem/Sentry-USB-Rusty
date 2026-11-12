@@ -1,6 +1,7 @@
 //! Linux configfs USB mass-storage gadget control.
 
 pub mod cycle_lock;
+pub mod exfat_reserve;
 pub mod reflink;
 pub mod reported_size;
 pub mod snapshot;
