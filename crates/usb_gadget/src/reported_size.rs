@@ -37,6 +37,7 @@ const MAX_BYTES: u64 = 16 << 40;
 /// given exactly 2T reported the filesystem as corrupted, while 1500G worked.
 /// Larger values are capped here (1 MiB under 2 TiB).
 pub const MAX_REPORTED: u64 = (2 << 40) - (1 << 20);
+const _: () = assert!(MAX_REPORTED / 512 < 1 << 32, "the cap must fit a 32-bit sector count");
 
 /// Slack below which a size difference is left alone (sfdisk alignment).
 const SLACK_BYTES: u64 = 64 << 20;
@@ -186,7 +187,6 @@ mod tests {
         assert_eq!(parse_size_bytes("2TB"), Some(MAX_REPORTED));
         assert_eq!(parse_size_bytes("'2T'"), Some(MAX_REPORTED));
         assert_eq!(parse_size_bytes("16T"), Some(MAX_REPORTED));
-        assert!(MAX_REPORTED / 512 < 1 << 32, "fits a 32-bit sector count");
         assert_eq!(parse_size_bytes("1.5t"), Some(T + T / 2));
         assert_eq!(parse_size_bytes("1500G"), Some(1500 * G));
         assert_eq!(parse_size_bytes("40G"), Some(40 * G));
