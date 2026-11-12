@@ -393,6 +393,7 @@ jobs:
           bash test/archiveloop-archive-verify.test.sh
           bash test/archiveloop-clock-checkpoint.test.sh
           bash test/archiveloop-home-verify.test.sh
+          bash test/archiveloop-device-status.test.sh
           bash -n run/release_snapshot.sh
           bash -n run/make_snapshot.sh
           bash test/release-snapshot.test.sh

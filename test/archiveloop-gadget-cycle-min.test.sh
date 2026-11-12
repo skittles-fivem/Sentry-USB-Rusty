@@ -460,6 +460,7 @@ cloud_upload_step() { :; }
 # (archiveloop-archive-verify.test.sh); here they only need to exist.
 verify_archived_clips() { :; }
 write_share_status() { :; }
+write_device_status() { :; }
 SHARE_STATUS_DIR=.sentryusb SHARE_STATUS_NAME=archive-status.json
 MUSIC_MOUNT="$workdir/unused-music"
 disable_calls=0

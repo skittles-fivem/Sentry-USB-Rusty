@@ -39,6 +39,7 @@ travel_mode_active() { return 1; }
 # (archiveloop-archive-verify.test.sh); here they only need to exist.
 verify_archived_clips() { :; }
 write_share_status() { :; }
+write_device_status() { :; }
 SHARE_STATUS_DIR=.sentryusb SHARE_STATUS_NAME=archive-status.json
 ensure_usb_drives_connected() { :; }
 MUSIC_MOUNT="$work/no-music"

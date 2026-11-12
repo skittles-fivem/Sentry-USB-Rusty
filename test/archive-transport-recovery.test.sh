@@ -255,6 +255,7 @@ cloud_upload_step() { cloud=$((cloud + 1)); }
 # (archiveloop-archive-verify.test.sh); here they only need to exist.
 verify_archived_clips() { :; }
 write_share_status() { :; }
+write_device_status() { :; }
 SHARE_STATUS_DIR=.sentryusb SHARE_STATUS_NAME=archive-status.json
 archive_transport_recover() { checks=$((checks + 1)); }
 archive_cancel_cleanup() { :; }

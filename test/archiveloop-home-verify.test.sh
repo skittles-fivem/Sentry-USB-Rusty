@@ -32,6 +32,8 @@ fake_disconnect() { disconnects=$((disconnects + 1)); }
 archive_cycle_begin() { cycles=$((cycles + 1)); }
 archive_cycle_end() { [ "$cancel_after" = 0 ] || [ "$slices" -lt "$cancel_after" ]; }
 write_share_status() { status_writes=$((status_writes + 1)); }
+device_writes=0
+write_device_status() { device_writes=$((device_writes + 1)); }
 sleeps=0
 sleep() { sleeps=$((sleeps + 1)); }
 waiting_slices=0   # this many first slices find only clips waiting for Manager
@@ -56,6 +58,7 @@ home_verify_backlog
 [ ! -e "$ARCHIVE_VERIFY_QUEUE" ] || fail "queue not drained: $(wc -l < "$ARCHIVE_VERIFY_QUEUE") left"
 [ "$slices" = 3 ] && [ "$cycles" = 3 ] && [ "$disconnects" = 3 ] && [ "$status_writes" = 3 ] ||
   fail "expected 3 slices/cycles/disconnects/status writes, got $slices/$cycles/$disconnects/$status_writes"
+[ "$device_writes" = 6 ] || fail "expected the device status at the start and end of each slice (6), got $device_writes"
 grep -q "Parked at home: checking more of the archive backlog (8 file(s) queued)" "$LOG_FILE" || fail "no start line: $(cat "$LOG_FILE")"
 
 # The car leaves: stops before starting another slice.

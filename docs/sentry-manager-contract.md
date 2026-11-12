@@ -5,13 +5,13 @@ reads the same share, builds its footage inventory, and can re-encode clips.
 This document is what each side may write to the share, and what each side
 must do so they never undo each other's work.
 
-Sentry USB side: `run/archiveloop` (sections "Archive verification" and
-"Status file on the archive share"), `run/rsync_archive/archive-clips.sh`.
+Sentry USB side: `run/archiveloop` (sections "Archive verification",
+"Status file on the archive share" and "Device status file on the archive
+share"), `run/rsync_archive/archive-clips.sh`, `crates/api/src/device_status`.
 
-Sentry Manager can also manage the Pi directly (status, settings, logs,
-updates) over an encrypted link the Pi opens to Manager. That is a separate
-contract: [sentry-manager-link.md](sentry-manager-link.md). On the Pi it is
-Settings → System → Sentry Manager, and `crates/manager_link`.
+The share is the only connection between the two: Manager never connects to
+the Pi, and the Pi never connects to Manager. What Manager shows about the Pi
+comes from the files in section 2.
 
 ## 1. Layout (unchanged)
 
@@ -26,6 +26,7 @@ or clips without updating this document.
 |---|---|
 | `.sentryusb/archive-status.json` | Status file (section 4) |
 | `.sentryusb/car-files.tsv` | Every clip the car wrote to its USB drive in the last 7 days (section 4) |
+| `.sentryusb/device-status.json` | The Pi's version, storage, drives, CPU temperature and the car's latest readings (section 5) |
 | `<clip folder>/.sentryusb-partial/<clip>.mp4` | An interrupted rsync upload, waiting to resume. Moved to its real name when complete; the folder is removed when empty. |
 | `.sentryusbtmp/` | SMB/NFS upload temp folder |
 | `<clip>.mp4.mismatch-<unix time>` | A server copy that failed its SHA-256 check, renamed aside (never deleted). The clip is re-uploaded under its real name. |
@@ -252,7 +253,75 @@ The Pi also logs a daily line in its archiveloop log, e.g. "Car files for
 2026-11-10: 1234 RecentClips file(s) covering 310 minute(s), 3 Sentry
 event(s), 1 saved clip(s)".
 
-## 5. Checking it works end to end
+## 5. Device status: `.sentryusb/device-status.json`
+
+Beside `archive-status.json`, at the same share root. What Manager shows
+about the Pi itself, without ever connecting to it.
+
+**When it's written:**
+- at the start and the end of every archive cycle (also the parked-at-home
+  backlog checks);
+- every 5 minutes while the share is mounted on the Pi (SMB/NFS);
+- at most once a minute, while mounted, when a car reading changes (a newer
+  reading of the same value is not a change).
+
+Writing it is best effort and never holds up or slows the archive; a failed
+write is logged on the Pi and tried again next time. On rsync and rclone
+archives it's written only at the start and end of a cycle (the Pi has
+nothing mounted between them).
+
+**How:** atomically. The Pi writes `.sentryusb/device-status.json.tmp` in the
+same folder and renames it over `device-status.json`, so a reader sees the
+old file or the new one, never half of one. (rsync uses its own dot-named
+temp file, then renames.) At most 16 KiB.
+
+**Schema 1:**
+
+```json
+{
+  "schema": 1,
+  "written_unix": 1762800000,
+  "version": "v3.28.10-test.32",
+  "storage": { "total_bytes": 256060514304, "used_bytes": 98100000000, "free_bytes": 157960514304 },
+  "drives": [ { "name": "cam", "size_bytes": 64424509440 }, { "name": "music", "size_bytes": 4294967296 } ],
+  "cpu_temp_c": 51.2,
+  "car": {
+    "battery":  { "pct": 89, "charging": false, "at": 1762800000 },
+    "interior": { "c": 9.4, "at": 1762800000 },
+    "exterior": { "c": 7.8, "at": 1762799940 },
+    "tires": { "fl": { "kpa": 290.3, "at": 1762792800 }, "fr": { "kpa": 289.6, "at": 1762792800 }, "rl": { "kpa": 288.9, "at": 1762771200 }, "rr": { "kpa": 291.6, "at": 1762771200 }, "state": "optimal" },
+    "drive": { "state": "parked", "since": 1762791000, "at": 1762799990 }
+  }
+}
+```
+
+`schema` and `written_unix` (Unix seconds) are always there. Every other
+field is optional and left out when the Pi doesn't know it:
+
+- `version`: the Sentry USB version (at most 64 characters).
+- `storage`: the Pi's own storage that holds the car's drive images and
+  snapshots (the backing-files filesystem), in bytes. The same numbers the
+  Pi's dashboard shows as used and free.
+- `drives`: up to 8 `{name, size_bytes}`, `name` one of `cam`, `music`,
+  `lightshow`, `boombox`, `size_bytes` the size the car sees. Only drives
+  that exist.
+- `cpu_temp_c`: the Pi's CPU temperature in °C, one decimal, -40 to 125.
+- `car`: the car's latest readings from the Pi's Tesla BLE telemetry. No
+  `car` key when there are none; inside it, unknown readings are left out.
+  - `battery`: `pct` (0-100), `charging` (when known), `at`.
+  - `interior`, `exterior`: `c`, °C with one decimal, and `at`.
+  - `tires`: `fl`, `fr`, `rl`, `rr`, each `kpa` (one decimal) and `at`, when
+    the car last heard that sensor; `state` is `optimal`, `check` or
+    `unsafe`, the worst tire against the owner's `TIRE_PSI_BANDS`.
+  - `drive`: `state` `parked` or `driving`; `since` (parked: when the last
+    drive ended) and `at` (when the gear was read), each when known.
+  - `at` and `since` are Unix seconds. Never the car's place, position,
+    odometer or VIN, and no display units: Manager converts for display.
+
+Treat a file whose `written_unix` is old as "the Pi hasn't reached the share
+since then", not as current values.
+
+## 6. Checking it works end to end
 
 1. Manager writes `.sentrymanager/original-checksums.sha256` before each
    in-place conversion.
