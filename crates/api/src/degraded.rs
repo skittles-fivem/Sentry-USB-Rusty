@@ -89,6 +89,9 @@ pub fn build_degraded_router(state: DegradedState) -> Router {
         .route("/api/auth/logout", post(crate::auth::handle_logout))
         .route("/api/auth/check", get(crate::auth::handle_auth_check))
         .route("/api/system/version", get(crate::update::get_version))
+        // The share's device-status file (archiveloop asks for it each cycle).
+        .route("/api/system/device-status", get(crate::device_status::get_document))
+        .route("/api/system/device-status/write", post(crate::device_status::post_write))
         .route("/api/system/reboot", post(crate::system::reboot))
         .route("/api/system/shutdown", post(crate::system::shutdown))
         // USB recording and diagnostics must not require the history database.

@@ -40,9 +40,11 @@ sentryusb-ble-health = { path = "../ble_health", package = "sentryusb-ble-health
 # instead of a duplicated, weaker "file exists" test.
 sentryusb-tesla-ble = { path = "../tesla_ble", package = "sentryusb-tesla-ble" }
 
+# In-process GETs against the router for .sentryusb/device-status.json.
+tower = { version = "0.5", features = ["util"] }
+
 [dev-dependencies]
 tempfile = "3"
-tower = { version = "0.5", features = ["util"] }
 # Test-only ZIP reader for streaming-writer validation.
 zip = { version = "9", default-features = false, features = ["deflate"] }
 

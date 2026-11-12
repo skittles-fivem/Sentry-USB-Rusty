@@ -297,6 +297,8 @@ async fn main() {
                 reason: std::sync::Arc::new(format!("{e:#}")),
             };
             let app = sentryusb_api::degraded::build_degraded_router(degraded);
+            // The share's device-status file still reports storage and version.
+            sentryusb_api::device_status::spawn(app.clone());
             serve_with_common_layers(app, auth, args.port, args.dev, t0, led).await;
             return;
         }
@@ -422,6 +424,10 @@ async fn main() {
     // Build the API router
     let app = sentryusb_api::build_router(app_state.clone());
     phase!("router_built");
+
+    // .sentryusb/device-status.json on the archive share: built from this
+    // router's own answers, in-process (fixed read-only GETs, no auth layer).
+    sentryusb_api::device_status::spawn(app.clone());
 
     serve_with_common_layers(app, auth, args.port, args.dev, t0, led).await;
 }

@@ -251,6 +251,7 @@ clear_archive_status() { :; }
 copy_music_files() { music=$((music + 1)); }
 ensure_usb_drives_connected() { ensures=$((ensures + 1)); }
 cloud_upload_step() { cloud=$((cloud + 1)); }
+write_device_status() { :; }
 archive_transport_recover() { checks=$((checks + 1)); }
 archive_cancel_cleanup() { :; }
 ARCHIVE_SYSTEM=rsync MUSIC_SHARE_NAME=Music MUSIC_MOUNT=$work/music

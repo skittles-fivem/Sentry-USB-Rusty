@@ -25,7 +25,7 @@ pub(crate) fn nudge() {
     if let Some(tx) = WAKE.get() { let _ = tx.try_send(()); }
 }
 
-fn running_version(compiled: Option<&str>, installed: &str) -> Option<String> {
+pub(crate) fn running_version(compiled: Option<&str>, installed: &str) -> Option<String> {
     [compiled.unwrap_or_default(), installed].into_iter().map(str::trim)
         .find(|version| !version.is_empty() && *version != "0.1.0" && *version != "v0.1.0"
             && crate::update::parse_semver(version).is_some())

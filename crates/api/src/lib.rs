@@ -29,6 +29,7 @@ pub mod backup;
 pub mod update;
 pub mod release_download;
 pub mod device_reporting;
+pub mod device_status;
 pub mod support;
 pub mod community;
 pub mod healthcheck;

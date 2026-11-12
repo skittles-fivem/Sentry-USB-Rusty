@@ -2553,6 +2553,55 @@ function archive_cancel_cleanup () {
   /root/bin/send-live-activity end cancelled || true
 }
 
+# ── Device status file on the archive share ──────────────────────────────
+#
+# .sentryusb/device-status.json at the share root (beside RecentClips/ or
+# TeslaCam/): the Pi's version, storage, drives, CPU temperature and, when the
+# Pi reads them, the car's latest readings, for Sentry Six Manager. The
+# sentryusb service builds it (crates/api/src/device_status). It is written at
+# the start and the end of every archive cycle; while an SMB/NFS share is
+# mounted the service also refreshes it every 5 minutes, and at most once a
+# minute when a car reading changes. SMB/NFS: the service writes
+# device-status.json.tmp and renames it over the real name. rsync/rclone: the
+# file is fetched and sent with the cycle (rsync also uses a temp name and a
+# rename). Best effort with short timeouts: a failure is logged, never fatal.
+DEVICE_STATUS_DIR=.sentryusb
+DEVICE_STATUS_NAME=device-status.json
+
+function write_device_status () {
+  local api="http://127.0.0.1:${SENTRYUSB_PORT:-80}"
+  case "${ARCHIVE_SYSTEM:-none}" in
+    cifs|nfs)
+      curl -sf -m 20 -X POST "$api/api/system/device-status/write" > /dev/null
+      ;;
+    rsync|rclone)
+      local stage=/tmp/device-status-stage rc=0
+      rm -rf "$stage"
+      mkdir -p "$stage/$DEVICE_STATUS_DIR" || return 1
+      if curl -sf -m 20 -o "$stage/$DEVICE_STATUS_DIR/$DEVICE_STATUS_NAME" "$api/api/system/device-status"
+      then
+        if [ "$ARCHIVE_SYSTEM" = rsync ]
+        then
+          timeout -k 5 60 rsync -r --no-perms --omit-dir-times --timeout=30 \
+            -e "ssh${RSYNC_SSH_PORT:+ -p ${RSYNC_SSH_PORT}} -o BatchMode=yes -o ConnectTimeout=10" \
+            "$stage/$DEVICE_STATUS_DIR" "$RSYNC_USER@$RSYNC_SERVER:$RSYNC_PATH/" || rc=1
+        else
+          timeout -k 5 120 rclone --config /root/.config/rclone/rclone.conf copyto \
+            "$stage/$DEVICE_STATUS_DIR/$DEVICE_STATUS_NAME" \
+            "$RCLONE_DRIVE:$RCLONE_PATH/$DEVICE_STATUS_DIR/$DEVICE_STATUS_NAME" || rc=1
+        fi
+      else
+        rc=1
+      fi
+      rm -rf "$stage"
+      return "$rc"
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
 function archive_clips () {
   log "Archiving..."
 
@@ -2576,6 +2625,8 @@ function archive_clips () {
     /root/bin/disconnect-archive.sh 2>> "$LOG_FILE" || true
     return 1
   fi
+  # The Pi's own status for Sentry Six Manager, at the start of the cycle.
+  write_device_status || log "WARNING: could not write $DEVICE_STATUS_DIR/$DEVICE_STATUS_NAME to the archive"
 
   if ! has_cam_disk
   then
@@ -2672,6 +2723,9 @@ function archive_clips () {
   if ! archive_is_reachable; then
     ARCHIVE_ALL_STAGES_OK=0
     log "Archive became unreachable during drive processing, user likely drove away"
+  else
+    # ...and at its end.
+    write_device_status || log "WARNING: could not write $DEVICE_STATUS_DIR/$DEVICE_STATUS_NAME to the archive"
   fi
   /root/bin/disconnect-archive.sh 2>> "$LOG_FILE" || ARCHIVE_ALL_STAGES_OK=0
 

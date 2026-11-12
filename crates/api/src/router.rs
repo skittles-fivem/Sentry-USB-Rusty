@@ -123,6 +123,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/system/ble-connected", get(crate::ble::ble_connected))
         .route("/api/system/ble-install", post(crate::ble::ble_install))
         .route("/api/system/ble-latest-sample", get(crate::ble::ble_latest_sample))
+        // .sentryusb/device-status.json on the archive share (archiveloop
+        // asks for it at the start and end of each archive cycle).
+        .route("/api/system/device-status", get(crate::device_status::get_document))
+        .route("/api/system/device-status/write", post(crate::device_status::post_write))
         .route("/api/system/ble-adapters", get(crate::ble::ble_adapters))
         .route("/api/system/ble-adapter", post(crate::ble::ble_adapter_set))
         .route("/api/system/ble-force-poll", post(crate::ble::ble_force_poll))
