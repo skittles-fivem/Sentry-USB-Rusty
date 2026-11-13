@@ -181,6 +181,11 @@ Schema 1:
     { "started_unix": 1762735089, "kept": false },
     { "name": "snap-000012", "started_unix": 1762738569, "kept": true }
   ],
+  "snapshot_health": {
+    "state": "ok | stalled | missed", "checked_unix": 1762739000,
+    "last_run_unix": 1762738569, "newest_kept_unix": 1762738569,
+    "clips_not_kept": 0, "example_clip": null
+  },
   "transfer": null
 }
 ```
@@ -208,6 +213,28 @@ written by older Sentry USB builds), and `schema` stays 1:
   when the car was driving and no run (kept or not) started within about
   60 min of it. A parked stretch shows regular unkept runs every
   `snapshot_interval_s`.
+
+`snapshot_health` is optional too (left out by older builds, or before the
+first check). The Pi checks it every 10 minutes, after listing the car's
+drive for `car-files.tsv`, and from outside the snapshot loop, so a stuck
+loop or a run that read the wrong image can't hide it:
+- `ok`: snapshot runs are happening and the newest kept snapshot holds
+  every clip the car wrote since it.
+- `stalled`: no snapshot run (kept or not) for over twice
+  `snapshot_interval_s` plus 5 minutes. The snapshot loop is stuck; footage
+  older than about 60 min is being lost.
+- `missed`: `clips_not_kept` clips (`.mp4`, counted once per path) were
+  first seen in `car-files.tsv` after `newest_kept_unix` and at least a
+  minute before `last_run_unix`, yet the newest kept snapshot doesn't hold
+  them. A run should have kept them and didn't. `example_clip` is one of
+  them (path under TeslaCam, as in `car-files.tsv`). This is what happened on
+  2026-11-12: runs read a stale mount of an old image and discarded
+  themselves as identical for 19 hours while the car recorded.
+
+`newest_kept_unix` is null when the Pi holds no kept snapshot. Show
+`stalled` and `missed` as a Sentry USB problem (not missing car footage),
+using `checked_unix` for "as of". The Pi also logs and alerts once per
+problem.
 
 When a transfer is in progress, `transfer` is:
 `{"started_unix", "files", "bytes", "first_clip", "last_clip", "expected_finish_unix", "give_up_unix"}`.

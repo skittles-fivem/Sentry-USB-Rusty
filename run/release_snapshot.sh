@@ -92,7 +92,14 @@ then
     }') || { log "could not plan clip re-points for $NAME"; PLAN=""; }
 fi
 
-umount "$IMAGE" || true
+# Unmount by the autofs mountpoint: it mounts the image at an offset, so
+# "umount <image file>" alone doesn't find it and leaves the mount up, and the
+# next snapshot in this slot would be read through it.
+if grep -q " /tmp/snapshots/$NAME " /proc/mounts 2>/dev/null
+then
+  umount "/tmp/snapshots/$NAME" 2>/dev/null || umount -l "/tmp/snapshots/$NAME" 2>/dev/null || true
+fi
+umount "$IMAGE" 2>/dev/null || true
 
 # delete the snapshot folders
 rm -rf "/backingfiles/snapshots/$NAME"

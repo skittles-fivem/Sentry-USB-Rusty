@@ -3568,6 +3568,70 @@ function car_file_inventory_once () {
   rm -f "$list"
 }
 
+# Snapshot health, judged from outside the snapshot loop (so a stuck loop,
+# or a run that reads the wrong image, can't hide its own failure): written
+# by snapshot_health_check after every car file inventory as one line,
+# "<checked unix>\t<state>\t<last run unix>\t<newest kept unix>\t<clips not
+# kept>\t<example clip>", and reported as "snapshot_health" in the status file.
+# state: ok; stalled (no snapshot run for over twice the interval); missed
+# (the car wrote clips, a run started after they were seen, and the newest
+# kept snapshot doesn't hold them: on 2026-11-12 a stale mount made 236 runs
+# in a row discard as identical while the car recorded all day).
+SNAPSHOT_HEALTH_FILE=/mutable/snapshot_health
+SNAPSHOT_HEALTH_ALERTED=/mutable/snapshot_health_alerted
+
+# $1: now (unix). Uses SNAPSHOT_LOG, CAR_FILES_LOG and the newest kept TOC.
+function snapshot_health_check () {
+  local now=$1 interval last_run toc kept=0 state=ok missed=0 example="" counted
+  interval="${SNAPSHOT_INTERVAL:-3480}"
+  [[ "$interval" =~ ^[0-9]+$ ]] && [ "$interval" -gt 0 ] || interval=3480
+  last_run=$(awk -F'\t' '$2 ~ /^[0-9]+$/ && $2 + 0 > m { m = $2 + 0 } END { if (m) print m }' "$SNAPSHOT_LOG" 2>/dev/null || true)
+  [ -n "$last_run" ] || return 0
+  toc=$(LC_ALL=C find /backingfiles/snapshots -mindepth 2 -maxdepth 2 -path '*/snap-[0-9]*/snap.bin.toc' 2>/dev/null |
+    LC_ALL=C sort | tail -1 || true)
+  [ -z "$toc" ] || kept=$(stat -c %Y "$toc" 2>/dev/null || echo 0)
+  if [ $((now - last_run)) -gt $((2 * interval + 300)) ]
+  then
+    state=stalled
+  elif [ -n "$toc" ] && [ -s "$CAR_FILES_LOG" ]
+  then
+    # Clips first seen after the newest kept snapshot and at least a minute
+    # before the latest run: that run should have kept them.
+    counted=$(awk -F'\t' -v toc="$toc" -v kept="$kept" -v run="$last_run" '
+      FILENAME == toc { sp = index($0, " "); if (sp) intoc[substr($0, sp + 1)] = 1; next }
+      $1 + 0 > kept && $1 + 60 <= run && tolower($2) ~ /\.mp4$/ && !(("TeslaCam/" $2) in intoc) && !($2 in seen) {
+        seen[$2] = 1; n++; if (ex == "") ex = $2
+      }
+      END { printf "%d\t%s\n", n + 0, ex }' "$toc" "$CAR_FILES_LOG" 2>/dev/null) || counted=""
+    missed=${counted%%$'\t'*}
+    [[ "$missed" =~ ^[0-9]+$ ]] || missed=0
+    [ "$missed" = 0 ] || { state=missed; example=${counted#*$'\t'}; }
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$now" "$state" "$last_run" "$kept" "$missed" "$example" \
+    > "$SNAPSHOT_HEALTH_FILE.new" 2>/dev/null && mv -f "$SNAPSHOT_HEALTH_FILE.new" "$SNAPSHOT_HEALTH_FILE"
+  if [ "$state" = ok ]
+  then
+    rm -f "$SNAPSHOT_HEALTH_ALERTED"
+    return 0
+  fi
+  # Once per problem: the state and the newest kept snapshot identify it.
+  [ "$(cat "$SNAPSHOT_HEALTH_ALERTED" 2>/dev/null)" != "$state $kept" ] || return 0
+  echo "$state $kept" > "$SNAPSHOT_HEALTH_ALERTED" 2>/dev/null || true
+  local msg at_run at_kept
+  at_run=$(date -d "@$last_run" '+%m/%d %H:%M' 2>/dev/null || echo "$last_run")
+  at_kept=$(date -d "@$kept" '+%m/%d %H:%M' 2>/dev/null || echo "$kept")
+  if [ "$state" = stalled ]
+  then
+    msg="no snapshot run since $at_run (interval $((interval / 60)) min); the snapshot loop looks stuck"
+  else
+    msg="the car wrote $missed clip(s) since the newest kept snapshot ($at_kept) that no snapshot kept (e.g. $example), although a run started at $at_run"
+  fi
+  log "ERROR: snapshot health: $msg"
+  /root/bin/send-push-message "${NOTIFICATION_TITLE:-SentryUSB}:" "Snapshots: $msg." \
+    warning snapshot_health "Snapshots aren't keeping the car's footage." 2>/dev/null ||
+    log "failed to send snapshot health notification"
+}
+
 # Every CAR_FILE_INVENTORY_INTERVAL seconds (default 600; the car keeps
 # RecentClips about an hour, so every clip is seen at least once).
 function car_file_inventory_loop {
@@ -3577,6 +3641,7 @@ function car_file_inventory_loop {
   while true
   do
     car_file_inventory_once || log "car file inventory: could not list the car's drive this time"
+    snapshot_health_check "$(date +%s)" || true
     car_files_daily_summary || true
     sleep "$interval"
   done
@@ -3667,6 +3732,8 @@ function build_share_status_json () {
     printf '  "snapshot_interval_s": %s,\n' "$interval"
   fi
   printf '  "snapshots": %s,\n' "$(snapshot_log_json)"
+  local health
+  health=$(snapshot_health_json) && printf '  "snapshot_health": %s,\n' "$health"
   if [ -n "${ARCHIVE_PLAN_START:-}" ]
   then
     printf '  "transfer": {\n'
@@ -5090,6 +5157,19 @@ function snapshot_gap_check () {
       warning snapshot_gap "No snapshot for over an hour. Recent footage may not be kept." 2>/dev/null ||
       log "failed to send snapshot gap notification"
   fi
+}
+
+# The "snapshot_health" status object from SNAPSHOT_HEALTH_FILE; fails (the
+# field is left out) when there's no valid line.
+function snapshot_health_json () {
+  local checked state last_run kept missed example
+  IFS=$'\t' read -r checked state last_run kept missed example < "$SNAPSHOT_HEALTH_FILE" 2>/dev/null || return 1
+  case "$state" in ok|stalled|missed) ;; *) return 1 ;; esac
+  [[ "$checked" =~ ^[0-9]+$ ]] || return 1
+  printf '{ "state": %s, "checked_unix": %s, "last_run_unix": %s, "newest_kept_unix": %s, "clips_not_kept": %s, "example_clip": %s }' \
+    "$(json_string "$state")" "$checked" "$(json_int "$last_run")" \
+    "$(if [ "${kept:-0}" != 0 ]; then json_int "$kept"; else printf null; fi)" \
+    "$(json_int "${missed:-0}")" "$(if [ -n "${example:-}" ]; then json_string "$example"; else printf null; fi)"
 }
 
 # When the next scheduled snapshot is due (unix time), for the web UI.

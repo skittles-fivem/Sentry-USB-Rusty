@@ -49,6 +49,33 @@ function place_snapshot_link {
   fi
 }
 
+# Whether something is mounted at $1 (an autofs snapshot mountpoint).
+function snapshot_mounted () {
+  grep -q " $1 " /proc/mounts 2>/dev/null
+}
+
+# Unmount a snapshot's autofs mountpoint ($1), lazily if it's busy. Unmount by
+# mountpoint: the autofs map mounts the image at an offset, so "umount
+# <image file>" doesn't find the mount and silently leaves it up.
+function unmount_snapshot_mount () {
+  snapshot_mounted "$1" || return 0
+  umount "$1" 2>/dev/null || umount -l "$1" 2>/dev/null || true
+}
+
+# Whether the mount at $1 shows image $2: the loop device behind it must be
+# backed by that very file (same inode). A mount left from an earlier image in
+# the same slot shows the old, deleted file, and a file list read through it
+# would make a new snapshot look identical to the last one. When $1 isn't a
+# loop mount (or losetup can't tell), there's nothing to check: true.
+function snapshot_mount_is_current () {
+  local mnt=$1 image=$2 src ino
+  src=$(awk -v m="$mnt" '$2 == m { s = $1 } END { print s }' /proc/mounts 2>/dev/null)
+  case "$src" in /dev/loop*) ;; *) return 0 ;; esac
+  ino=$(losetup -n -O BACK-INO "$src" 2>/dev/null | tr -d ' ') || return 0
+  [ -n "$ino" ] || return 0
+  [ "$ino" = "$(stat -c %i "$image" 2>/dev/null)" ]
+}
+
 function linksnapshotfiletorecents {
   local file=$1
   local curmnt=$2
@@ -361,6 +388,13 @@ function snapshot {
 
   local newsnapname=$newsnapdir/snap.bin
   log "taking snapshot of cam disk in $newsnapdir"
+  # A discarded run reuses this slot number. If its autofs mount is still up,
+  # it shows the old (deleted) image, not the one about to be taken.
+  if snapshot_mounted "$newsnapmnt"
+  then
+    log "unmounting a leftover mount of $newsnapmnt before reusing the slot"
+    unmount_snapshot_mount "$newsnapmnt"
+  fi
 
   if mount | grep /backingfiles/cam_disk.bin
   then
@@ -434,6 +468,19 @@ function snapshot {
     rm -f "${newsnapname}.toc_"
     return 1
   fi
+  # The list must come from this image, not a mount left from an earlier one.
+  if ! snapshot_mount_is_current "$newsnapmnt" "$newsnapname"
+  then
+    log "ERROR: $newsnapmnt showed an older image; remounting and listing again"
+    unmount_snapshot_mount "$newsnapmnt"
+    if ! find "$newsnapmnt" -type f -printf '%s %P\n' > "${newsnapname}.toc_" ||
+       ! snapshot_mount_is_current "$newsnapmnt" "$newsnapname"
+    then
+      log "ERROR: could not list this snapshot's own files; keeping the image without a TOC"
+      rm -f "${newsnapname}.toc_"
+      return 1
+    fi
+  fi
   log "comparing new snapshot with $oldname"
   local newcount oldcount=0
   newcount=$(wc -l < "${newsnapname}.toc_")
@@ -496,6 +543,8 @@ function snapshot {
     # to keep still shows regular runs rather than a missed snapshot.
     printf '%s\t%s\t0\n' "-" "$started" >> /mutable/snapshot_log.tsv 2>/dev/null || true
     /root/bin/release_snapshot.sh "$newsnapdir"
+    # Leave no mount behind for the next run to read in this slot.
+    unmount_snapshot_mount "$newsnapmnt"
     rm -rf "$newsnapdir"
   fi
 }

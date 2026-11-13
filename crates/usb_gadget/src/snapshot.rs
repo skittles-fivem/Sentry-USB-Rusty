@@ -97,6 +97,13 @@ pub async fn make_snapshot_with(skip_fsck: bool, caller_holds_lock: bool) -> Res
 
     std::fs::create_dir_all(&snap_dir)?;
     info!("Taking snapshot of cam disk in {}", snap_dir);
+    // A discarded run reuses this slot number; a mount left up from it shows
+    // the old (deleted) image, and listing it would make this snapshot look
+    // identical to the last one.
+    if is_mounted(Path::new(&snap_mnt)) {
+        info!("Unmounting a leftover mount of {} before reusing the slot", snap_mnt);
+        unmount_snapshot_mount(&snap_mnt).await;
+    }
 
     // When this snapshot was taken: the copy below captures the drive as of now.
     let started_unix = std::time::SystemTime::now()
@@ -173,6 +180,8 @@ pub async fn make_snapshot_with(skip_fsck: bool, caller_holds_lock: bool) -> Res
 
     if is_duplicate {
         info!("Snapshot {} identical to previous; discarding", snap_name);
+        // Leave no mount behind for the next run to read in this slot.
+        unmount_snapshot_mount(&snap_mnt).await;
         // The run still counts as a check of the drive: log it, unkept.
         if let Err(e) = record_snapshot_taken(Path::new(SNAPSHOT_LOG), None, started_unix) {
             warn!("could not log the discarded snapshot run in {}: {}", SNAPSHOT_LOG, e);
@@ -1297,6 +1306,17 @@ async fn generate_toc(root: &str, out_path: &str) -> Result<()> {
 fn shell_escape(s: &str) -> String {
     // Snapshot paths are fixed and contain no quotes.
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Unmount a snapshot's autofs mountpoint, lazily if it's busy. By mountpoint:
+/// the map mounts the image at an offset, so unmounting by image file misses it.
+async fn unmount_snapshot_mount(mnt: &str) {
+    if !is_mounted(Path::new(mnt)) {
+        return;
+    }
+    if sentryusb_shell::run("umount", &[mnt]).await.is_err() {
+        let _ = sentryusb_shell::run("umount", &["-l", mnt]).await;
+    }
 }
 
 /// The newest file modification time under `root` (find's `%T@`, seconds with
