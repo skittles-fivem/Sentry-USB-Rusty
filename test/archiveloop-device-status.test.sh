@@ -1,8 +1,9 @@
 #!/bin/bash
 # Tests for write_device_status (run/archiveloop): .sentryusb/device-status.json
-# on the archive share, built by the sentryusb service
-# (crates/api/src/device_status, which has the JSON-shape, atomic-rename,
-# omitted-field, 16 KiB-cap and failed-write tests).
+# on the archive share, built by the sentryusb service. Format:
+# docs/share-files.md. The Rust tests in crates/api/src/device_status cover
+# the JSON shape, the atomic rename, omitted fields, the 16 KiB cap and a
+# failed write keeping the old file.
 set -euo pipefail
 
 script=${1:-run/archiveloop}
@@ -103,6 +104,25 @@ reset; api_ok=false
 out=$( (set -e; ARCHIVE_SYSTEM=cifs; write_device_status || log "WARNING: could not write"; echo "cycle continued") )
 [ "$out" = "cycle continued" ] || fail "a failed write stopped the cycle"
 grep -q '^log WARNING: could not write' "$calls" || fail "the failure wasn't logged"
+
+# set_time marks the clock as corrected for this boot (clock_synced in the
+# file), and only when a time server answered.
+clock_src=$(awk '$0 ~ "^function set_time[ (]" {keep=1} keep {print} keep && /^}/ {exit}' "$script")
+[ -n "$clock_src" ] || fail "set_time not found in $script"
+eval "$clock_src"
+# shellcheck disable=SC2329
+sleep() { :; }
+CLOCK_SYNCED_MARKER="$workdir/clock-synced"
+# shellcheck disable=SC2329 # called by the eval'd set_time
+ntpdig() { return 0; }
+# shellcheck disable=SC2329
+sntp() { return 1; }
+set_time
+[ -s "$CLOCK_SYNCED_MARKER" ] || fail "a corrected clock wasn't marked"
+rm -f "$CLOCK_SYNCED_MARKER"
+ntpdig() { return 1; }
+set_time
+[ ! -e "$CLOCK_SYNCED_MARKER" ] || fail "a failed correction was marked as synced"
 
 if [ "$failures" -gt 0 ]; then
   echo "$failures failure(s)" >&2

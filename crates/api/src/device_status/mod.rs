@@ -1,8 +1,7 @@
 //! `.sentryusb/device-status.json` on the archive share: what Sentry
 //! Manager shows about the Pi (version, storage, drives, CPU temperature and
 //! the car's latest readings), read from the share the Pi archives to.
-//! The format is in [`document`] and the tests below; the repo has no
-//! separate share-contract document.
+//! Format: docs/share-files.md.
 //!
 //! When it is written:
 //! - at the start and the end of every archive cycle: archiveloop asks for it
@@ -43,6 +42,9 @@ const MAX_DRIVES: usize = 8;
 const ARCHIVE_MOUNT: &str = "/mnt/archive";
 const BACKING_DIR: &str = "/backingfiles";
 const CPU_TEMP_PATH: &str = "/sys/class/thermal/thermal_zone0/temp";
+/// Present once the clock was corrected this boot (tmpfs, cleared at boot):
+/// archiveloop's set_time writes the first, systemd-timesyncd the second.
+const CLOCK_SYNC_MARKERS: [&str; 2] = ["/run/sentryusb-clock-synced", "/run/systemd/timesync/synchronized"];
 /// Drive images, in the contract's names.
 const DRIVES: [(&str, &str); 4] = [
     ("cam", "cam_disk.bin"),
@@ -63,6 +65,11 @@ const GET_TIMEOUT: Duration = Duration::from_secs(15);
 #[derive(Debug, Clone, Default)]
 pub struct Facts {
     pub written_unix: i64,
+    /// Whether the Pi's clock was corrected from a time server this boot.
+    /// The Pi has no clock battery: until then `written_unix` and every
+    /// reading's `at` may be off (Manager compares them with the share's
+    /// time for the file; see docs/share-files.md).
+    pub clock_synced: Option<bool>,
     pub version: Option<String>,
     /// Backing-files filesystem: (total, free) bytes.
     pub storage: Option<(u64, u64)>,
@@ -81,6 +88,9 @@ pub fn document(f: &Facts) -> Value {
     let mut m = Map::new();
     m.insert("schema".into(), SCHEMA.into());
     m.insert("written_unix".into(), f.written_unix.into());
+    if let Some(synced) = f.clock_synced {
+        m.insert("clock_synced".into(), synced.into());
+    }
     if let Some(v) = f
         .version
         .as_deref()
@@ -161,6 +171,11 @@ pub fn parse_cpu_temp(raw: &str) -> Option<f64> {
     let milli = raw.trim().parse::<f64>().ok()?;
     let c = milli / 1000.0;
     (c.is_finite() && (-40.0..=125.0).contains(&c)).then(|| round1(c))
+}
+
+/// Whether any clock-sync marker exists.
+pub fn clock_synced_by(markers: &[&str]) -> bool {
+    markers.iter().any(|p| Path::new(p).exists())
 }
 
 /// The drive images under `root`, each at its full size (what the car sees).
@@ -247,12 +262,14 @@ async fn collect(router: &axum::Router) -> Facts {
         let cpu = std::fs::read_to_string(CPU_TEMP_PATH)
             .ok()
             .and_then(|raw| parse_cpu_temp(&raw));
-        (storage, drives_in(Path::new(BACKING_DIR)), cpu)
+        let synced = clock_synced_by(&CLOCK_SYNC_MARKERS);
+        (storage, drives_in(Path::new(BACKING_DIR)), cpu, synced)
     })
     .await;
-    let (storage, drives, cpu_temp_c) = local.unwrap_or_default();
+    let (storage, drives, cpu_temp_c, synced) = local.unwrap_or_default();
     Facts {
         written_unix: now_unix(),
+        clock_synced: Some(synced),
         version: crate::device_reporting::running_version(
             option_env!("SENTRYUSB_RELEASE_VERSION"),
             &crate::update::read_current_version(),
@@ -391,11 +408,12 @@ mod tests {
     fn full() -> Facts {
         Facts {
             written_unix: NOW,
+            clock_synced: Some(true),
             version: Some("v3.28.10".into()),
             storage: Some((256_060_514_304, 157_960_514_304)),
             drives: vec![("cam".into(), 64_424_509_440), ("music".into(), 4_294_967_296)],
             cpu_temp_c: Some(51.23),
-            car: Some(json!({"battery": {"pct": 89.0, "charging": false, "at": NOW}})),
+            car: Some(json!({"battery": {"pct": 89, "charging": false, "at": NOW}})),
         }
     }
 
@@ -406,11 +424,12 @@ mod tests {
             json!({
                 "schema": 1,
                 "written_unix": NOW,
+                "clock_synced": true,
                 "version": "v3.28.10",
                 "storage": {"total_bytes": 256_060_514_304u64, "used_bytes": 98_100_000_000u64, "free_bytes": 157_960_514_304u64},
                 "drives": [{"name": "cam", "size_bytes": 64_424_509_440u64}, {"name": "music", "size_bytes": 4_294_967_296u64}],
                 "cpu_temp_c": 51.2,
-                "car": {"battery": {"pct": 89.0, "charging": false, "at": NOW}},
+                "car": {"battery": {"pct": 89, "charging": false, "at": NOW}},
             })
         );
     }
@@ -421,6 +440,7 @@ mod tests {
         assert_eq!(document(&bare), json!({"schema": 1, "written_unix": NOW}));
         let odd = Facts {
             written_unix: NOW,
+            clock_synced: None,
             version: Some("x".repeat(65)),
             storage: Some((0, 0)),
             drives: vec![("usb".into(), 10), ("cam".into(), 0)],
@@ -493,6 +513,18 @@ mod tests {
     }
 
     #[test]
+    fn an_unsynced_clock_is_reported_not_hidden() {
+        let unsynced = Facts { written_unix: NOW, clock_synced: Some(false), ..Facts::default() };
+        assert_eq!(document(&unsynced), json!({"schema": 1, "written_unix": NOW, "clock_synced": false}));
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("synced");
+        let m = marker.to_str().unwrap();
+        assert!(!clock_synced_by(&[m, "/nonexistent/x"]));
+        std::fs::write(&marker, b"1762800000\n").unwrap();
+        assert!(clock_synced_by(&["/nonexistent/x", m]));
+    }
+
+    #[test]
     fn cpu_temp_and_drives_are_read_from_the_system_files() {
         assert_eq!(parse_cpu_temp("51234\n"), Some(51.2));
         assert_eq!(parse_cpu_temp("-5000"), Some(-5.0));
@@ -545,7 +577,7 @@ mod tests {
             }),
         );
         let car = car_object(&r).await.unwrap();
-        assert_eq!(car["battery"]["pct"], 80.0);
+        assert_eq!(car["battery"]["pct"], 80);
         let text = car.to_string();
         assert!(!text.contains("Home") && !text.contains("5YJ3"));
 

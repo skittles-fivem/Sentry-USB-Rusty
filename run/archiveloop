@@ -2557,7 +2557,8 @@ function archive_cancel_cleanup () {
 #
 # .sentryusb/device-status.json at the share root (beside RecentClips/ or
 # TeslaCam/): the Pi's version, storage, drives, CPU temperature and, when the
-# Pi reads them, the car's latest readings, for Sentry Six Manager. The
+# Pi reads them, the car's latest readings, for Sentry Six Manager
+# (format: docs/share-files.md; clock_synced comes from set_time). The
 # sentryusb service builds it (crates/api/src/device_status). It is written at
 # the start and the end of every archive cycle; while an SMB/NFS share is
 # mounted the service also refreshes it every 5 minutes, and at most once a
@@ -2758,6 +2759,9 @@ function set_time () {
       # The wall-clock change minus the time that really passed is the
       # step itself. A slow answer points at the network, not the clock.
       log "$(awk "BEGIN {printf \"Clock corrected by %.2f seconds (the time server took %.1f seconds to answer)\", ($clocktime_end-$clocktime_start)-($uptime_end-$uptime_start), $uptime_end-$uptime_start}")"
+      # The clock is right from here on this boot (/run is cleared at boot):
+      # the share's device-status.json says so (clock_synced).
+      date +%s > "${CLOCK_SYNCED_MARKER:-/run/sentryusb-clock-synced}" 2>/dev/null || true
       return
     fi
     log "sntp failed, retrying..."

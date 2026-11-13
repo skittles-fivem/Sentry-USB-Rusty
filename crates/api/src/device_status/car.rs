@@ -118,7 +118,8 @@ pub fn build(i: &Inputs) -> Option<Value> {
     let mut car = Map::new();
 
     if let Some(pct) = finite(s.get("battery_pct")).filter(|p| (0.0..=100.0).contains(p)) {
-        let mut b = json!({"pct": round1(pct)});
+        // a whole percent, as the car shows it
+        let mut b = json!({"pct": pct.round() as i64});
         if let Some(t) = at("battery_pct") {
             b["at"] = t.into();
         }
@@ -266,7 +267,7 @@ mod tests {
         assert_eq!(
             car,
             json!({
-                "battery": {"pct": 89.0, "at": NOW - 60, "charging": false},
+                "battery": {"pct": 89, "at": NOW - 60, "charging": false},
                 "interior": {"c": 9.4, "at": NOW - 60},
                 "exterior": {"c": 7.8, "at": NOW - 120},
                 "tires": {
