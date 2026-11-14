@@ -148,19 +148,6 @@ export DRIVE_MAP_ENABLED=true
 #   * If no lightshow size is specified, no lightshow drive will be created.
 #   * If no boombox size is specified, no boombox drive will be created.
 export CAM_SIZE=40G
-# Experimental: show the car a bigger cam drive than CAM_SIZE. Tesla software
-# 2026.14+ offers its 24-hour Dashcam/Sentry buffer only on a drive of 1 TB or
-# more, and the car judges by the filesystem's size. With this set (exFAT only)
-# the next setup run formats the cam drive at this size and fills all but
-# CAM_SIZE of it with one placeholder file, SentryUSB-reserved.bin, that is
-# never written: the car sees e.g. 1.5 TB with CAM_SIZE free, records into that
-# CAM_SIZE and recycles its own oldest clips there, and the storage used stays
-# about CAM_SIZE. Setting it, changing it or removing it recreates (erases) the
-# cam drive on the next setup run, so run setup right after an archive. If the
-# car offers to format the drive, decline; never delete the placeholder.
-# Stay under 2 TiB (sizes from 2T up are capped just below it): at exactly
-# 2T the car reported the filesystem as corrupted; 1500G worked.
-#export CAM_REPORTED_SIZE=1500G
 #export MUSIC_SIZE=4G
 #export LIGHTSHOW_SIZE=1G
 #export BOOMBOX_SIZE=100M
