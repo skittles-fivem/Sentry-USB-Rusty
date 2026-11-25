@@ -785,6 +785,16 @@ CONFEOF
     fi
 fi
 
+# Installed from another repository (a fork's release or its SD card image):
+# record it, so the Pi's updater keeps following that repository. Without
+# REPO the updater uses the official releases. A REPO the owner already set
+# is left alone.
+if [ "$REPO" != "Sentry-Six/Sentry-USB-Rusty" ] && [ -f /root/sentryusb.conf ] \
+   && ! grep -qE '^[[:space:]]*(export[[:space:]]+)?REPO=' /root/sentryusb.conf; then
+    printf '\n# Updates come from this repository (set when Sentry USB was installed from it).\nexport REPO=%s\n' "$REPO" >> /root/sentryusb.conf
+    ok "Updates will come from $REPO"
+fi
+
 # ── Step 5: WiFi Marker ────────────────────────────────────────────
 
 if [ ! -f /sentryusb/WIFI_ENABLED ]; then
