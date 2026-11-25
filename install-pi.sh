@@ -253,6 +253,17 @@ else
         RELEASE_URL=$(curl -fsSL --max-time 10 -o /dev/null -w '%{url_effective}' \
             "https://github.com/${REPO}/releases/latest" 2>/dev/null || true)
         RELEASE_TAG="${RELEASE_URL##*/}"
+        # With no full release, GitHub redirects to the releases list.
+        case "$RELEASE_TAG" in latest|releases) RELEASE_TAG="" ;; esac
+    fi
+    if [ -z "${RELEASE_TAG:-}" ]; then
+        # A repository with only pre-releases (a fork's test builds) has no
+        # "latest" release: install its newest release instead.
+        RELEASE_TAG=$(curl -fsSL --max-time 10 \
+            "https://api.github.com/repos/${REPO}/releases?per_page=1" 2>/dev/null \
+            | grep '"tag_name"' | head -1 \
+            | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/' || true)
+        [ -z "$RELEASE_TAG" ] || info "No full release in $REPO; installing its newest pre-release, $RELEASE_TAG"
     fi
     [ -n "${RELEASE_TAG:-}" ] && [ "$RELEASE_TAG" != latest ] \
         || error_exit "Could not resolve the latest SentryUSB release tag"

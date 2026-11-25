@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Sentry-Six/Sentry-USB-Rusty/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/Sentry-Six/Sentry-USB-Rusty"></a>
+  <a href="https://github.com/skittles-fivem/Sentry-USB-Rusty/releases"><img alt="Newest release" src="https://img.shields.io/github/v/release/skittles-fivem/Sentry-USB-Rusty?include_prereleases"></a>
   <a href="https://discord.gg/9QZEzVwdnt"><img alt="Discord" src="https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-blue.svg"></a>
 </p>
@@ -39,9 +39,12 @@ Sentry USB is one of the free tools for Tesla owners from the [Sentry Six](https
 
 ## Install
 
+> [!NOTE]
+> This is the **skittles-fivem** fork of [Sentry-Six/Sentry-USB-Rusty](https://github.com/Sentry-Six/Sentry-USB-Rusty). The steps below install this fork's builds, and a Pi installed this way keeps updating from this fork (`REPO=skittles-fivem/Sentry-USB-Rusty` in `/root/sentryusb.conf`). For the official version, follow the official README instead.
+
 **On a Raspberry Pi (recommended):**
 
-1. Download **[Sentry-USB-for-Raspberry-Pi-Imager.rpi-imager-manifest](https://github.com/Sentry-Six/Sentry-USB-Rusty/releases/latest/download/Sentry-USB-for-Raspberry-Pi-Imager.rpi-imager-manifest)** and double-click it to open [Raspberry Pi Imager](https://www.raspberrypi.com/software/).
+1. Open the [Releases page](https://github.com/skittles-fivem/Sentry-USB-Rusty/releases), and from the newest release that has one, download **Sentry-USB-for-Raspberry-Pi-Imager.rpi-imager-manifest** (currently [v3.28.10-test.38](https://github.com/skittles-fivem/Sentry-USB-Rusty/releases/download/v3.28.10-test.38/Sentry-USB-for-Raspberry-Pi-Imager.rpi-imager-manifest)). Double-click it to open [Raspberry Pi Imager](https://www.raspberrypi.com/software/).
 2. Pick your Pi, add your Wi-Fi when Imager asks, and write the card.
 3. Boot the Pi and open `http://sentryusb.local` about a minute later.
 4. Follow the setup wizard, then plug the Pi into your Tesla.
@@ -53,7 +56,7 @@ The [Getting Started guide](https://github.com/Sentry-Six/Sentry-USB-Rusty/wiki/
 ```bash
 sudo apt update && sudo apt upgrade -y
 sudo -i
-curl -fsSL https://usb.sentry-six.com | bash
+curl -fsSL https://raw.githubusercontent.com/skittles-fivem/Sentry-USB-Rusty/main/install-pi.sh | REPO=skittles-fivem/Sentry-USB-Rusty bash
 ```
 
 > [!WARNING]
