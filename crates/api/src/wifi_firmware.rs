@@ -121,6 +121,21 @@ fn read_state() -> InstallState {
         .unwrap_or_default()
 }
 
+/// The state shown for a run that a restart cut off. The firmware on disk is
+/// whichever image the run last wrote; the status's versions show which.
+fn interrupted_state(st: &InstallState) -> InstallState {
+    InstallState {
+        state: "failed".into(),
+        step: "interrupted".into(),
+        progress: 100,
+        message: format!(
+            "The Pi restarted during this firmware update (at \"{}\"), so it didn't finish. Check the installed version below; you can run the update or roll back again.",
+            st.message.trim_end_matches('…')
+        ),
+        updated_at: st.updated_at,
+    }
+}
+
 /// Persist progress where it survives the Wi-Fi drop, and mirror it to any
 /// still-connected WebSocket client so the progress bar moves live.
 fn set_state(hub: &sentryusb_ws::Hub, state: &str, step: &str, progress: u8, message: &str) {
@@ -261,6 +276,15 @@ fn version_in_blob(path: &Path) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// How many firmware start banners the kernel has logged; each radio reload
+/// adds one.
+async fn firmware_banner_count() -> usize {
+    sentryusb_shell::run("dmesg", &[])
+        .await
+        .map(|out| out.lines().filter(|l| l.contains("preinit_dcmds: Firmware")).count())
+        .unwrap_or(0)
+}
+
 /// The version the radio is running right now, from the driver's boot banner.
 async fn running_version() -> Option<String> {
     let out = sentryusb_shell::run("dmesg", &[]).await.ok()?;
@@ -316,7 +340,16 @@ pub async fn get_status(State(_s): State<AppState>) -> (StatusCode, Json<serde_j
     // *current* boot. Reloading the radio in place can leave it transmitting
     // well below normal, but once the machine has been restarted since, the
     // job is finished and nagging about it would be wrong.
-    let st = read_state();
+    let mut st = read_state();
+    // An install or rollback still "running" from before this boot was cut off
+    // by a restart (its task can't survive one), so it will never finish: say
+    // so instead of showing its last progress forever.
+    if st.state == "running"
+        && !INSTALL_RUNNING.load(Ordering::SeqCst)
+        && boot_time().map(|b| st.updated_at < b).unwrap_or(false)
+    {
+        st = interrupted_state(&st);
+    }
     let reboot_pending =
         st.state == "success" && boot_time().map(|b| st.updated_at > b).unwrap_or(false);
     // Eligible only where the work can actually be done: a supported board
@@ -435,6 +468,12 @@ async fn run_install(hub: &sentryusb_ws::Hub, fw_path: &Path) -> anyhow::Result<
         warn!("[wifi-fw] firmware installed but not pinned — a package upgrade may revert it");
     }
 
+    // A Pi that reaches its network another way (Ethernet, a USB Wi-Fi
+    // adapter) may have wlan0 unconnected; then "came back" can only mean the
+    // radio is up again, not that it rejoined a network it wasn't on.
+    let was_linked = wlan0_linked().await;
+    let mut banners = firmware_banner_count().await;
+
     set_state(hub, "running", "reload", 65, "Reloading the Wi-Fi radio…");
     reload_radio().await?;
 
@@ -445,7 +484,7 @@ async fn run_install(hub: &sentryusb_ws::Hub, fw_path: &Path) -> anyhow::Result<
         80,
         "Waiting for Wi-Fi to come back…",
     );
-    if wait_for_wifi().await {
+    if wait_for_wifi(was_linked, banners).await {
         let ver = running_version()
             .await
             .unwrap_or_else(|| TARGET_VERSION.to_string());
@@ -472,8 +511,9 @@ async fn run_install(hub: &sentryusb_ws::Hub, fw_path: &Path) -> anyhow::Result<
     unpin_firmware(fw_path).await;
     std::fs::copy(&stock, fw_path)?;
     let _ = sentryusb_shell::run("sync", &[]).await;
+    banners = firmware_banner_count().await;
     let _ = reload_radio().await;
-    let recovered = wait_for_wifi().await;
+    let recovered = wait_for_wifi(was_linked, banners).await;
     set_state(
         hub,
         "rolled_back",
@@ -506,16 +546,32 @@ async fn reload_radio() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Associated *and* actually passing traffic — association alone can come back
-/// while the link is unusable, which is the whole failure we're fixing.
-async fn wait_for_wifi() -> bool {
+async fn wlan0_linked() -> bool {
+    sentryusb_shell::run("iw", &["dev", "wlan0", "link"])
+        .await
+        .map(|o| o.contains("Connected to"))
+        .unwrap_or(false)
+}
+
+/// The radio is back. If wlan0 was connected before (`was_linked`), that means
+/// associated *and* passing traffic — association alone can come back while the
+/// link is unusable, which is the whole failure we're fixing. If it wasn't
+/// (the Pi uses Ethernet or another adapter), it means wlan0 exists again and
+/// a new firmware banner (more than `banners_before`) shows the reloaded image
+/// started.
+async fn wait_for_wifi(was_linked: bool, banners_before: usize) -> bool {
     tokio::time::sleep(Duration::from_secs(6)).await;
     for _ in 0..45 {
-        let linked = sentryusb_shell::run("iw", &["dev", "wlan0", "link"])
-            .await
-            .map(|o| o.contains("Connected to"))
-            .unwrap_or(false);
-        if linked {
+        if !was_linked {
+            if Path::new("/sys/class/net/wlan0/phy80211").exists()
+                && firmware_banner_count().await > banners_before
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        }
+        if wlan0_linked().await {
             let gw = sentryusb_shell::run(
                 "bash",
                 &[
@@ -572,8 +628,10 @@ pub async fn rollback(State(s): State<AppState>) -> (StatusCode, Json<serde_json
         let _ = sentryusb_shell::run("sync", &[]).await;
         if ok {
             set_state(&hub, "running", "reload", 70, "Reloading the Wi-Fi radio…");
+            let was_linked = wlan0_linked().await;
+            let banners = firmware_banner_count().await;
             let _ = reload_radio().await;
-            let back = wait_for_wifi().await;
+            let back = wait_for_wifi(was_linked, banners).await;
             set_state(
                 &hub,
                 "success",
@@ -601,4 +659,27 @@ pub async fn rollback(State(s): State<AppState>) -> (StatusCode, Json<serde_json
         StatusCode::ACCEPTED,
         Json(serde_json::json!({"started": true})),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_run_cut_off_by_a_restart_reads_as_failed_not_running() {
+        let stuck = InstallState {
+            state: "running".into(),
+            step: "rollback".into(),
+            progress: 90,
+            message: "Wi-Fi did not return — restoring previous firmware…".into(),
+            updated_at: 1_795_000_000,
+        };
+        let shown = interrupted_state(&stuck);
+        assert_eq!(shown.state, "failed");
+        assert_eq!(shown.step, "interrupted");
+        assert_eq!(shown.progress, 100);
+        assert_eq!(shown.updated_at, stuck.updated_at);
+        assert!(shown.message.contains("restarted during this firmware update"));
+        assert!(shown.message.contains("restoring previous firmware\""), "{}", shown.message);
+    }
 }
