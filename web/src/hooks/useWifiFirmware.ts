@@ -5,7 +5,7 @@ const REVERT_DISMISS_KEY = "sentryusb.wifiFirmwareRevertDismissed"
 
 interface WifiFirmware {
   status: WifiFirmwareStatus | null
-  /** Offer the update: supported board, not yet updated. */
+  /** Offer the update: supported board, not yet updated, not hidden. */
   show: boolean
   /** An install is in flight right now. */
   installing: boolean
@@ -23,7 +23,9 @@ interface WifiFirmware {
  * unsupported boards and once the newer firmware is in place, so the offer
  * clears itself after a successful update and not before. There is
  * deliberately no dismiss on the *offer*: it is a correctness fix for a fault
- * that silently cripples archiving, so it stays until the firmware is updated.
+ * that silently cripples archiving, so it stays until the firmware is updated,
+ * unless the owner chooses "Don't ask again" (saved on the Pi as
+ * `offer_hidden`; Settings → System brings it back).
  */
 export function useWifiFirmware(): WifiFirmware {
   const [status, setStatus] = useState<WifiFirmwareStatus | null>(null)
@@ -79,7 +81,7 @@ export function useWifiFirmware(): WifiFirmware {
 
   return {
     status,
-    show: !!status && status.eligible && !installing,
+    show: !!status && status.eligible && !installing && !status.offer_hidden,
     installing: !!installing,
     offerRevert,
     dismissRevert,

@@ -156,6 +156,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/system/wifi-firmware", get(crate::wifi_firmware::get_status))
         .route("/api/system/wifi-firmware/install", post(crate::wifi_firmware::install))
         .route("/api/system/wifi-firmware/rollback", post(crate::wifi_firmware::rollback))
+        .route("/api/system/wifi-firmware/offer", post(crate::wifi_firmware::set_offer))
         // Storage repair
         .route("/api/storage/health", get(crate::storage_repair::storage_health))
         .route("/api/storage/repair", get(crate::storage_repair::repair_status).post(crate::storage_repair::storage_repair))

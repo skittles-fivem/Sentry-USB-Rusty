@@ -9,6 +9,7 @@ import {
 import { Modal } from "@/components/ui/Modal"
 import { wsClient } from "@/lib/ws"
 import { cn } from "@/lib/utils"
+import { setWifiFirmwareOfferHidden } from "@/lib/wifiFirmware"
 
 export interface WifiFirmwareStatus {
   eligible: boolean
@@ -25,6 +26,8 @@ export interface WifiFirmwareStatus {
   reboot_pending: boolean
   /** Held in place with dpkg-divert so an apt upgrade can't revert it. */
   pinned: boolean
+  /** The owner chose "Don't ask again"; absent on older builds. */
+  offer_hidden?: boolean
   install: InstallState
 }
 
@@ -129,6 +132,21 @@ export function WifiFirmwareModal({
       .finally(() => setStarting(false))
   }, [])
 
+  // "Don't ask again": saved on the Pi, so the offer stays gone in every
+  // browser. Settings → System → Wi-Fi firmware brings it back.
+  const [hiding, setHiding] = useState(false)
+  const hideForever = useCallback(() => {
+    setHiding(true)
+    setStartError("")
+    setWifiFirmwareOfferHidden(true)
+      .then(() => {
+        onRefresh()
+        onClose()
+      })
+      .catch((e: Error) => setStartError(e.message))
+      .finally(() => setHiding(false))
+  }, [onClose, onRefresh])
+
   const rollback = useCallback(() => {
     setStarting(true)
     fetch("/api/system/wifi-firmware/rollback", { method: "POST" })
@@ -159,6 +177,15 @@ export function WifiFirmwareModal({
               : `Target ${status.target_version}`}
           </span>
           <div className="flex gap-2">
+            {!running && install.state !== "success" && !status.up_to_date && (
+              <button
+                onClick={hideForever}
+                disabled={hiding}
+                className="rounded-lg px-3 py-1.5 text-xs font-medium text-slate-400 hover:bg-slate-500/15 disabled:opacity-50"
+              >
+                Don't ask again
+              </button>
+            )}
             {!running && install.state !== "success" && (
               <button
                 onClick={onClose}

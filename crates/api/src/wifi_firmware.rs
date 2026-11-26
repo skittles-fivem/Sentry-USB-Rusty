@@ -79,6 +79,9 @@ const FW_LINK: &str = "/usr/lib/firmware/brcm/brcmfmac43455-sdio.bin";
 const FW_BASE: &str = "/usr/lib/firmware/brcm/brcmfmac43455-sdio";
 const BACKUP_DIR: &str = "/mutable/wifi-firmware";
 const STATE_FILE: &str = "/mutable/wifi-firmware/state.json";
+/// Present when the owner chose "Don't ask again": the dashboard stops
+/// offering the update. Settings → System can bring the offer back.
+const OFFER_HIDDEN_FILE: &str = "/mutable/wifi-firmware/offer-hidden";
 
 /// Guards a second install starting mid-flight — the first is holding the
 /// radio down and the two would fight over the same file.
@@ -371,9 +374,38 @@ pub async fn get_status(State(_s): State<AppState>) -> (StatusCode, Json<serde_j
             "can_rollback": Path::new(&format!("{}/stock.bin", BACKUP_DIR)).exists(),
             "reboot_pending": reboot_pending,
             "pinned": fw_path.as_deref().map(is_pinned).unwrap_or(false),
+            "offer_hidden": Path::new(OFFER_HIDDEN_FILE).exists(),
             "install": st,
         })),
     )
+}
+
+// ── hide / show the offer ─────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct OfferRequest {
+    pub hidden: bool,
+}
+
+/// POST /api/system/wifi-firmware/offer — `{"hidden": true}` stops the
+/// dashboard offering the update for good (saved on the Pi, so every browser
+/// and later updates keep it); `{"hidden": false}` brings the offer back.
+pub async fn set_offer(Json(req): Json<OfferRequest>) -> (StatusCode, Json<serde_json::Value>) {
+    let result = if req.hidden {
+        std::fs::create_dir_all(BACKUP_DIR).and_then(|_| std::fs::write(OFFER_HIDDEN_FILE, b"hidden\n"))
+    } else {
+        match std::fs::remove_file(OFFER_HIDDEN_FILE) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        }
+    };
+    match result {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "offer_hidden": req.hidden }))),
+        Err(e) => crate::json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Could not save the setting: {e}"),
+        ),
+    }
 }
 
 // ── install ───────────────────────────────────────────────────────────────
